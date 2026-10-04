@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "paper": {
+      "type": "stdio",
+      "command": "/Users/christian/.paper/bin/paper",
+      "args": ["mcp"]
+    }
+  }
+}
