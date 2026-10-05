@@ -1,3 +1,4 @@
 /target
 /dist
 /.wiesel-dev.env
+__pycache__/

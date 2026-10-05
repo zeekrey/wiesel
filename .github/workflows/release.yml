@@ -1,0 +1,165 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Prepared release tag already pushed to origin (for example v0.1.1)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      source: ${{ steps.source.outputs.source }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+        with:
+          version: 0.23.0
+      - name: Resolve the prepared release source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          source="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$source"
+          git merge-base --is-ancestor "$source" origin/main
+          version="$(knope get-version)"
+          test "v$version" = "$RELEASE_TAG"
+          # A prepared release has a current-version section in the changelog.
+          awk -v version="$version" '$1 == "##" && $2 == version { found=1 } END { exit !found }' CHANGELOG.md
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+  checks:
+    needs: resolve
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.resolve.outputs.source }}
+  build:
+    needs: [resolve, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install native Knope 0.23.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(uname -m)" in
+            arm64) target=aarch64-apple-darwin ;;
+            x86_64) target=x86_64-apple-darwin ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/knope"
+          gh release download knope/v0.23.0 --repo knope-dev/knope --pattern "knope-$target.tgz" --dir "$RUNNER_TEMP/knope"
+          tar -xzf "$RUNNER_TEMP/knope/knope-$target.tgz" -C "$RUNNER_TEMP/knope"
+          echo "$RUNNER_TEMP/knope/knope-$target" >> "$GITHUB_PATH"
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Package and verify architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          bash scripts/package-release.sh
+          test "$(lipo -archs dist/Wiesel.app/Contents/MacOS/Wiesel)" = "$EXPECTED_ARCH"
+          for dmg in dist/release/*.dmg; do hdiutil verify "$dmg"; done
+          (cd dist/release && shasum -a 256 -c *.sha256)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    environment: release
+    concurrency:
+      group: release-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: release-assets
+      - name: Create the release, attach installers and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source }}
+        run: |
+          # Detect a tag moved after resolution; never release different source.
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
+          version="${RELEASE_TAG#v}"
+          assets=()
+          for arch in arm64 x86_64; do
+            for ext in dmg zip sha256; do
+              file="release-assets/Wiesel-$version-macos-$arch.$ext"
+              test -s "$file"
+              assets+=("$file")
+            done
+          done
+          (cd release-assets && shasum -a 256 -c *.sha256)
+          if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > release.json; then
+            if [[ "$(jq -r .isDraft release.json)" != true ]]; then
+              echo 'Already published; leaving existing assets unchanged.'
+              exit 0
+            fi
+            test "$(jq -r .targetCommitish release.json)" = "$SOURCE_SHA"
+          else
+            # No bot is required: create a draft only after checks/builds pass.
+            awk -v version="$version" '
+              $1 == "##" && $2 == version { found=1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > release-notes.md
+            test -s release-notes.md
+            printf '\nBuilds are ad-hoc signed, not notarized. See README installation instructions.\n' >> release-notes.md
+            gh release create "$RELEASE_TAG" --verify-tag --target "$SOURCE_SHA" --draft --title "Wiesel $version" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" = 6
+          # Paginate all releases and fail closed if GitHub cannot provide history.
+          published="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v[0-9]+[.][0-9]+[.][0-9]+$"))')"
+          newest="$(printf '%s\n%s\n' "$RELEASE_TAG" "$published" | sort -V | tail -n 1)"
+          latest=false
+          if [[ "$newest" == "$RELEASE_TAG" ]]; then latest=true; fi
+          gh release edit "$RELEASE_TAG" --target "$SOURCE_SHA" --draft=false "--latest=$latest"

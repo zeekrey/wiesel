@@ -1,0 +1,57 @@
+[package]
+versioned_files = [
+    "Cargo.toml",
+    { path = "Cargo.lock", dependency = "wiesel" },
+    { path = "resources/Info.plist", regex = '<key>CFBundleShortVersionString</key>\s*<string>(?<version>\d+\.\d+\.\d+)</string>' },
+]
+changelog = "CHANGELOG.md"
+[[workflows]]
+name = "document-change"
+help_text = "Document a user-facing change for the next release"
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[[workflows]]
+name = "prepare-release"
+help_text = "Update and stage versions and release notes for review (preview with --dry-run)"
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows]]
+name = "release"
+help_text = "Tag the prepared main commit and dispatch the installer release workflow"
+[[workflows.steps]]
+type = "Command"
+shell = true
+command = '''
+set -eu
+test -z "$(git status --porcelain)" || { echo 'Commit or stash local changes first.' >&2; exit 1; }
+test "$(git branch --show-current)" = main || { echo 'Switch to main after merging the prepared release.' >&2; exit 1; }
+git fetch origin main --tags
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || { echo 'Local main must match origin/main. Pull before releasing.' >&2; exit 1; }
+awk -v version="$version" '$1 == "##" && $2 == version { found=1 } END { exit !found }' CHANGELOG.md || { echo 'Prepare and merge the release notes before tagging.' >&2; exit 1; }
+test "$(git log --first-parent -1 --format=%H -- CHANGELOG.md)" = "$(git rev-parse HEAD)" || { echo 'Main advanced after release preparation. Tag the prepared commit explicitly, or prepare a new release.' >&2; exit 1; }
+'''
+[[workflows.steps]]
+# With no forge configured, Knope creates a local Git tag, not a GitHub release.
+type = "Release"
+[[workflows.steps]]
+type = "Command"
+command = "git push origin refs/tags/v$version:refs/tags/v$version"
+[[workflows.steps]]
+type = "Command"
+command = "gh workflow run release.yml --ref main -f tag=v$version"
+
+[[workflows]]
+name = "get-version"
+help_text = "Print the current version and verify all versioned files agree"
+[[workflows.steps]]
+type = "Command"
+command = 'echo "$version"'
+
+[[workflows]]
+name = "validate"
+help_text = "Validate pending changes and release metadata without publishing"
+[[workflows.steps]]
+type = "PrepareRelease"
+allow_empty = true

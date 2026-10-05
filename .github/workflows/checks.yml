@@ -1,0 +1,69 @@
+name: Checks
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact release source commit; empty uses the triggering ref
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      # The official Knope install action only downloads Linux x86_64 binaries.
+      - name: Install native Knope 0.23.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(uname -m)" in
+            arm64) target=aarch64-apple-darwin ;;
+            x86_64) target=x86_64-apple-darwin ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/knope"
+          gh release download knope/v0.23.0 --repo knope-dev/knope --pattern "knope-$target.tgz" --dir "$RUNNER_TEMP/knope"
+          tar -xzf "$RUNNER_TEMP/knope/knope-$target.tgz" -C "$RUNNER_TEMP/knope"
+          echo "$RUNNER_TEMP/knope/knope-$target" >> "$GITHUB_PATH"
+      - run: knope get-version
+      - run: knope validate --dry-run
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: checks-${{ matrix.arch }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: python3 scripts/test-app-scripts.py
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+  required:
+    name: CI required
+    if: always()
+    needs: macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all macOS checks
+        env:
+          RESULT: ${{ needs.macos.result }}
+        run: test "$RESULT" = success

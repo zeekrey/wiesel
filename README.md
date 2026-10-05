@@ -2,6 +2,30 @@
 
 A small, Raycast-inspired native writing launcher built with Rust and GPUI. **This first version supports macOS only**; other targets are explicitly rejected until their native selection and persistent credential backends are implemented.
 
+## Install a release
+
+Download a DMG from this repository's GitHub **Releases** page: choose
+`macos-arm64` for Apple Silicon or `macos-x86_64` for Intel. Open it and drag
+**Wiesel.app** to **Applications**. ZIP downloads and SHA-256 checksum files are
+also provided.
+
+**These builds are ad-hoc signed, not Apple-notarized.** macOS may block a
+downloaded app. Only if you trust the release, try launching it, then use
+**System Settings → Privacy & Security → Open Anyway** and confirm. Do not
+disable Gatekeeper globally. See Apple's
+[guidance for opening apps safely](https://support.apple.com/en-us/102445).
+Grant Accessibility access during [first launch](#first-launch).
+
+Verify downloaded assets before installing:
+
+```sh
+# Download the matching .sha256 file, DMG and ZIP into the same directory:
+shasum -a 256 -c Wiesel-<version>-macos-<arch>.sha256
+```
+
+For CI, CLI-controlled Knope releases, contributor instructions and one-time GitHub configuration,
+see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Run
 
 ```sh
@@ -154,6 +178,9 @@ cargo test --locked
 cargo clippy --locked -- -D warnings
 # Build/restart script tests (Python 3, mocked OS commands):
 python3 scripts/test-app-scripts.py
+# Knope release metadata and pending change validation:
+knope get-version
+knope validate --dry-run
 ```
 
 Unit tests cover response/model-catalog parsing, model search, settings serialization, hotkey validation, Unicode/IME offsets, selection snapshots across in-flight requests, failed-chat draft preservation, Copy release/timeout/focus handling, and clipboard preservation/races. Native clipboard tests use private pasteboards, not your general clipboard. Manual acceptance checks require your macOS permissions and real Gateway key:
