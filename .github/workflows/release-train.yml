@@ -1,0 +1,67 @@
+name: Release train
+defaults:
+  run:
+    shell: bash
+run-name: Release train — ${{ inputs.action }} ${{ inputs.branch }}
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Cut a new preview, patch an existing train, or promote its tested preview to stable
+        required: true
+        type: choice
+        options: [cut, patch, promote]
+      branch:
+        description: Existing train branch for patch/promote (for example v0.2.x); leave empty for cut
+        type: string
+        default: ''
+permissions:
+  contents: read
+# Train mutations must not race, including two cuts choosing the same version.
+concurrency:
+  group: release-train-management
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - run: python3 scripts/test-release.py
+      - name: Configure release commit identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Prepare and tag the train
+        id: prepare
+        env:
+          TRAIN_ACTION: ${{ inputs.action }}
+          TRAIN_BRANCH: ${{ inputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release.py prepare --action "$TRAIN_ACTION" --branch "$TRAIN_BRANCH"
+      - name: Record recovery command
+        env:
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          printf '### Prepared `%s`\n\nIf publication fails, retry this tag without bumping again:\n\n```sh\ngh workflow run release.yml --ref main -f tag=%s\n```\n' "$RELEASE_TAG" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+  release:
+    needs: prepare
+    permissions:
+      contents: write
+      pull-requests: read
+    # GITHUB_TOKEN pushes don't trigger other workflows. Call publication explicitly.
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}

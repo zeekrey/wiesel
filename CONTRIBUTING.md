@@ -2,11 +2,11 @@
 
 ## Development
 
-Wiesel currently builds only on macOS. Install Rust through rustup, Python 3 for
-the existing lifecycle tests, [Knope](https://knope.tech/installation/), and the
-[GitHub CLI](https://cli.github.com/) if you maintain releases.
-CI pins Knope to 0.23.0 and Rust through `rust-toolchain.toml`. There is no Node.js
-or npm dependency.
+Wiesel currently builds only on macOS. Install Rust through rustup and Python
+3.11+ for script tests and release metadata validation. CI uses Python 3.13 and
+the Rust toolchain in `rust-toolchain.toml`. Release maintainers also need the
+[GitHub CLI](https://cli.github.com/). There is no Knope, Changesets, Node.js, or
+npm dependency.
 
 ```sh
 cargo fmt --all -- --check
@@ -14,189 +14,228 @@ cargo check --locked --all-targets
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 python3 scripts/test-app-scripts.py
-knope get-version
-knope validate --dry-run
+python3 scripts/test-release.py
+python3 scripts/release.py version
 ```
 
-Knope's validation previews a release without modifying files, pushing commits,
-or publishing. It checks pending change files and agreement between Cargo's
-manifest/lock version and the bundle's marketing version.
+`version` verifies that the package version in `Cargo.toml`, the Wiesel entry in
+`Cargo.lock`, and `CFBundleShortVersionString` in `resources/Info.plist` agree.
 
-## Documenting changes
+## Pull requests and release notes
 
-Use conventional commits for simple changes:
+Open feature/fix PRs against `main`. Include testing results; for native/UI
+changes, include manual macOS checks and screenshots where useful. **Do not bump
+versions in feature PRs.** Commit prefixes do not determine release versions.
 
-- `fix: ...` — patch release.
-- `feat: ...` — feature release.
-- `feat!: ...` or a `BREAKING CHANGE:` footer — breaking change.
-- `ci: ...`, `docs: ...`, or `chore: ...` — no release by itself.
-
-Knope applies semantic-version rules, including special treatment of pre-1.0
-versions. Preserve conventional commit messages when merging, or configure
-squash merges to retain conventional PR titles.
-
-For detailed user-facing notes, run `knope document-change`, or commit a Markdown
-file in `.changeset/`:
+Every PR must contain a `Release Notes:` section with user-facing bullets:
 
 ```markdown
----
-default: patch
----
+Release Notes:
 
-# Fix a user-visible issue
-
-Explain the impact on users.
+- Added a keyboard shortcut for opening settings.
+- Fixed a failed request clearing the current draft.
 ```
 
-The single package is named `default` in Knope change files. Use `patch`,
-`minor`, or `major`; this is Knope's native format, not npm Changesets. Do not put
-non-change Markdown files in that directory. There is no bot enforcing PR
-change documentation or creating change files for you.
+Describe what a user can see or feel. Mention changed settings or shortcuts.
+For internal-only changes, use exactly:
 
-## Preparing a release
+```markdown
+Release Notes:
 
-This uses Knope's [basic CLI workflow](https://knope.tech/tutorials/releasing-basic-projects/),
-split into preparation and publication so version changes can be reviewed under
-normal branch protection. Neither ordinary merges nor tag pushes publish a
-release automatically. This setup currently supports stable `X.Y.Z` versions,
-not prerelease labels.
+- N/A
+```
 
-Start from current main, fetch release tags, and create a release branch:
+The **Release notes required** Action validates the PR description on opening,
+updates, and edits. Missing/empty sections, placeholders, and mixing `N/A` with
+real notes fail. Marking this check required in branch protection prevents
+merging until it passes. Reviewers still verify the notes' accuracy. The check
+reads the event JSON as data and executes the trusted base-branch validator,
+not scripts supplied by a fork.
+
+## Release model
+
+There are **preview and stable channels, no nightly**:
+
+```text
+feature PRs → main → v0.2.x preview → v0.2.x stable
+                └→ v0.3.x preview → v0.3.x stable
+```
+
+- `main`: continuous development and CI; no automatic publishing or packaging.
+- `vMAJOR.MINOR.x`: a snapshot of `main`, maintained through backport PRs.
+- Preview tags: `v0.2.0-pre`, `v0.2.1-pre`, etc.; GitHub prereleases.
+- Stable tags: `v0.2.1`, etc.; the tested preview promoted without newer `main`
+  changes. Promotion changes only release-channel metadata, not code/version.
+
+The **Release train** Action is manually dispatched on `main`. It chooses and
+updates versions, commits the version/channel metadata on the train branch,
+and atomically pushes that branch and its tag. It never pushes a version bump
+to `main`. Cutting a new train automatically selects the next minor version
+above the current development version and existing trains/tags. Patch releases
+increment the branch's patch version. Human maintainers choose **when** to cut,
+patch, or promote; developers do not manage versions in everyday PRs.
+
+The publisher is explicitly called after preparation: pushes made with
+`GITHUB_TOKEN` do not trigger another Actions workflow. Ordinary PR merges and
+manual tag pushes do not publish installers.
+
+### Cut a preview
+
+After desired PRs have merged to `main`:
 
 ```sh
-git switch main
-git pull --ff-only
-git fetch origin --tags
-git switch -c release/next
-knope prepare-release --dry-run
-knope prepare-release
+gh workflow run release-train.yml --ref main -f action=cut
 ```
 
-`prepare-release` updates and stages `Cargo.toml`, the Wiesel entry in
-`Cargo.lock`, the plist's marketing version, and `CHANGELOG.md`. It consumes the
-pending change files. It does **not** commit, push, tag, or contact GitHub.
-Review the staged diff, then commit and open an ordinary PR:
-
-```sh
-git diff --cached
-git commit -m "chore: prepare release"
-git push -u origin HEAD
-gh pr create --base main --title "chore: prepare release" --body "Prepare the next Wiesel release."
-```
-
-Merge that PR once its required CI checks and review pass. A directly committed
-version update is also possible if your repository policy permits it; the CLI
-never bypasses main protection for you.
-
-## Publishing a release
-
-After merging the prepared version, update your clean local main:
-
-```sh
-git switch main
-git pull --ff-only
-knope release --dry-run
-knope release
-```
-
-Unlike the tutorial's all-in-one default workflow, `release` deliberately does
-not bump versions again. Its dry run previews tagging/dispatching the **current
-prepared version**; `prepare-release --dry-run` previews the next version and
-notes. Dry runs do not execute the Git/authentication guards.
-
-The real release command:
-
-1. Requires a clean local `main` matching `origin/main`, current-version release
-   notes, and the prepared release's changelog update at the main tip. This
-   prevents silently including later merges that aren't in the prepared notes.
-2. Uses Knope's native Git-only `Release` step to create `vX.Y.Z` locally.
-3. Pushes only that tag; no version commits are pushed to main.
-4. Explicitly dispatches `.github/workflows/release.yml` on main through `gh`.
-
-If main advances after the prepared release merges, the CLI refuses to include
-those later changes silently. To intentionally release the earlier prepared
-commit, tag that exact merge SHA yourself, push the tag, and dispatch it:
-
-```sh
-git tag v0.1.1 <prepared-merge-sha>
-git push origin refs/tags/v0.1.1:refs/tags/v0.1.1
-gh workflow run release.yml --ref main -f tag=v0.1.1
-```
-
-Use the prepared version and SHA, not the example values. Actions still verifies
-main ancestry, version agreement, and release notes for that source.
-
-The command enqueues Actions; it does not wait for builds or publish a GitHub
-release itself. Watch progress with `gh run list --workflow release.yml`, then
+This creates the next `vMAJOR.MINOR.x` branch and its initial `vX.Y.0-pre` tag.
+Watch the run with `gh run list --workflow release-train.yml` and
 `gh run watch <run-id>`.
 
-Actions resolves the tag's exact commit, requires it to belong to main, verifies
-its version and changelog, and runs the same Intel/Apple Silicon checks as PR CI.
-It builds both native apps, creates a draft release with the prepared notes,
-uploads both DMGs, both ZIPs, and both SHA-256 files, then publishes. Tests or
-build failures occur before any GitHub release is created. Interrupted uploads
-may leave a draft that can be recovered.
+### Ship preview fixes
 
-All builds use the resolved SHA, not moving main. A moved tag fails validation.
-Published assets are not replaced on reruns; recovering an older draft does not
-mark it Latest over a newer published stable version. Publication is serialized
-and active publications are never canceled.
+Prefer fixing on `main` first, then cherry-pick the fix onto a separate branch
+and open a PR against the train. Retain a valid release-notes section on the
+backport PR. For example:
 
-The one additional shell script, `scripts/package-release.sh`, handles native
-macOS packaging. Knope handles versions/changelogs directly. The bundle build
-number is the release commit's reachable Git commit count, separate from the
-marketing version. License notices are included before signing.
+```sh
+git fetch origin
+git switch -c backport/fix origin/v0.2.x
+git cherry-pick <fix-commit-sha>
+git push -u origin HEAD
+gh pr create --base v0.2.x
+```
 
-## One-time configuration
+Start the backport PR summary with `Cherry-pick of #<original-pr-number>` (or
+`Backport of #<original-pr-number>`), followed by its required release notes.
+This preserves the original PR identity so later trains do not announce a fix
+that already shipped on stable a second time.
 
-This checkout currently uses local branch `master` and has no remote configured.
-These files target `main`; this setup does not rename branches or push anything.
+After merging the backport and passing CI:
 
-1. Configure the GitHub remote as `origin`, make `main` the default branch, and
-   commit/push the CI and Knope configuration. The dispatch workflow must exist
-   on the default branch before it can be run.
-2. Install Knope (0.23.0 recommended) and GitHub CLI locally. Run `gh auth login`
-   for the account that can push release tags and dispatch workflows. If you
-   supply a fine-grained token instead, it needs access to this repository with
-   **Actions: write** and the appropriate **Contents** permissions. Ensure your
-   Git credentials can push tags too. No `[github]` owner/repo placeholders in
-   `knope.toml` need filling: `gh` uses the repository's Git remote.
-3. Enable GitHub Actions. Allow the publication job's requested
-   `contents: write` permission; GitHub supplies its job token automatically.
-   No stored CI PAT, bot, custom GitHub App, or additional release secret is
-   required.
-4. Configure the `release` Actions environment, restricted to main. Optional
-   required reviewers add final approval before the draft is created/published.
-5. Require the **CI required** check from CI, PR review, and resolved conversations.
-   Disallow force pushes/deletion of main, and protect `v*` tags against updates
-   or deletion while allowing release maintainers to create them.
-6. If Knope Bot was already installed, remove/disable its installation for this
-   repository and remove its **Require changes to be documented** required check.
-   Removing bot configuration from Git does not uninstall a GitHub App.
+```sh
+gh workflow run release-train.yml --ref main -f action=patch -f branch=v0.2.x
+```
 
-There is no Dependabot configuration or replacement dependency-update bot.
-Manual acceptance testing of the first downloaded release on both architectures
-is still required.
+A preview branch publishes the next preview patch, e.g. `v0.2.1-pre`.
+
+### Promote a tested preview
+
+Manually test the downloaded preview installers on both architectures. Verify
+installation, launch, minimum-OS behavior, Accessibility permission, shortcuts,
+and representative UI/request flows. Then:
+
+```sh
+gh workflow run release-train.yml --ref main -f action=promote -f branch=v0.2.x
+```
+
+Promotion requires the branch tip to be **exactly the newest published preview
+for that train**. If additional changes merged, publish/test another preview
+first. Draft or failed previews cannot be promoted. The stable tag has the same
+numeric version as that preview. Once stable, this branch cannot be promoted
+again; a new preview train comes from `main`.
+
+### Stable hotfixes
+
+Backport a fix through a PR against the stable train, then dispatch `patch` on
+that branch. This increments its patch version and publishes a stable hotfix.
+Unlike promotion, this path does not require a preview first: maintainers must
+perform appropriate acceptance testing and review before approving publication.
+Normal features should wait for the next preview train.
+
+## Packaging, notes, and publication
+
+The **Release** workflow resolves an immutable tag SHA and checks its version,
+channel, metadata, and membership in its train branch. It re-runs CI on that
+source, packages Intel and Apple Silicon apps, verifies architecture/DMGs and
+SHA-256 checksums, and creates a GitHub **draft** with six assets (DMG, ZIP, and
+checksum file for each architecture).
+
+Notes are assembled from merged PRs associated with included commits, with PR
+links and `N/A` entries omitted. Notes are cumulative from the prior stable
+baseline captured when cutting the train, so stable promotion includes the
+whole train rather than only its last preview patch. The baseline can diverge
+from `main`: no merge-back is needed. Shared commits and already shipped
+backport PR identities are excluded from the next train's notes. The first train can cover
+all history when no prior stable baseline exists. `.release/train.json` records
+the baseline, channel, and release-note migration boundary.
+
+Historical PRs through the first-parent commit introducing this tooling may
+have no release-notes section and are skipped with warnings. This includes the
+tooling-adoption PR whether it is squash-merged or merged normally. New PRs
+must have valid notes; invalid notes fail generation. Direct commits are not a substitute for documented PRs;
+review the generated draft for omissions. Maintain PR descriptions through
+publication, since notes are collected from GitHub at release time.
+
+**Review/edit the draft notes and approve the `release` environment deployment.**
+Configure required environment reviewers to make this a real approval gate;
+without them, GitHub publishes immediately after the draft job. Draft-note
+edits are preserved on retries. Tests/builds must pass before a draft is created.
+
+All artifacts come from the resolved release SHA, not moving `main`. The live
+tag is checked again before uploading and after approval. Existing published
+assets/notes are not overwritten. Previews are never marked Latest, and
+recovering an older stable release cannot mark it Latest over a newer version.
+Train management and publication are serialized without canceling active runs.
+
+`scripts/package-release.sh` handles macOS packaging. The app marketing version
+is numeric even for previews; the release tag carries `-pre`. The bundle build
+number is the release commit's reachable commit count. License notices are
+included before signing.
+
+Generated release notes live on GitHub Releases. `CHANGELOG.md` is an index,
+not another source requiring manual versioned entries.
+
+## One-time GitHub configuration
+
+These changes only configure local files; they do not configure GitHub settings
+or publish anything.
+
+1. Merge this tooling into the default `main` branch before dispatching it.
+   Enable Actions and allow the train/draft/publication jobs' requested
+   **Contents: write** permission. No stored PAT, bot, or GitHub App is required
+   by CI. Maintainers need permission to dispatch workflows; local `gh auth
+   login` is sufficient with normal repository access.
+2. Protect `main` and `v*.x` train branches: require PR review, resolved
+   conversations, **CI required**, and **Release notes required**. Disable
+   force pushes/deletion. The train Action must be allowed to create train
+   branches and push its **metadata-only version/channel commits**. If rules
+   require every commit to come through a PR, configure a narrowly scoped
+   automation bypass for these train updates. Do not bypass PR policy for
+   ordinary code changes. Some repository rules may require a dedicated GitHub
+   App instead of `GITHUB_TOKEN`; the workflow fails rather than bypassing them.
+3. Protect `v*` tags from updates/deletion, allowing the release automation to
+   create them. Keep release tags immutable.
+4. Create the **release** Actions environment, restrict deployment to `main`
+   (the publishing workflow runs on main even though artifacts come from a
+   train tag), and add required reviewers. Review the draft before approval.
+   Environment protection availability depends on GitHub plan/repo visibility.
+5. Remove old Knope/Changesets bot installations and required checks if they
+   were configured. Deleting configuration files does not uninstall a GitHub
+   App. Require the new release-note check after the validator exists on main.
+
+Merge-queue CI is supported; the release-notes check relies on validation of
+its constituent PRs. Train pushes from the default token do not independently
+start CI, but the explicit publisher re-runs source checks before packaging.
 
 ## Recovery and distribution caveats
 
-If tagging succeeds but dispatch fails, do not prepare/bump another version.
-Authenticate/fix permissions and dispatch the existing tag explicitly:
+If preparation pushed a tag but builds/uploads/publication failed, **do not
+bump again**. Dispatch the publisher using the existing tag:
 
 ```sh
-gh workflow run release.yml --ref main -f tag=v0.1.1
+gh workflow run release.yml --ref main -f tag=v0.2.1-pre
+# Stable recovery:
+gh workflow run release.yml --ref main -f tag=v0.2.1
 ```
 
-Replace `v0.1.1` with the prepared tag. The same command (or GitHub's **Run
-workflow** button on main) recovers failed builds/uploads and old drafts. Rerun
-the original run if only a failed job needs retrying. Never move an existing
-release tag to fix a source bug; prepare a new release instead. GitHub may
-replace pending jobs during bursts, so an unprocessed tag/draft can be explicitly
-redispatched.
+Use the actual tag from the original train run's summary. You can also retry
+failed publication jobs. Re-running train preparation means a new release
+operation, not recovery. Never move an existing tag to fix a source bug.
+GitHub may replace pending concurrency runs during bursts; explicitly dispatch
+an existing unprocessed tag if needed.
 
-Builds are **ad-hoc signed, not notarized**. Follow the README's Gatekeeper
+Builds remain **ad-hoc signed, not notarized**. Follow README Gatekeeper
 instructions only if you trust the download. Developer ID signing/notarization
-would require separate Apple credentials; no AI Gateway key is needed in CI.
-`MACOSX_DEPLOYMENT_TARGET=12.0` matches the plist, but minimum-OS compatibility,
-installation, Accessibility, Gatekeeper, and UI behavior still need manual
-acceptance testing.
+is separate work requiring Apple credentials; no AI Gateway key is needed in
+CI. `MACOSX_DEPLOYMENT_TARGET=12.0` matches the plist, but distribution and UI
+acceptance testing are still manual.

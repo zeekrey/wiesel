@@ -1,10 +1,12 @@
-# Wiesel
+# Wiesel 🦫
 
 A small, Raycast-inspired native writing launcher built with Rust and GPUI. **This first version supports macOS only**; other targets are explicitly rejected until their native selection and persistent credential backends are implemented.
 
 ## Install a release
 
-Download a DMG from this repository's GitHub **Releases** page: choose
+Download a DMG from this repository's GitHub **Releases** page. Choose the latest
+**stable** release for normal use, or a release marked **Pre-release** to test the
+next preview. Preview tags end in `-pre`; stable tags do not. Choose
 `macos-arm64` for Apple Silicon or `macos-x86_64` for Intel. Open it and drag
 **Wiesel.app** to **Applications**. ZIP downloads and SHA-256 checksum files are
 also provided.
@@ -23,8 +25,10 @@ Verify downloaded assets before installing:
 shasum -a 256 -c Wiesel-<version>-macos-<arch>.sha256
 ```
 
-For CI, CLI-controlled Knope releases, contributor instructions and one-time GitHub configuration,
-see [CONTRIBUTING.md](CONTRIBUTING.md).
+Wiesel uses manually triggered **preview → stable release trains**. `main` runs
+CI without publishing; release branches produce installers. For contribution
+instructions, release commands, and one-time GitHub configuration, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Run
 
@@ -178,9 +182,9 @@ cargo test --locked
 cargo clippy --locked -- -D warnings
 # Build/restart script tests (Python 3, mocked OS commands):
 python3 scripts/test-app-scripts.py
-# Knope release metadata and pending change validation:
-knope get-version
-knope validate --dry-run
+# Release metadata and train/PR-note tests (Python 3.11+):
+python3 scripts/release.py version
+python3 scripts/test-release.py
 ```
 
 Unit tests cover response/model-catalog parsing, model search, settings serialization, hotkey validation, Unicode/IME offsets, selection snapshots across in-flight requests, failed-chat draft preservation, Copy release/timeout/focus handling, and clipboard preservation/races. Native clipboard tests use private pasteboards, not your general clipboard. Manual acceptance checks require your macOS permissions and real Gateway key:

@@ -1,8 +1,9 @@
 name: CI
 on:
   pull_request:
+  merge_group:
   push:
-    branches: [main]
+    branches: [main, 'v[0-9]+.[0-9]+.x']
   workflow_dispatch:
 permissions:
   contents: read

@@ -31,21 +31,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'
-      # The official Knope install action only downloads Linux x86_64 binaries.
-      - name: Install native Knope 0.23.0
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          case "$(uname -m)" in
-            arm64) target=aarch64-apple-darwin ;;
-            x86_64) target=x86_64-apple-darwin ;;
-          esac
-          mkdir -p "$RUNNER_TEMP/knope"
-          gh release download knope/v0.23.0 --repo knope-dev/knope --pattern "knope-$target.tgz" --dir "$RUNNER_TEMP/knope"
-          tar -xzf "$RUNNER_TEMP/knope/knope-$target.tgz" -C "$RUNNER_TEMP/knope"
-          echo "$RUNNER_TEMP/knope/knope-$target" >> "$GITHUB_PATH"
-      - run: knope get-version
-      - run: knope validate --dry-run
+      - run: python3 scripts/release.py version
+      - run: python3 scripts/test-release.py
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
