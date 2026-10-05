@@ -1,9 +1,17 @@
 name: Release
+defaults:
+  run:
+    shell: bash
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Prepared release tag already pushed to origin (for example v0.1.1)
+        description: Existing train tag to publish or recover (v0.2.0-pre or v0.2.0)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
         required: true
         type: string
 permissions:
@@ -19,30 +27,25 @@ jobs:
     outputs:
       tag: ${{ steps.source.outputs.tag }}
       source: ${{ steps.source.outputs.source }}
+      channel: ${{ steps.source.outputs.channel }}
+      version: ${{ steps.source.outputs.version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: main
           fetch-depth: 0
           persist-credentials: false
-      - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          version: 0.23.0
-      - name: Resolve the prepared release source
+          python-version: '3.13'
+      - name: Resolve release source
         id: source
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          source="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
-          test "$(git rev-parse HEAD)" = "$source"
-          git merge-base --is-ancestor "$source" origin/main
-          version="$(knope get-version)"
-          test "v$version" = "$RELEASE_TAG"
-          # A prepared release has a current-version section in the changelog.
-          awk -v version="$version" '$1 == "##" && $2 == version { found=1 } END { exit !found }' CHANGELOG.md
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "source=$source" >> "$GITHUB_OUTPUT"
+          gh auth setup-git
+          python3 scripts/release.py resolve --tag "$RELEASE_TAG"
   checks:
     needs: resolve
     uses: ./.github/workflows/checks.yml
@@ -68,18 +71,9 @@ jobs:
           ref: ${{ needs.resolve.outputs.source }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Install native Knope 0.23.0
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          case "$(uname -m)" in
-            arm64) target=aarch64-apple-darwin ;;
-            x86_64) target=x86_64-apple-darwin ;;
-          esac
-          mkdir -p "$RUNNER_TEMP/knope"
-          gh release download knope/v0.23.0 --repo knope-dev/knope --pattern "knope-$target.tgz" --dir "$RUNNER_TEMP/knope"
-          tar -xzf "$RUNNER_TEMP/knope/knope-$target.tgz" -C "$RUNNER_TEMP/knope"
-          echo "$RUNNER_TEMP/knope/knope-$target" >> "$GITHUB_PATH"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
@@ -98,8 +92,78 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
           retention-days: 14
-  publish:
+  draft:
     needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: release-assets
+      - name: Generate release notes from included PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          gh auth setup-git
+          python3 scripts/release.py notes --tag "$RELEASE_TAG" --output release-notes.md
+          printf '\nBuilds are ad-hoc signed, not notarized. See README installation instructions.\n' >> release-notes.md
+      - name: Create draft and attach verified installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_CHANNEL: ${{ needs.resolve.outputs.channel }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source }}
+        run: |
+          git fetch origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          assets=()
+          for arch in arm64 x86_64; do
+            for ext in dmg zip sha256; do
+              file="release-assets/Wiesel-$RELEASE_VERSION-macos-$arch.$ext"
+              test -s "$file"
+              assets+=("$file")
+            done
+          done
+          (cd release-assets && shasum -a 256 -c *.sha256)
+          # Listing fails closed on API/auth errors; don't treat any error as 'not found'.
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[]' | jq -s --arg tag "$RELEASE_TAG" 'map(select(.tag_name == $tag))' > existing.json
+          test "$(jq length existing.json)" -le 1
+          if [[ "$(jq length existing.json)" == 1 ]]; then
+            test "$(jq -r '.[0].target_commitish' existing.json)" = "$SOURCE_SHA"
+            if [[ "$(jq -r '.[0].draft' existing.json)" != true ]]; then
+              echo 'Already published; leaving existing assets and notes unchanged.'
+              exit 0
+            fi
+          else
+            prerelease=false
+            if [[ "$RELEASE_CHANNEL" == preview ]]; then prerelease=true; fi
+            gh release create "$RELEASE_TAG" --verify-tag --target "$SOURCE_SHA" --draft "--prerelease=$prerelease" --title "Wiesel $RELEASE_TAG" --notes-file release-notes.md
+          fi
+          # Existing draft notes are intentionally preserved for human edits.
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort' > assets.json
+          printf '%s\n' "${assets[@]##*/}" | jq -R . | jq -s 'sort' > expected.json
+          diff -u expected.json assets.json
+          printf '### Review release draft\n\n[Review notes and installers](https://github.com/%s/releases/tag/%s), then approve the **release** environment deployment.\n' "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+  publish:
+    needs: [resolve, draft]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -111,55 +175,46 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.resolve.outputs.source }}
+          ref: main
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          pattern: macos-*
-          merge-multiple: true
-          path: release-assets
-      - name: Create the release, attach installers and publish
+      - name: Verify draft and publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_CHANNEL: ${{ needs.resolve.outputs.channel }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source }}
         run: |
-          # Detect a tag moved after resolution; never release different source.
-          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
-          version="${RELEASE_TAG#v}"
-          assets=()
+          # Fetch private origins without persisting checkout credentials.
+          gh auth setup-git
+          # Check the live tag again after any approval delay.
+          git fetch origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          gh release view "$RELEASE_TAG" --json isDraft,targetCommitish,isPrerelease,assets > release.json
+          test "$(jq -r .targetCommitish release.json)" = "$SOURCE_SHA"
+          prerelease=false
+          if [[ "$RELEASE_CHANNEL" == preview ]]; then prerelease=true; fi
+          test "$(jq -r .isPrerelease release.json)" = "$prerelease"
+          expected=()
           for arch in arm64 x86_64; do
             for ext in dmg zip sha256; do
-              file="release-assets/Wiesel-$version-macos-$arch.$ext"
-              test -s "$file"
-              assets+=("$file")
+              expected+=("Wiesel-$RELEASE_VERSION-macos-$arch.$ext")
             done
           done
-          (cd release-assets && shasum -a 256 -c *.sha256)
-          if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > release.json; then
-            if [[ "$(jq -r .isDraft release.json)" != true ]]; then
-              echo 'Already published; leaving existing assets unchanged.'
-              exit 0
-            fi
-            test "$(jq -r .targetCommitish release.json)" = "$SOURCE_SHA"
-          else
-            # No bot is required: create a draft only after checks/builds pass.
-            awk -v version="$version" '
-              $1 == "##" && $2 == version { found=1; next }
-              found && /^## / { exit }
-              found { print }
-            ' CHANGELOG.md > release-notes.md
-            test -s release-notes.md
-            printf '\nBuilds are ad-hoc signed, not notarized. See README installation instructions.\n' >> release-notes.md
-            gh release create "$RELEASE_TAG" --verify-tag --target "$SOURCE_SHA" --draft --title "Wiesel $version" --notes-file release-notes.md
+          printf '%s\n' "${expected[@]}" | jq -R . | jq -s 'sort' > expected.json
+          jq '[.assets[].name] | sort' release.json > assets.json
+          diff -u expected.json assets.json
+          if [[ "$(jq -r .isDraft release.json)" != true ]]; then
+            echo 'Already published; leaving release unchanged.'
+            exit 0
           fi
-          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
-          test "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')" = 6
-          # Paginate all releases and fail closed if GitHub cannot provide history.
-          published="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v[0-9]+[.][0-9]+[.][0-9]+$"))')"
-          newest="$(printf '%s\n%s\n' "$RELEASE_TAG" "$published" | sort -V | tail -n 1)"
           latest=false
-          if [[ "$newest" == "$RELEASE_TAG" ]]; then latest=true; fi
-          gh release edit "$RELEASE_TAG" --target "$SOURCE_SHA" --draft=false "--latest=$latest"
+          if [[ "$RELEASE_CHANNEL" == stable ]]; then
+            published="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v[0-9]+[.][0-9]+[.][0-9]+$"))')"
+            newest="$(printf '%s\n%s\n' "$RELEASE_TAG" "$published" | sort -V | tail -n 1)"
+            if [[ "$newest" == "$RELEASE_TAG" ]]; then latest=true; fi
+          fi
+          gh release edit "$RELEASE_TAG" --target "$SOURCE_SHA" --draft=false "--prerelease=$prerelease" "--latest=$latest"
+          printf '### Published\n\nhttps://github.com/%s/releases/tag/%s\n' "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,29 @@
+name: Release notes
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  validate:
+    name: Release notes required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Run the trusted base-branch validator, never code from a fork PR.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: github.event_name == 'pull_request'
+        with:
+          python-version: '3.13'
+      - name: Validate the PR description
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/release.py check-pr --event-file "$GITHUB_EVENT_PATH"
+      - name: Merge queue
+        if: github.event_name == 'merge_group'
+        run: echo 'Release notes are validated on each constituent PR.'

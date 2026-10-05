@@ -1,11 +1,14 @@
 ## Summary
 
-<!-- What changed and why? -->
+<!-- What changed and why? Link resolved issues with Closes #123. -->
 
 ## Validation
 
 - [ ] Rust and script tests pass
-- [ ] Documented user-facing changes with `knope document-change` or conventional commits
 - [ ] Manual macOS checks completed when changing native/UI behavior
+- [ ] Reviewed the diff and the user-facing release notes below
 
-<!-- Internal-only changes can use ci:, docs:, or chore: conventional commits. -->
+Release Notes:
+
+<!-- Replace the placeholder with user-facing bullet points, or use only - N/A for internal changes. No version bump is needed in feature PRs. -->
+- Added/Fixed/Improved ...

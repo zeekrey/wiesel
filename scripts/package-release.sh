@@ -3,7 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$root"
-version="$(knope get-version)"
+version="$(python3 scripts/release.py version)"
 build_number="$(git rev-list --count HEAD)"
 case "$(uname -m)" in
     arm64) arch=arm64 ;;
