@@ -1,4 +1,4 @@
-# Wiesel
+# Wiesel 🦫
 
 A small, Raycast-inspired native writing launcher built with Rust and GPUI. **This first version supports macOS only**; other targets are explicitly rejected until their native selection and persistent credential backends are implemented.
 
