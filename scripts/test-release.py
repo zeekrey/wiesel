@@ -74,6 +74,39 @@ class ParserTests(unittest.TestCase):
                 release.git("fetch")
 
 
+@unittest.skipUnless(shutil.which("jq"), "jq is required for hosted-workflow regression tests")
+class WorkflowAssetTests(unittest.TestCase):
+    def test_draft_and_publish_compare_json_values(self):
+        workflow = SCRIPT.parent.parent / ".github/workflows/release.yml"
+        # Execute the actual validation commands from both jobs, not a copied
+        # implementation, so reverting to text diff reproduces the failure.
+        commands = [line.strip() for line in workflow.read_text().splitlines()
+                    if line.strip().endswith("assets.json")
+                    and not line.strip().endswith("> assets.json")]
+        self.assertEqual(len(commands), 2, "Both draft and publish must validate assets")
+        expected = sorted(f"Wiesel-0.2.0-macos-{arch}.{ext}"
+                          for arch in ("arm64", "x86_64")
+                          for ext in ("dmg", "zip", "sha256"))
+        with tempfile.TemporaryDirectory(prefix="asset validation ") as temp:
+            root = Path(temp)
+            (root / "expected.json").write_text(json.dumps(expected, indent=2) + "\n")
+            cases = (
+                ("compact gh output", expected, None, True),
+                ("pretty jq output", expected, 2, True),
+                ("missing installer", expected[:-1], None, False),
+                ("unexpected asset", sorted(expected + ["unexpected.txt"]), None, False),
+                ("wrong architecture", sorted(expected[:-1] + ["Wiesel-0.2.0-macos-other.zip"]), None, False),
+            )
+            for command in commands:
+                for name, assets, indent, succeeds in cases:
+                    with self.subTest(command=command, case=name):
+                        (root / "assets.json").write_text(json.dumps(assets, indent=indent) + "\n")
+                        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
+                                                cwd=root, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode == 0, succeeds,
+                                         result.stdout + result.stderr)
+
+
 class GitTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="release tests ")

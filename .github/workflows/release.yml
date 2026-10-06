@@ -160,7 +160,8 @@ jobs:
           gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort' > assets.json
           printf '%s\n' "${assets[@]##*/}" | jq -R . | jq -s 'sort' > expected.json
-          diff -u expected.json assets.json
+          # Compare JSON values, not gh/jq output formatting.
+          jq -e --slurpfile expected expected.json '. == $expected[0]' assets.json
           printf '### Review release draft\n\n[Review notes and installers](https://github.com/%s/releases/tag/%s), then approve the **release** environment deployment.\n' "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
   publish:
     needs: [resolve, draft]
@@ -205,7 +206,8 @@ jobs:
           done
           printf '%s\n' "${expected[@]}" | jq -R . | jq -s 'sort' > expected.json
           jq '[.assets[].name] | sort' release.json > assets.json
-          diff -u expected.json assets.json
+          # Keep the same exact asset-set check after the approval delay.
+          jq -e --slurpfile expected expected.json '. == $expected[0]' assets.json
           if [[ "$(jq -r .isDraft release.json)" != true ]]; then
             echo 'Already published; leaving release unchanged.'
             exit 0
