@@ -7,6 +7,13 @@ edition = "2024"
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "f8c2cc844057540ca1eac7de4f19f50d7597dead" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "f8c2cc844057540ca1eac7de4f19f50d7597dead", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
 anyhow = "1"
+base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+uuid = { version = "1", features = ["serde"] }
+zeroize = { version = "1", features = ["serde"] }
 global-hotkey = "0.7"
 keyring = { version = "3", features = ["apple-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
