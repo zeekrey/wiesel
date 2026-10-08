@@ -40,6 +40,7 @@ impl Severity {
 /// A source owns its issue; unrelated successes cannot erase it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
+    Diagnostics,
     Settings,
     Keychain,
     Hotkey,
@@ -129,9 +130,9 @@ impl Notifications {
         self.issues
             .push((source, Notification::new(severity, message)));
     }
-    /// Keep diagnostic details out of the one-line UI. Never pass credentials here.
-    pub fn report(&mut self, source: Source, message: &str, error: &anyhow::Error) {
-        eprintln!("Wiesel {source:?}: {error:#}");
+    /// Publish safe UI copy without formatting the error or its source chain.
+    /// Typed local diagnostics are recorded separately by the operation owner.
+    pub fn report(&mut self, source: Source, message: &str, _error: &anyhow::Error) {
         self.issue(source, Severity::Error, message);
     }
     pub fn clear(&mut self, source: Source) {
@@ -369,6 +370,26 @@ mod tests {
         state.clear(Source::Keychain);
         state.update(Instant::now(), idle());
         assert_eq!(state.visible.as_ref().unwrap().message, "Refresh models.");
+    }
+    #[test]
+    fn diagnostic_recovery_does_not_clear_a_settings_failure() {
+        let mut state = Notifications::default();
+        state.issue(
+            Source::Settings,
+            Severity::Error,
+            "Could not save settings.",
+        );
+        state.issue(
+            Source::Diagnostics,
+            Severity::Warning,
+            "Close other Wiesel instances.",
+        );
+        state.clear(Source::Diagnostics);
+        state.update(Instant::now(), idle());
+        assert_eq!(
+            state.visible.as_ref().unwrap().message,
+            "Could not save settings."
+        );
     }
     #[test]
     fn unchanged_status_does_not_restart_animation() {

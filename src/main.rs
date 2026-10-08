@@ -1,7 +1,12 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("Wiesel currently supports macOS only (native selection and Keychain backend).");
 
+mod auth;
+#[cfg(test)]
+mod chat_tests;
 mod clipboard_capture;
+mod completion_backend;
+mod diagnostics;
 mod gateway;
 mod input;
 mod model_picker;
@@ -11,17 +16,25 @@ mod selection;
 mod settings;
 mod theme;
 
-use anyhow::Context as _;
+use auth::{AuthError, DesktopClient, DeviceCredential};
+use diagnostics::{
+    Category, Completion, DiagnosticError, Diagnostics, Event, EventKind, FailureCode, Stage,
+};
 use gateway::Message;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
-use gpui::{KeyBinding, prelude::*, *};
+use gpui::{
+    App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, FontWeight,
+    KeyBinding, KeyDownEvent, MouseButton, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    Stateful, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*, px, relative,
+    rgb, rgba, size,
+};
 use input::TextInput;
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::{QUICK_ACTIONS, QuickAction};
 use settings::Settings;
 use std::{
     str::FromStr,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -101,19 +114,448 @@ impl Render for HeaderTooltip {
     }
 }
 
-enum ResultEvent {
-    Auth(anyhow::Result<()>, String),
+actions!(wiesel, [Login]);
+
+// Every async event is bound to both a login generation and the issuing device.
+// Secrets stay in the credential/attempt; neither is copied into the event scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EventScope {
+    generation: u64,
+    device_id: Option<uuid::Uuid>,
+}
+#[derive(Default)]
+struct DesktopSession {
+    generation: u64,
+    credential: Option<Arc<DeviceCredential>>,
+    attempt: Option<auth::Attempt>,
+    exchanging: bool,
+}
+impl DesktopSession {
+    fn scope(&self) -> EventScope {
+        EventScope {
+            generation: self.generation,
+            device_id: self.credential.as_ref().map(|c| c.device_id()),
+        }
+    }
+    fn accepts(&self, scope: EventScope) -> bool {
+        self.scope() == scope
+    }
+    fn cancel_login(&mut self) {
+        self.generation += 1;
+        if let Some(mut attempt) = self.attempt.take() {
+            attempt.cancel();
+        }
+        self.exchanging = false;
+    }
+    fn end_session(&mut self) -> Option<settings::CleanupTarget> {
+        let target = self
+            .credential
+            .take()
+            .map(|credential| settings::CleanupTarget::device(credential.device_id()));
+        self.cancel_login();
+        target
+    }
+    fn consume_callback(&mut self, raw: &str) -> Result<auth::ExchangeRequest, AuthError> {
+        let request = auth::consume_callback(&mut self.attempt, raw)?;
+        self.exchanging = true;
+        Ok(request)
+    }
+    fn persist_exchange(
+        &mut self,
+        scope: EventScope,
+        credential: DeviceCredential,
+        save: impl FnOnce(&DeviceCredential) -> Result<(), settings::CredentialError>,
+    ) -> Result<bool, settings::CredentialError> {
+        if !self.accepts(scope) || !self.exchanging {
+            return Ok(false);
+        }
+        self.exchanging = false;
+        save(&credential)?;
+        self.credential = Some(Arc::new(credential));
+        Ok(true)
+    }
+    fn login_url(&mut self) -> Result<zeroize::Zeroizing<String>, AuthError> {
+        // Replacement invalidates old completions even if secure randomness fails.
+        self.generation += 1;
+        self.exchanging = false;
+        let result = if let Some(attempt) = &mut self.attempt {
+            attempt.replace()
+        } else {
+            auth::Attempt::new().map(|attempt| self.attempt = Some(attempt))
+        };
+        let result = result.and_then(|()| {
+            self.attempt
+                .as_mut()
+                .ok_or(AuthError::Inactive)?
+                .login_url()
+        });
+        if result.is_err() {
+            self.cancel_login();
+        }
+        result.map(zeroize::Zeroizing::new)
+    }
+}
+// Recovery never discovers a deletion target at retry time. A load that could
+// not observe the pointer can only retry restoration, not remove a later login.
+#[derive(Default)]
+enum CredentialRecovery {
+    #[default]
+    Ready,
+    Restore,
+    Remove(settings::CleanupTarget),
+}
+impl CredentialRecovery {
+    fn from_load_failure(failure: settings::CredentialLoadError) -> Self {
+        match failure.cleanup {
+            Some(target) => Self::Remove(target),
+            None => Self::Restore,
+        }
+    }
+    fn blocks_login(&self) -> bool {
+        !matches!(self, Self::Ready)
+    }
+    fn restore_only(&self) -> bool {
+        matches!(self, Self::Restore)
+    }
+    fn remove(
+        &mut self,
+        target: Option<settings::CleanupTarget>,
+        delete: impl FnOnce(&settings::CleanupTarget) -> Result<(), settings::CredentialError>,
+    ) -> Result<(), settings::CredentialError> {
+        if let Some(target) = target {
+            *self = Self::Remove(target);
+        }
+        match self {
+            Self::Ready => (),
+            Self::Restore => return Err(settings::CredentialError::Keychain),
+            Self::Remove(target) => delete(target)?,
+        }
+        *self = Self::Ready;
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod desktop_session_tests {
+    use super::{CredentialRecovery, DesktopSession, EventScope};
+    use crate::{
+        auth::AuthError,
+        settings::{self, CredentialError, DeviceCredential},
+    };
+    use std::{cell::Cell, sync::Arc};
+
+    fn credential(device: u128) -> DeviceCredential {
+        let now = settings::utc_now_ms().unwrap();
+        DeviceCredential::validated(
+            zeroize::Zeroizing::new(format!("wd_{}", "t".repeat(43))),
+            now + 60_000,
+            uuid::Uuid::from_u128(device),
+            now,
+        )
+        .unwrap()
+    }
+    fn callback(url: &str) -> String {
+        let url = reqwest::Url::parse(url).unwrap();
+        let state = url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        format!(
+            "wiesel://auth/callback?code={}&state={state}",
+            "c".repeat(43)
+        )
+    }
+    #[test]
+    fn cold_launch_callback_does_not_create_an_exchange() {
+        let mut session = DesktopSession::default();
+        let raw = format!(
+            "wiesel://auth/callback?code={}&state={}",
+            "c".repeat(43),
+            "s".repeat(43)
+        );
+        assert!(matches!(
+            session.consume_callback(&raw),
+            Err(AuthError::Inactive)
+        ));
+        assert!(!session.exchanging);
+    }
+    #[test]
+    fn matching_callback_consumes_the_only_attempt_before_exchange() {
+        let mut session = DesktopSession::default();
+        let raw = callback(&session.login_url().unwrap());
+        let _request = session.consume_callback(&raw).unwrap();
+        assert!(session.attempt.is_none());
+        assert!(session.exchanging);
+        assert!(matches!(
+            session.consume_callback(&raw),
+            Err(AuthError::Inactive)
+        ));
+    }
+    #[test]
+    fn canceled_exchange_never_calls_persistence() {
+        let mut session = DesktopSession::default();
+        let raw = callback(&session.login_url().unwrap());
+        let _request = session.consume_callback(&raw).unwrap();
+        let scope = session.scope();
+        session.cancel_login();
+        let called = Cell::new(false);
+        let saved = session
+            .persist_exchange(scope, credential(1), |_| {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!saved);
+        assert!(!called.get());
+        assert!(session.credential.is_none());
+    }
+    #[test]
+    fn replaced_exchange_never_calls_persistence_or_changes_new_attempt() {
+        let mut session = DesktopSession::default();
+        let raw = callback(&session.login_url().unwrap());
+        let _request = session.consume_callback(&raw).unwrap();
+        let scope = session.scope();
+        let new_raw = callback(&session.login_url().unwrap());
+        let saved = session
+            .persist_exchange(scope, credential(1), |_| panic!("stale persistence"))
+            .unwrap();
+        assert!(!saved);
+        assert!(session.consume_callback(&new_raw).is_ok());
+    }
+    #[test]
+    fn matching_exchange_is_persisted_once_and_binds_events_to_device() {
+        let mut session = DesktopSession::default();
+        let raw = callback(&session.login_url().unwrap());
+        let _request = session.consume_callback(&raw).unwrap();
+        let scope = session.scope();
+        let writes = Cell::new(0);
+        assert!(
+            session
+                .persist_exchange(scope, credential(1), |_| {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(
+            !session
+                .persist_exchange(scope, credential(1), |_| panic!("replay persistence"))
+                .unwrap()
+        );
+        assert_eq!(writes.get(), 1);
+        assert_eq!(session.scope().device_id, Some(uuid::Uuid::from_u128(1)));
+    }
+    #[test]
+    fn persistence_failure_does_not_sign_in_or_leave_attempt_secrets() {
+        let mut session = DesktopSession::default();
+        let raw = callback(&session.login_url().unwrap());
+        let _request = session.consume_callback(&raw).unwrap();
+        let result = session.persist_exchange(session.scope(), credential(1), |_| {
+            Err(CredentialError::Keychain)
+        });
+        assert_eq!(result, Err(CredentialError::Keychain));
+        assert!(session.credential.is_none());
+        assert!(session.attempt.is_none());
+        assert!(!session.exchanging);
+    }
+    #[test]
+    fn old_status_models_unauthorized_and_inference_events_fail_one_shared_gate() {
+        let mut session = DesktopSession {
+            credential: Some(Arc::new(credential(1))),
+            ..Default::default()
+        };
+        let old_scope = session.scope();
+        session.cancel_login();
+        session.credential = Some(Arc::new(credential(2)));
+        assert!(!session.accepts(old_scope));
+        assert!(session.accepts(session.scope()));
+    }
+    #[test]
+    fn wrong_device_is_rejected_even_with_the_current_generation() {
+        let session = DesktopSession {
+            credential: Some(Arc::new(credential(2))),
+            ..Default::default()
+        };
+        assert!(!session.accepts(EventScope {
+            generation: session.generation,
+            device_id: Some(uuid::Uuid::from_u128(1))
+        }));
+    }
+    #[test]
+    fn cancel_reopen_invalidates_the_old_browser_callback() {
+        let mut session = DesktopSession::default();
+        let old_raw = callback(&session.login_url().unwrap());
+        session.cancel_login();
+        let _new_url = session.login_url().unwrap();
+        assert!(matches!(
+            session.consume_callback(&old_raw),
+            Err(AuthError::StateMismatch)
+        ));
+        assert!(session.attempt.is_some());
+    }
+    #[test]
+    fn native_delete_failure_blocks_login_and_successful_retry_clears_recovery() {
+        let mut session = DesktopSession {
+            credential: Some(Arc::new(credential(1))),
+            ..Default::default()
+        };
+        let old_scope = session.scope();
+        let target = session.end_session();
+        let mut recovery = CredentialRecovery::Ready;
+        let failed = recovery.remove(target, |_| {
+            settings::checked_native_delete(Err(security_framework::base::Error::from_code(-25292)))
+        });
+        assert_eq!(failed, Err(CredentialError::Keychain));
+        assert!(recovery.blocks_login());
+        assert!(!recovery.restore_only());
+        assert!(session.credential.is_none());
+        assert!(!session.accepts(old_scope));
+        let called = Cell::new(false);
+        recovery
+            .remove(None, |_| {
+                called.set(true);
+                settings::checked_native_delete(Ok(()))
+            })
+            .unwrap();
+        assert!(called.get());
+        assert!(!recovery.blocks_login());
+    }
+
+    #[test]
+    fn unobserved_startup_failure_can_only_retry_restore_not_delete_a_later_device() {
+        let mut recovery = CredentialRecovery::from_load_failure(settings::CredentialLoadError {
+            error: CredentialError::Keychain,
+            cleanup: None,
+        });
+        assert!(recovery.restore_only());
+        assert_eq!(
+            recovery.remove(None, |_| panic!("unknown-identity cleanup must not delete")),
+            Err(CredentialError::Keychain)
+        );
+        assert!(recovery.blocks_login());
+    }
+
+    #[test]
+    fn failed_known_startup_cleanup_retains_target_for_retry_without_restoring() {
+        let mut recovery = CredentialRecovery::from_load_failure(settings::CredentialLoadError {
+            error: CredentialError::Invalid,
+            cleanup: Some(settings::CleanupTarget::device(uuid::Uuid::from_u128(1))),
+        });
+        assert!(!recovery.restore_only());
+        assert_eq!(
+            recovery.remove(None, |_| Err(CredentialError::Keychain)),
+            Err(CredentialError::Keychain)
+        );
+        assert!(recovery.blocks_login());
+        recovery.remove(None, |_| Ok(())).unwrap();
+        assert!(!recovery.blocks_login());
+    }
+}
+
+struct ResultEvent {
+    scope: EventScope,
+    result: ResultPayload,
+}
+enum ResultPayload {
+    Exchange(Result<DeviceCredential, AuthError>),
+    Status(Result<auth::DeviceStatus, AuthError>, bool),
     Models(anyhow::Result<Vec<String>>),
     ChatDelta(String),
     Completion(anyhow::Result<String>, bool),
+    SignOut(Result<(), AuthError>),
 }
+#[derive(Clone, Copy)]
+enum DiagnosticControl {
+    OpenFolder,
+    ClearLogs,
+}
+impl DiagnosticControl {
+    fn stage(self) -> Stage {
+        match self {
+            Self::OpenFolder => Stage::OpenFolder,
+            Self::ClearLogs => Stage::ClearLogs,
+        }
+    }
+}
+enum DiagnosticUpdate {
+    Initialized(Result<Diagnostics, DiagnosticError>),
+    Controlled(DiagnosticControl, Result<(), DiagnosticError>),
+}
+fn diagnostic_failure_message(error: DiagnosticError) -> &'static str {
+    match error {
+        DiagnosticError::OtherSessionActive => {
+            "Close other Wiesel instances, then clear logs again."
+        }
+        DiagnosticError::UnsafePath => {
+            "Unsafe logs path refused. Check ~/Library/Logs/Wiesel and relaunch."
+        }
+        DiagnosticError::InvalidHome => {
+            "Logs folder unavailable. Check your home folder and relaunch."
+        }
+        DiagnosticError::QueueFull => "Diagnostics busy. Wait and try again.",
+        DiagnosticError::StorageBudget => {
+            "Logs storage full. Close other Wiesel instances and clear logs."
+        }
+        DiagnosticError::Io(std::io::ErrorKind::PermissionDenied) => {
+            "Logs permission denied. Check folder permissions and relaunch."
+        }
+        _ => "Local diagnostics unavailable. Check disk space and folder permissions; relaunch.",
+    }
+}
+fn finder_command(path: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command
+        .args(["-a", "Finder", "--"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+fn run_diagnostic_control(
+    diagnostics: &Diagnostics,
+    control: DiagnosticControl,
+) -> Result<(), DiagnosticError> {
+    match control {
+        DiagnosticControl::ClearLogs => diagnostics.clear()?.wait(),
+        DiagnosticControl::OpenFolder => {
+            let path = diagnostics.log_directory()?;
+            let status = finder_command(&path)
+                .status()
+                .map_err(DiagnosticError::from)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(DiagnosticError::Io(std::io::ErrorKind::Other))
+            }
+        }
+    }
+}
+
 struct Wiesel {
     page: Page,
     settings: Settings,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_initializing: bool,
+    diagnostics_busy: bool,
+    #[cfg(test)]
+    controlled_diagnostic_requests: Option<Vec<DiagnosticControl>>,
+    diagnostics_tx: mpsc::Sender<DiagnosticUpdate>,
+    diagnostics_rx: mpsc::Receiver<DiagnosticUpdate>,
+    diagnostic_flush: Option<Completion>,
+    diagnostic_flushed_at: Instant,
+    diagnostics_open_focus: FocusHandle,
+    diagnostics_clear_focus: FocusHandle,
     manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
     hotkey_input: Entity<TextInput>,
-    key_input: Entity<TextInput>,
+    session: DesktopSession,
+    login_focus: FocusHandle,
+    urls: mpsc::Receiver<zeroize::Zeroizing<String>>,
+    status_loading: bool,
+    device_status: Option<auth::DeviceStatus>,
+    recovery: CredentialRecovery,
     model_picker: Entity<model_picker::ModelPicker>,
     grammar_input: Entity<TextInput>,
     improve_input: Entity<TextInput>,
@@ -137,9 +579,16 @@ struct Wiesel {
     chat_scroll: ScrollHandle,
     chat_follow_bottom: bool,
     streaming_chat: Option<Message>,
+    completion_backend: completion_backend::CompletionBackend,
 }
 impl Wiesel {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        urls: mpsc::Receiver<zeroize::Zeroizing<String>>,
+        diagnostics_tx: mpsc::Sender<DiagnosticUpdate>,
+        diagnostics_rx: mpsc::Receiver<DiagnosticUpdate>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut notifications = Notifications::default();
         let settings = match settings::load() {
             Ok(s) => s,
@@ -152,15 +601,15 @@ impl Wiesel {
                 Settings::default()
             }
         };
-        let authenticated = match settings::key() {
-            Ok(key) => key.is_some(),
-            Err(e) => {
-                notifications.report(
+        let (credential, recovery) = match settings::load_device_credential() {
+            Ok(credential) => (credential.map(Arc::new), CredentialRecovery::Ready),
+            Err(failure) => {
+                notifications.issue(
                     Source::Keychain,
-                    "Could not read API key. Unlock Keychain and reconnect.",
-                    &e,
+                    Severity::Error,
+                    "Could not restore login. Unlock Keychain and retry the saved-login recovery control.",
                 );
-                false
+                (None, CredentialRecovery::from_load_failure(failure))
             }
         };
         let manager = match GlobalHotKeyManager::new() {
@@ -183,24 +632,42 @@ impl Wiesel {
         improve_input.update(cx, |i, cx| i.set(settings.improve_prompt.clone(), cx));
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
-            page: if settings.onboarded && authenticated {
-                Page::Launcher
-            } else {
-                Page::Setup
-            },
+            page: Page::Setup,
             settings,
+            diagnostics: None,
+            diagnostics_initializing: true,
+            diagnostics_busy: false,
+            #[cfg(test)]
+            controlled_diagnostic_requests: None,
+            diagnostics_tx,
+            diagnostics_rx,
+            diagnostic_flush: None,
+            diagnostic_flushed_at: Instant::now(),
+            diagnostics_open_focus: cx.focus_handle().tab_stop(true),
+            diagnostics_clear_focus: cx.focus_handle().tab_stop(true),
             manager,
             hotkey: None,
             hotkey_input,
             model_picker,
             grammar_input,
             improve_input,
-            key_input: cx.new(|cx| TextInput::new("Paste your AI Gateway API key", true, cx)),
-            composer: cx.new(|cx| TextInput::new("Ask anything…", false, cx)),
+            session: DesktopSession {
+                credential,
+                ..Default::default()
+            },
+            login_focus: cx.focus_handle().tab_stop(true),
+            urls,
+            status_loading: false,
+            device_status: None,
+            recovery,
+            composer: cx.new(|cx| {
+                TextInput::new("Ask anything…", false, cx)
+                    .with_accessibility_id("wiesel.chat.composer")
+            }),
             launcher_input: cx.new(TextInput::launcher),
             focus: cx.focus_handle(),
             recording: false,
-            authenticated,
+            authenticated: false,
             accessibility_granted: selection::accessibility_granted(),
             permission_checked_at: Instant::now(),
             busy: false,
@@ -219,10 +686,10 @@ impl Wiesel {
             chat_scroll: ScrollHandle::new(),
             chat_follow_bottom: true,
             streaming_chat: None,
+            completion_backend: completion_backend::CompletionBackend::Gateway,
         };
         for input in [
             &app.hotkey_input,
-            &app.key_input,
             &app.grammar_input,
             &app.improve_input,
             &app.composer,
@@ -240,7 +707,7 @@ impl Wiesel {
             },
         )
         .detach();
-        // Opening the app must work even before AI Gateway onboarding is complete.
+        // The shortcut also works before browser login and onboarding are complete.
         if let Err(e) = app.register(&app.settings.hotkey.clone()) {
             app.notifications.report(
                 Source::Hotkey,
@@ -257,14 +724,187 @@ impl Wiesel {
             cx.hide();
             false
         });
-        if app.page == Page::Launcher {
-            window.focus(&app.launcher_input.focus_handle(cx), cx);
-        } else {
-            window.focus(&app.focus, cx);
-        }
+        window.focus(&app.login_focus, cx);
+        app.poll_diagnostics(cx);
         app.sync_permission_issue();
-        app.refresh_models(cx);
+        app.refresh_status(true, cx);
         app
+    }
+    // Called only by the production entry point, never by in-process UI fixtures.
+    fn register_diagnostic_shutdown(&mut self, cx: &mut Context<Self>) {
+        cx.on_app_quit(|this, cx| {
+            let diagnostics = this.diagnostics.take();
+            cx.background_executor().spawn(async move {
+                if let Some(diagnostics) = diagnostics {
+                    let _ = diagnostics.record(
+                        Event::new(Category::Application, EventKind::Succeeded),
+                        None,
+                    );
+                    if let Err(error) = diagnostics.shutdown().and_then(Completion::wait) {
+                        // Closed storage errors only; no arbitrary app/network errors.
+                        eprintln!("Diagnostics shutdown incomplete: {error}");
+                    }
+                }
+            })
+        })
+        .detach();
+    }
+    fn poll_diagnostics(&mut self, cx: &mut Context<Self>) {
+        while let Ok(update) = self.diagnostics_rx.try_recv() {
+            match update {
+                DiagnosticUpdate::Initialized(result) => {
+                    self.diagnostics_initializing = false;
+                    match result {
+                        Ok(diagnostics) => {
+                            let _ = diagnostics.record(
+                                Event::new(Category::Application, EventKind::Started),
+                                None,
+                            );
+                            self.diagnostic_flush = diagnostics.flush().ok();
+                            self.diagnostics = Some(diagnostics);
+                            self.record_diagnostic_outcome(
+                                Category::Accessibility,
+                                self.accessibility_granted,
+                                FailureCode::Permission,
+                            );
+                        }
+                        Err(error) => self.notifications.issue(
+                            Source::Diagnostics,
+                            Severity::Warning,
+                            diagnostic_failure_message(error),
+                        ),
+                    }
+                }
+                DiagnosticUpdate::Controlled(control, result) => {
+                    self.diagnostics_busy = false;
+                    self.notifications.clear(Source::Diagnostics);
+                    match result {
+                        Ok(()) => self.notifications.success(match control {
+                            DiagnosticControl::OpenFolder => "Logs folder opened in Finder.",
+                            DiagnosticControl::ClearLogs => "Logs cleared. New diagnostics continue locally.",
+                        }),
+                        Err(error) => self.notifications.issue(Source::Diagnostics, Severity::Warning,
+                            if matches!(control, DiagnosticControl::OpenFolder) && matches!(error, DiagnosticError::Io(_)) {
+                                "Could not open logs in Finder. Check folder permissions and try again."
+                            } else { diagnostic_failure_message(error) }),
+                    }
+                }
+            }
+            cx.notify();
+        }
+        if let Some(result) = self
+            .diagnostic_flush
+            .as_ref()
+            .and_then(Completion::try_wait)
+        {
+            self.diagnostic_flush = None;
+            if let Err(error) = result {
+                self.notifications.issue(
+                    Source::Diagnostics,
+                    Severity::Warning,
+                    diagnostic_failure_message(error),
+                );
+                cx.notify();
+            }
+        }
+        if self.diagnostic_flush.is_none()
+            && self.diagnostic_flushed_at.elapsed() >= Duration::from_secs(30)
+        {
+            self.diagnostic_flushed_at = Instant::now();
+            if let Some(diagnostics) = &self.diagnostics {
+                match diagnostics.flush() {
+                    Ok(completion) => self.diagnostic_flush = Some(completion),
+                    Err(error) => {
+                        self.notifications.issue(
+                            Source::Diagnostics,
+                            Severity::Warning,
+                            diagnostic_failure_message(error),
+                        );
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+    fn diagnostic_control(&mut self, control: DiagnosticControl, cx: &mut Context<Self>) {
+        if self.diagnostics_busy || self.diagnostics_initializing {
+            return;
+        }
+        // Controlled UI tests release completions explicitly, without storage or Finder.
+        #[cfg(test)]
+        if let Some(requests) = &mut self.controlled_diagnostic_requests {
+            requests.push(control);
+            self.diagnostics_busy = true;
+            cx.notify();
+            return;
+        }
+        let Some(diagnostics) = self.diagnostics.clone() else {
+            self.notifications
+                .warning("Local diagnostics unavailable. Check folder permissions and relaunch.");
+            cx.notify();
+            return;
+        };
+        self.diagnostics_busy = true;
+        self.notifications.working(
+            Source::Diagnostics,
+            match control {
+                DiagnosticControl::OpenFolder => "Opening logs folder…",
+                DiagnosticControl::ClearLogs => "Clearing local logs…",
+            },
+        );
+        let tx = self.diagnostics_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("wiesel-diagnostic-control".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let id = diagnostics.new_action_id();
+                let _ = diagnostics.record(
+                    Event::new(Category::Diagnostics, EventKind::Started)
+                        .at_stage(control.stage(), 0),
+                    Some(id),
+                );
+                let result = run_diagnostic_control(&diagnostics, control);
+                let event = match result {
+                    Ok(()) => Event::new(Category::Diagnostics, EventKind::Succeeded),
+                    Err(DiagnosticError::OtherSessionActive) => {
+                        Event::failure(Category::Diagnostics, FailureCode::Conflict)
+                    }
+                    Err(
+                        DiagnosticError::UnsafePath
+                        | DiagnosticError::Io(std::io::ErrorKind::PermissionDenied),
+                    ) => Event::failure(Category::Diagnostics, FailureCode::Permission),
+                    Err(_) => Event::failure(Category::Diagnostics, FailureCode::Storage),
+                };
+                let _ = diagnostics.record(
+                    event.at_stage(
+                        control.stage(),
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    ),
+                    Some(id),
+                );
+                let _ = tx.send(DiagnosticUpdate::Controlled(control, result));
+            });
+        if let Err(error) = spawned {
+            self.diagnostics_busy = false;
+            self.notifications.issue(
+                Source::Diagnostics,
+                Severity::Warning,
+                diagnostic_failure_message(error.into()),
+            );
+        }
+        cx.notify();
+    }
+    fn record_diagnostic(&self, event: Event) {
+        if let Some(diagnostics) = &self.diagnostics {
+            let _ = diagnostics.record(event, Some(diagnostics.new_action_id()));
+        }
+    }
+    fn record_diagnostic_outcome(&self, category: Category, succeeded: bool, code: FailureCode) {
+        self.record_diagnostic(if succeeded {
+            Event::new(category, EventKind::Succeeded)
+        } else {
+            Event::failure(category, code)
+        });
     }
     fn input_notification(&mut self, notification: &Notification, cx: &mut Context<Self>) {
         self.notifications.suppress_motion = true;
@@ -309,6 +949,7 @@ impl Wiesel {
         }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&text) {
+            self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
             self.notifications.report(
                 Source::Hotkey,
                 "Could not activate shortcut. Choose another and retry.",
@@ -320,11 +961,16 @@ impl Wiesel {
             next.hotkey = text;
             match settings::save(&next) {
                 Ok(()) => {
+                    self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
                     self.settings = next;
                     self.notifications.clear(Source::Settings);
                     self.notifications.success("Shortcut active and saved.");
                 }
                 Err(e) => {
+                    self.record_diagnostic(Event::failure(
+                        Category::Settings,
+                        FailureCode::Storage,
+                    ));
                     self.notifications.report(
                         Source::Settings,
                         "Could not save shortcut. Try again.",
@@ -358,7 +1004,7 @@ impl Wiesel {
     }
     fn idle_notification(&self) -> Notification {
         if !self.authenticated {
-            Notification::new(Severity::Warning, "Connect AI Gateway in Settings.")
+            Notification::new(Severity::Warning, "Log in to Wiesel in Settings (⌘⇧L).")
         } else if let Some(text) = &self.selection.text {
             Notification::new(
                 Severity::Success,
@@ -372,6 +1018,11 @@ impl Wiesel {
         self.permission_checked_at = Instant::now();
         let granted = selection::accessibility_granted();
         if self.accessibility_granted != granted {
+            self.record_diagnostic_outcome(
+                Category::Accessibility,
+                granted,
+                FailureCode::Permission,
+            );
             self.accessibility_granted = granted;
             // Never leave a previously captured selection ready after permission is revoked.
             if !granted {
@@ -401,6 +1052,24 @@ impl Wiesel {
                     .accessibilityDisplayShouldReduceMotion(),
             );
             self.refresh_permissions(cx);
+        }
+        if self
+            .session
+            .attempt
+            .as_mut()
+            .is_some_and(|attempt| attempt.expired())
+        {
+            self.cancel_login(cx);
+            self.notifications
+                .warning("Browser login expired. Start a new login.");
+        }
+        if self
+            .session
+            .credential
+            .as_ref()
+            .is_some_and(|c| c.ensure_valid().is_err())
+        {
+            self.clear_session("Login expired. Log in again; sessions do not refresh.", cx);
         }
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if event.state == HotKeyState::Pressed
@@ -433,6 +1102,11 @@ impl Wiesel {
             && let Some(result) = capture.poll()
         {
             self.pending_capture = None;
+            self.record_diagnostic_outcome(
+                Category::Selection,
+                result.is_ok(),
+                FailureCode::Unavailable,
+            );
             self.notifications.clear(Source::Selection);
             match &result {
                 Ok(text) => self.notifications.success(format!(
@@ -441,7 +1115,6 @@ impl Wiesel {
                 )),
                 Err(e) => {
                     let (severity, message) = notifications::capture_issue(e);
-                    eprintln!("Wiesel selection: {e:#}");
                     self.notifications
                         .issue(Source::Selection, severity, message);
                 }
@@ -454,10 +1127,18 @@ impl Wiesel {
             window.activate_window();
             if self.page == Page::Launcher {
                 window.focus(&self.launcher_input.focus_handle(cx), cx);
+            } else if self.page == Page::Setup && !self.authenticated {
+                window.focus(&self.login_focus, cx);
             } else {
                 window.focus(&self.focus, cx);
             }
             cx.notify();
+        }
+        // Callback activation must not steal focus before Copy restoration finishes.
+        if self.pending_capture.is_none() {
+            while let Ok(raw) = self.urls.try_recv() {
+                self.handle_callback(&raw, window, cx);
+            }
         }
         // Resume following only once the reader has returned to the bottom.
         if !self.chat_follow_bottom
@@ -465,104 +1146,8 @@ impl Wiesel {
         {
             self.chat_follow_bottom = true;
         }
-        while let Ok(event) = self.rx.try_recv() {
-            if matches!(&event, ResultEvent::Auth(..) | ResultEvent::Completion(..)) {
-                self.busy = false;
-            }
-            match event {
-                ResultEvent::Models(result) => {
-                    self.notifications.clear(Source::Models);
-                    match &result {
-                        Ok(_) => {
-                            if self.page == Page::Setup
-                                && !self.busy
-                                && self.pending_capture.is_none()
-                            {
-                                self.notifications.success("Model catalog refreshed.");
-                            }
-                        }
-                        Err(e) => self.notifications.report(
-                            Source::Models,
-                            "Could not load models. Refresh models in Settings.",
-                            e,
-                        ),
-                    }
-                    self.model_picker
-                        .update(cx, |picker, cx| picker.finish_load(result, cx));
-                }
-                ResultEvent::Auth(result, key) => {
-                    self.notifications.clear(Source::Request);
-                    match result {
-                        Ok(()) => match settings::save_key(&key) {
-                            Ok(()) => {
-                                self.authenticated = true;
-                                self.key_input.update(cx, |input, cx| input.set("", cx));
-                                self.notifications.clear(Source::Keychain);
-                                self.notifications
-                                    .success("Connected. API key saved securely in Keychain.");
-                            }
-                            Err(e) => self.notifications.report(
-                                Source::Keychain,
-                                "Key verified but not saved. Unlock Keychain and retry.",
-                                &e,
-                            ),
-                        },
-                        Err(e) => self.notifications.report(
-                            Source::Request,
-                            gateway::failure_message(&e),
-                            &e,
-                        ),
-                    }
-                }
-                ResultEvent::ChatDelta(delta) => {
-                    if let Some(message) = &mut self.streaming_chat {
-                        message.content.push_str(&delta);
-                        self.follow_chat_bottom();
-                    }
-                }
-                ResultEvent::Completion(result, chat) => {
-                    if chat {
-                        self.streaming_chat = None;
-                    }
-                    match result {
-                        Ok(text) => {
-                            if chat {
-                                self.messages.push(Message::new("assistant", text));
-                                self.follow_chat_bottom();
-                            } else {
-                                self.result = text;
-                            }
-                            self.notifications.clear(Source::Request);
-                            self.notifications.success(if chat {
-                                "Response ready."
-                            } else {
-                                "Writing ready. Copy the result to use it."
-                            });
-                        }
-                        Err(e) => {
-                            self.notifications.report(
-                                Source::Request,
-                                gateway::failure_message(&e),
-                                &e,
-                            );
-                            if chat && let Some(message) = self.messages.pop() {
-                                let (draft, failed) = recover_failed_draft(
-                                    &self.composer.read(cx).content,
-                                    message.content,
-                                );
-                                if let Some(failed) = failed {
-                                    // Preserve the newer draft's caret, selection, and active IME state.
-                                    self.failed_chat.push_back(failed);
-                                } else {
-                                    self.composer.update(cx, |i, cx| i.set(draft, cx));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            cx.notify();
-        }
+        self.poll_diagnostics(cx);
+        self.receive_results(window, cx);
         if self
             .notifications
             .update(Instant::now(), self.idle_notification())
@@ -570,38 +1155,404 @@ impl Wiesel {
             cx.notify();
         }
     }
+    fn receive_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Ok(event) = self.rx.try_recv() {
+            if !self.session.accepts(event.scope) {
+                // In particular, never persist a canceled/replaced exchange result.
+                continue;
+            }
+            self.apply_result(event.scope, event.result, window, cx);
+            cx.notify();
+        }
+    }
+    fn apply_result(
+        &mut self,
+        scope: EventScope,
+        result: ResultPayload,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            ResultPayload::Exchange(result) => {
+                self.notifications.clear(Source::Request);
+                match result {
+                    Ok(credential) => {
+                        // UI-thread persistence is serialized with cancel/signout. No worker
+                        // writes Keychain before its generation has been accepted here.
+                        let target = settings::CleanupTarget::device(credential.device_id());
+                        match self.session.persist_exchange(
+                            scope,
+                            credential,
+                            settings::save_device_credential,
+                        ) {
+                            Ok(false) => (),
+                            Ok(true) => {
+                                self.authenticated = true;
+                                self.recovery = CredentialRecovery::Ready;
+                                self.notifications.clear(Source::Keychain);
+                                self.notifications
+                                    .success("Logged in. Device login saved in Keychain.");
+                                self.login_ready(true, window, cx);
+                                self.refresh_status(false, cx);
+                            }
+                            Err(_) => {
+                                self.recovery = CredentialRecovery::Remove(target);
+                                self.clear_session(
+                                    "Login could not be saved. Unlock Keychain and restart login.",
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.session.cancel_login();
+                        self.notifications.issue(
+                            Source::Request,
+                            Severity::Error,
+                            "Login exchange failed. Start a new login; do not retry the old link.",
+                        );
+                    }
+                }
+            }
+            ResultPayload::Status(result, startup) => {
+                self.status_loading = false;
+                self.notifications.clear(Source::Request);
+                match result {
+                    Ok(status) => {
+                        self.device_status = Some(status);
+                        self.authenticated = true;
+                        self.notifications.success("Device login verified.");
+                        self.login_ready(startup, window, cx);
+                    }
+                    Err(AuthError::HttpStatus(401)) => {
+                        self.clear_session("Device login rejected. Log in again.", cx);
+                    }
+                    Err(AuthError::Credential(_)) => {
+                        self.clear_session("Device login is no longer valid. Log in again.", cx);
+                    }
+                    Err(_) => self.notifications.issue(Source::Request, Severity::Error,
+                        "Could not check device login. Check your connection and Check login again."),
+                }
+            }
+            ResultPayload::Models(result) => {
+                if result.as_ref().is_err_and(gateway::is_unauthorized) {
+                    self.clear_session("Device login rejected. Log in again.", cx);
+                    return;
+                }
+                self.notifications.clear(Source::Models);
+                if let Err(e) = &result {
+                    self.notifications.issue(
+                        Source::Models,
+                        Severity::Error,
+                        gateway::failure_message(e),
+                    );
+                }
+                self.model_picker
+                    .update(cx, |picker, cx| picker.finish_load(result, cx));
+            }
+            ResultPayload::ChatDelta(delta) => {
+                if let Some(message) = &mut self.streaming_chat {
+                    message.content.push_str(&delta);
+                    self.follow_chat_bottom();
+                }
+            }
+            ResultPayload::Completion(result, chat) => {
+                self.busy = false;
+                if chat {
+                    self.streaming_chat = None;
+                }
+                match result {
+                    Ok(text) => {
+                        if chat {
+                            self.messages.push(Message::new("assistant", text));
+                            self.follow_chat_bottom();
+                        } else {
+                            self.result = text;
+                        }
+                        self.notifications.clear(Source::Request);
+                        self.notifications.success(if chat {
+                            "Response ready."
+                        } else {
+                            "Writing ready. Copy the result to use it."
+                        });
+                    }
+                    Err(e) => {
+                        if gateway::is_unauthorized(&e) {
+                            self.clear_session("Device login rejected. Log in again.", cx);
+                            return;
+                        }
+                        self.notifications.issue(
+                            Source::Request,
+                            Severity::Error,
+                            gateway::failure_message(&e),
+                        );
+                        if chat && let Some(message) = self.messages.pop() {
+                            let (draft, failed) = recover_failed_draft(
+                                &self.composer.read(cx).content,
+                                message.content,
+                            );
+                            if let Some(failed) = failed {
+                                self.failed_chat.push_back(failed);
+                            } else {
+                                self.composer.update(cx, |i, cx| i.set(draft, cx));
+                            }
+                        }
+                    }
+                }
+            }
+            ResultPayload::SignOut(result) => {
+                if result.is_err() {
+                    self.notifications.issue(
+                        Source::Request,
+                        Severity::Warning,
+                        "Remote sign-out unconfirmed. Revoke this device on the website if needed.",
+                    );
+                } else if !self.recovery.blocks_login() {
+                    self.notifications
+                        .success("Signed out this device. Its saved credential was removed.");
+                }
+            }
+        }
+    }
+    fn login_ready(&mut self, show_launcher: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_models(cx);
+        if show_launcher
+            && self.hotkey.is_some()
+            && self.settings.onboarded
+            && self.page == Page::Setup
+        {
+            self.page = Page::Launcher;
+            window.focus(&self.launcher_input.focus_handle(cx), cx);
+        }
+    }
+    fn start_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = Page::Setup;
+        window.focus(&self.login_focus, cx);
+        if self.session.credential.is_some() {
+            self.notifications
+                .info("Already have a device login. Check login or Sign out to switch accounts.");
+        } else if self.recovery.blocks_login() {
+            self.notifications.warning(if self.recovery.restore_only() {
+                "Unlock Keychain and retry restoring login before starting a new login."
+            } else {
+                "Remove this saved login first. Unlock Keychain and retry removal."
+            });
+        } else {
+            self.notifications.clear(Source::Request);
+            match self.session.login_url() {
+                Ok(url) => {
+                    cx.open_url(&url);
+                    self.notifications.working(
+                        Source::Request,
+                        "Waiting for browser login… Cancel or reopen anytime.",
+                    );
+                }
+                Err(_) => self.notifications.issue(
+                    Source::Request,
+                    Severity::Error,
+                    "Could not start secure login. Try Login / Sign up again.",
+                ),
+            }
+        }
+        cx.notify();
+    }
+    fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        self.record_diagnostic(Event::new(Category::Authentication, EventKind::Cancelled));
+        self.session.cancel_login();
+        self.notifications.clear(Source::Request);
+        self.notifications
+            .info("Login canceled. Old browser links cannot sign you in.");
+        cx.notify();
+    }
+    fn handle_callback(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
+        match self.session.consume_callback(raw) {
+            Ok(request) => {
+                self.notifications
+                    .working(Source::Request, "Completing secure login…");
+                let scope = self.session.scope();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = DesktopClient::new().and_then(|client| client.exchange(request));
+                    let _ = tx.send(ResultEvent {
+                        scope,
+                        result: ResultPayload::Exchange(result),
+                    });
+                });
+            }
+            Err(AuthError::Expired) => {
+                self.cancel_login(cx);
+                self.notifications
+                    .warning("Login expired. Start a new login.");
+            }
+            Err(AuthError::Inactive) => {
+                self.record_diagnostic(Event::new(Category::Authentication, EventKind::Rejected));
+                self.notifications.warning("No matching active login. Reopen Login / Sign up; old links cannot be restored.");
+            }
+            Err(_) => self
+                .notifications
+                .warning("Login link did not match. Continue in your browser or reopen login."),
+        }
+        if !self.authenticated {
+            self.page = Page::Setup;
+            window.focus(&self.login_focus, cx);
+        }
+        cx.notify();
+    }
+    fn valid_credential(&mut self, cx: &mut Context<Self>) -> Option<Arc<DeviceCredential>> {
+        let credential = self.session.credential.as_ref()?.clone();
+        if credential.ensure_valid().is_err() {
+            self.clear_session("Login expired. Log in again; sessions do not refresh.", cx);
+            return None;
+        }
+        Some(credential)
+    }
+    fn clear_session(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        let request_pending = self.busy;
+        let target = self.session.end_session();
+        self.authenticated = false;
+        self.status_loading = false;
+        self.device_status = None;
+        self.busy = false;
+        self.streaming_chat = None;
+        self.messages.clear();
+        self.failed_chat.clear();
+        self.result.clear();
+        self.page = Page::Setup;
+        self.model_picker
+            .update(cx, |picker, cx| picker.finish_load(Ok(vec![]), cx));
+        self.notifications.clear(Source::Models);
+        self.notifications.clear(Source::Request);
+        // Local removal is independent of remote success. A failure is never labeled
+        // persistent logout, and blocks a new login until removal is retried.
+        let removed = self
+            .recovery
+            .remove(target, settings::delete_device_credential);
+        self.record_diagnostic_outcome(Category::Keychain, removed.is_ok(), FailureCode::Storage);
+        if removed.is_err() {
+            self.notifications.issue(
+                Source::Keychain,
+                Severity::Error,
+                "Session ended, but saved-login recovery is incomplete. Unlock Keychain and retry.",
+            );
+        } else {
+            self.notifications.clear(Source::Keychain);
+            self.notifications.warning(message);
+        }
+        if request_pending {
+            self.notifications.issue(
+                Source::Request,
+                Severity::Warning,
+                "Pending request outcome unknown; it may be charged. Do not retry blindly.",
+            );
+        }
+        cx.notify();
+    }
+    fn sign_out(&mut self, cx: &mut Context<Self>) {
+        let credential = self.session.credential.clone();
+        self.clear_session(
+            "Local session ended. Captured saved-login cleanup completed.",
+            cx,
+        );
+        if let Some(credential) = credential {
+            let tx = self.tx.clone();
+            let scope = self.session.scope();
+            std::thread::spawn(move || {
+                let result = DesktopClient::new().and_then(|client| client.sign_out(&credential));
+                let _ = tx.send(ResultEvent {
+                    scope,
+                    result: ResultPayload::SignOut(result),
+                });
+            });
+        }
+    }
+    fn retry_restore(&mut self, cx: &mut Context<Self>) {
+        // There was no safely observed identity at the failed load. Retry a
+        // locked load instead of inventing a destructive cleanup target.
+        match settings::load_device_credential() {
+            Ok(credential) => {
+                self.session.cancel_login();
+                self.session.credential = credential.map(Arc::new);
+                self.recovery = CredentialRecovery::Ready;
+                self.notifications.clear(Source::Keychain);
+                if self.session.credential.is_some() {
+                    self.refresh_status(false, cx);
+                } else {
+                    self.notifications
+                        .success("Saved login checked. Start a fresh login.");
+                }
+            }
+            Err(failure) => {
+                self.recovery = CredentialRecovery::from_load_failure(failure);
+                self.notifications.issue(
+                    Source::Keychain,
+                    Severity::Error,
+                    "Saved-login recovery failed. Unlock Keychain and retry the recovery control.",
+                );
+            }
+        }
+        cx.notify();
+    }
+    fn refresh_status(&mut self, startup: bool, cx: &mut Context<Self>) {
+        if self.status_loading {
+            return;
+        }
+        let Some(credential) = self.valid_credential(cx) else {
+            return;
+        };
+        self.status_loading = true;
+        self.notifications
+            .working(Source::Request, "Checking saved device login…");
+        let tx = self.tx.clone();
+        let scope = self.session.scope();
+        std::thread::spawn(move || {
+            let result = DesktopClient::new().and_then(|client| client.device_status(&credential));
+            let _ = tx.send(ResultEvent {
+                scope,
+                result: ResultPayload::Status(result, startup),
+            });
+        });
+        cx.notify();
+    }
     fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        if !self.authenticated {
+            self.notifications
+                .warning("Log in and check your device login before loading models.");
+            cx.notify();
+            return;
+        }
         if self.model_picker.read(cx).loading {
             return;
         }
+        let Some(credential) = self.valid_credential(cx) else {
+            return;
+        };
         self.model_picker
             .update(cx, |picker, cx| picker.begin_load(cx));
         self.notifications
             .working(Source::Models, "Loading model catalog…");
         let tx = self.tx.clone();
+        let scope = self.session.scope();
+        let action = self
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| gateway::DiagnosticAction::new(diagnostics, Category::Models));
         std::thread::spawn(move || {
-            let _ = tx.send(ResultEvent::Models(gateway::models()));
+            let result = credential
+                .ensure_valid()
+                .map_err(|error| {
+                    if let Some(action) = &action {
+                        action.credential_rejected();
+                    }
+                    anyhow::Error::from(error)
+                })
+                .and_then(|()| gateway::models(credential.access_token(), action.as_ref()));
+            let _ = tx.send(ResultEvent {
+                scope,
+                result: ResultPayload::Models(result),
+            });
         });
-    }
-    fn authenticate(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let key = self.key_input.read(cx).content.trim().to_owned();
-        if key.is_empty() {
-            self.notifications.warning("Paste an AI Gateway key first.");
-            cx.notify();
-            return;
-        }
-        self.busy = true;
-        self.notifications
-            .working(Source::Request, "Verifying your API key…");
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = gateway::authenticate(&key);
-            let _ = tx.send(ResultEvent::Auth(result, key));
-        });
-        cx.notify();
     }
     fn finish_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
@@ -613,7 +1564,7 @@ impl Wiesel {
         let improve = self.improve_input.read(cx).content.trim().to_owned();
         let hotkey = self.hotkey_input.read(cx).content.trim().to_owned();
         let missing = if !self.authenticated {
-            Some("Connect AI Gateway first.")
+            Some("Log in to Wiesel first.")
         } else if picker.loading {
             Some("Wait for the model catalog to finish loading.")
         } else if picker.models.is_empty() {
@@ -634,6 +1585,7 @@ impl Wiesel {
         }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&hotkey) {
+            self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
             self.notifications.report(
                 Source::Hotkey,
                 "Could not activate shortcut. Choose another and retry.",
@@ -651,6 +1603,7 @@ impl Wiesel {
         next.onboarded = true;
         match settings::save(&next) {
             Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
                 self.settings = next;
                 self.page = Page::Launcher;
                 self.notifications.clear(Source::Settings);
@@ -658,6 +1611,7 @@ impl Wiesel {
                 window.focus(&self.launcher_input.focus_handle(cx), cx);
             }
             Err(e) => {
+                self.record_diagnostic(Event::failure(Category::Settings, FailureCode::Storage));
                 self.notifications.report(
                     Source::Settings,
                     "Could not save settings. Try again.",
@@ -669,28 +1623,16 @@ impl Wiesel {
         cx.notify();
     }
     fn request(&mut self, messages: Vec<Message>, chat: bool, cx: &mut Context<Self>) {
-        let key = match settings::key() {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                self.authenticated = false;
-                self.notifications.issue(
-                    Source::Keychain,
-                    Severity::Warning,
-                    "No saved API key. Connect in Settings.",
-                );
-                cx.notify();
-                return;
-            }
-            Err(e) => {
-                self.notifications.report(
-                    Source::Keychain,
-                    "Could not read API key. Unlock Keychain and reconnect.",
-                    &e,
-                );
-                cx.notify();
-                return;
-            }
+        if !self.authenticated {
+            self.notifications
+                .warning("Log in to Wiesel and check your device login first.");
+            cx.notify();
+            return;
+        }
+        let Some(credential) = self.valid_credential(cx) else {
+            return;
         };
+        let scope = self.session.scope();
         self.busy = true;
         self.notifications.clear(Source::Keychain);
         self.notifications.working(Source::Request, "Thinking…");
@@ -699,17 +1641,19 @@ impl Wiesel {
         if chat {
             self.streaming_chat = Some(Message::new("assistant", ""));
         }
-        std::thread::spawn(move || {
-            let result = if chat {
-                gateway::complete_stream(&key, &model, &messages, |delta| {
-                    tx.send(ResultEvent::ChatDelta(delta.to_owned()))
-                        .context("Chat window closed")
-                })
-            } else {
-                gateway::complete(&key, &model, &messages)
-            };
-            let _ = tx.send(ResultEvent::Completion(result, chat));
-        });
+        self.completion_backend.start(
+            completion_backend::CompletionRequest {
+                credential,
+                model,
+                messages,
+                chat,
+                scope,
+                diagnostic_action: self.diagnostics.as_ref().map(|diagnostics| {
+                    gateway::DiagnosticAction::new(diagnostics, Category::Request)
+                }),
+            },
+            tx,
+        );
         cx.notify();
     }
     fn run_quick_action(
@@ -804,7 +1748,7 @@ impl Wiesel {
             cx.notify();
             return;
         }
-        // Resolve credentials before mutating conversation; request reports failure if Keychain fails.
+        // request validates the device session before the draft is cleared.
         self.messages.push(Message::new("user", text));
         let mut messages = vec![Message::new(
             "system",
@@ -877,7 +1821,31 @@ impl Wiesel {
             self.apply_hotkey(cx);
             return;
         }
-        if key.key == "escape" {
+        if self.page == Page::Setup
+            && key.key == "tab"
+            && !key.modifiers.platform
+            && !key.modifiers.control
+            && !key.modifiers.alt
+        {
+            if key.modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.page == Page::Setup
+            && key.key == "enter"
+            && !key.modifiers.shift
+            && self.login_focus.is_focused(window)
+        {
+            self.start_login(window, cx);
+            cx.stop_propagation();
+        } else if key.key == "escape" {
+            if self.session.attempt.is_some() || self.session.exchanging {
+                self.cancel_login(cx);
+            }
             cx.hide();
             cx.stop_propagation();
         } else if self.page == Page::Launcher {
@@ -953,6 +1921,71 @@ impl Wiesel {
                 cx.notify();
             })))
     }
+    fn login_controls(&self, cx: &mut Context<Self>) -> Div {
+        let pending = self.session.attempt.is_some() || self.session.exchanging;
+        let saved = self.session.credential.is_some();
+        div().flex().flex_col().gap_2()
+            .child(Self::label("2 · Wiesel account"))
+            .child(Self::button("login", if pending { "Reopen Login / Sign up ↗" } else { "Login / Sign up ↗" })
+                .track_focus(&self.login_focus)
+                .on_click(cx.listener(|this, _, window, cx| this.start_login(window, cx))))
+            .child(Self::label("Opens your system browser at wiesel.run. Enter when login is focused · ⌘⇧L from any screen."))
+            .when(pending, |d| d
+                .child(Self::label(if self.session.exchanging { "Completing login…" } else { "Waiting for browser login (up to 10 minutes)…" }))
+                .child(Self::button("cancel-login", "Cancel login").on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx)))))
+            .child(Self::label("New account? Finish signup and email verification on the website, then Reopen Login / Sign up here for a fresh attempt."))
+            .when(saved, |d| d.child(Self::button("check-login", if self.status_loading { "Checking login…" } else { "Check login" })
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_status(false, cx)))))
+            .when(self.authenticated, |d| d.child(Self::label("✓ Logged in · device token stored only in macOS Keychain. Expiry requires login again; no refresh.")))
+            .when_some(self.device_status.as_ref(), |d, status| d.child(Self::label(&format!(
+                "Plan: {} · virtual credits: {} (informational; service decides request allowance)",
+                match status.plan { auth::Plan::Free => "Free", auth::Plan::Starter => "Starter", auth::Plan::Unlimited => "Unlimited" },
+                status.virtual_credits))))
+            .when_some(self.session.credential.as_ref(), |d, credential| d.child(Self::label(&format!(
+                "Device login expires in about {} hours; log in again after expiry.",
+                settings::utc_now_ms().ok().map(|now| (credential.expires_at().saturating_sub(now).max(0) as u64).div_ceil(3_600_000)).unwrap_or(0)))))
+            .when(self.recovery.blocks_login(), |d| d.child(Self::label(if self.recovery.restore_only() {
+                "Saved login could not be read safely. Unlock Keychain, then Retry restoring login. No later saved login will be deleted."
+            } else {
+                "Saved-login cleanup failed. Unlock Keychain, then Retry saved login removal. This device may still be signed in after relaunch. Cleanup targets only the observed device or corrupt metadata."
+            })))
+            .when(saved || self.recovery.blocks_login(), |d| d.child(Self::button("sign-out", if self.recovery.restore_only() { "Retry restoring login" } else if self.recovery.blocks_login() { "Retry saved login removal" } else { "Sign out" })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.recovery.restore_only() { this.retry_restore(cx); } else { this.sign_out(cx); }
+                }))))
+    }
+    fn diagnostics_controls(&self, cx: &mut Context<Self>) -> Div {
+        let unavailable = self.diagnostics.is_none() || self.diagnostics_busy;
+        div().flex().flex_col().gap_2()
+            .child(Self::label("Diagnostics"))
+            .child(Self::label("Local JSONL logs · ~/Library/Logs/Wiesel. Includes model ID and raw server error type; review logs before sharing."))
+            .child(Self::label("Inactive logs pruned after 7 days, up to 20 MiB; active sessions protected. Cleanup runs on logging/flush, not an idle timer."))
+            .child(Self::label(if self.diagnostics_initializing { "Preparing local diagnostics…" }
+                else if self.diagnostics.is_none() { "Diagnostics unavailable; other features still work. Check folder permissions and relaunch." }
+                else if self.diagnostics_busy { "Working…" }
+                else { "Clearing logs does not clear chat or settings. Close other Wiesel instances first." }))
+            .child(div().flex().gap_2()
+                .child(Self::button("open-logs-folder", "Open Logs Folder")
+                    .debug_selector(|| "open-logs-folder".into())
+                    .role(Role::Button).aria_label("Open Logs Folder in Finder")
+                    .accessibility_id("wiesel.diagnostics.open-folder")
+                    .aria_description(if unavailable { "Unavailable or busy; check Diagnostics status." } else { "Ready" })
+                    .when(unavailable, |d| d.opacity(0.5))
+                    .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                    .active(|s| s.bg(rgb(theme::ACCENT)))
+                    .track_focus(&self.diagnostics_open_focus)
+                    .on_click(cx.listener(|this, _, _, cx| this.diagnostic_control(DiagnosticControl::OpenFolder, cx))))
+                .child(Self::button("clear-logs", "Clear Logs")
+                    .debug_selector(|| "clear-logs".into())
+                    .role(Role::Button).aria_label("Clear local diagnostic logs")
+                    .accessibility_id("wiesel.diagnostics.clear")
+                    .aria_description(if unavailable { "Unavailable or busy; check Diagnostics status." } else { "Ready" })
+                    .when(unavailable, |d| d.opacity(0.5))
+                    .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                    .active(|s| s.bg(rgb(theme::ACCENT)))
+                    .track_focus(&self.diagnostics_clear_focus)
+                    .on_click(cx.listener(|this, _, _, cx| this.diagnostic_control(DiagnosticControl::ClearLogs, cx)))))
+    }
     fn setup(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         // Keep scrollable content at its natural height instead of shrinking every field to fit.
         div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll()
@@ -964,40 +1997,23 @@ impl Wiesel {
                 .child(Self::button("record", if self.recording { "Press shortcut…" } else { "Record shortcut" }).on_click(cx.listener(|this, _, window, cx| { this.recording = true; this.notifications.info("Press your shortcut. Escape cancels."); window.focus(&this.focus, cx); cx.notify(); }))))
             .child(Self::button("apply-hotkey", "Apply shortcut").on_click(cx.listener(|this, _, _, cx| this.apply_hotkey(cx))))
             .child(Self::label("Command (⌘) is called Super in the field above. Recorded shortcuts activate immediately; typed changes need Apply shortcut."))
-            .child(Self::label("2 · Connect Vercel AI Gateway"))
-            .child(Self::label("API key"))
-            .child(div().w_full().h(px(40.)).min_h(px(40.)).flex_shrink_0().rounded_md().border_1().border_color(rgba(theme::INPUT_BORDER)).overflow_hidden().child(self.key_input.clone()))
-            .child(Self::button("connect", if self.busy { "Verifying…" } else { "Verify & connect" }).on_click(cx.listener(|this, _, _, cx| this.authenticate(cx))))
-            .child(Self::label(if self.authenticated { "✓ Key stored in macOS Keychain. Paste a new key only to replace it." } else { "Your key is verified with Vercel and stored in macOS Keychain, never in settings." }))
+            .child(self.login_controls(cx))
             .child(Self::label("3 · Model"))
             .child(self.model_picker.clone())
             .child(Self::button("refresh-models", "Refresh models").on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx))))
-            .child(Self::label("The live catalog includes all Gateway models. For writing and chat, choose a text/chat model."))
+            .child(Self::label("The authenticated Wiesel catalog lists model IDs. Choose a text/chat model; only text/chat requests are supported."))
             .child(Self::label("Custom prompt · Fix grammar"))
             .child(self.grammar_input.clone())
             .child(Self::label("Custom prompt · Improve writing"))
             .child(self.improve_input.clone())
-            .child(Self::label("Writing actions send selected text to Vercel and the chosen model provider. Nothing is sent until you choose an action."))
+            .child(Self::label("Writing actions send selected text to wiesel.run and its model provider. Nothing is sent until you choose an action."))
             .child(Self::label("Required for selected text: System Settings → Privacy & Security → Accessibility (Gerätesteuerung und Datenzugriff). Enable Wiesel; its live status appears in the bottom bar."))
             .child(self.permission_controls(cx))
             .child(Self::label("Wiesel captures selected text using ⌘C and restores your previous clipboard before opening. Release the shortcut keys and keep the source app active. Clipboard managers may retain the temporary selection."))
             .child(Self::label("Input Monitoring, Screen Recording, and Automation are not required. On newer macOS versions, allow Wiesel to paste from other apps if asked so it can save and restore the clipboard."))
             .child(Self::label("If macOS shows Wiesel enabled but the bottom bar still requests access after a rebuild, remove the old entry, add this Wiesel.app again, and relaunch it."))
-            .child(div().flex().gap_2()
-                .child(Self::button("save", "Save & start").on_click(cx.listener(|this, _, window, cx| this.finish_setup(window, cx))))
-                .child(Self::button("disconnect", "Disconnect").on_click(cx.listener(|this, _, _, cx| {
-                    if this.busy { return; }
-                    match settings::delete_key() {
-                        Ok(()) => {
-                            this.authenticated = false;
-                            this.notifications.clear(Source::Keychain);
-                            this.notifications.clear(Source::Request);
-                            this.notifications.success("Disconnected. API key removed from Keychain.");
-                        },
-                        Err(e) => this.notifications.report(Source::Keychain, "Could not remove API key. Unlock Keychain and retry.", &e),
-                    }
-                    cx.notify();
-                })))))
+            .child(self.diagnostics_controls(cx))
+            .child(Self::button("save", "Save & start").on_click(cx.listener(|this, _, window, cx| this.finish_setup(window, cx)))))
     }
     fn launcher(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
@@ -1014,6 +2030,10 @@ impl Wiesel {
                     actions.iter().copied().map(|action| {
                         div()
                             .id(action.id())
+                            .debug_selector(|| action.id().into())
+                            .role(Role::Button)
+                            .accessibility_id(format!("wiesel.action.{}", action.id()))
+                            .aria_label(action.title())
                             .relative()
                             .flex_1()
                             .h(px(106.))
@@ -1110,7 +2130,23 @@ impl Wiesel {
                             .map(|(index, message)| {
                                 let user = message.role == "user";
                                 let text = message.content.clone();
+                                // Only committed messages use user/assistant identifiers. A
+                                // streaming preview must never satisfy a completed-reply check.
+                                let message_kind = if index >= self.messages.len() {
+                                    "streaming"
+                                } else if user {
+                                    "user"
+                                } else {
+                                    "assistant"
+                                };
                                 div()
+                                    .id(("chat-message", index))
+                                    .role(Role::Group)
+                                    .accessibility_id(format!(
+                                        "wiesel.message.{message_kind}.{index}"
+                                    ))
+                                    .aria_label(if user { "Your message" } else { "Wiesel reply" })
+                                    .aria_value(text.clone())
                                     .w_full()
                                     .flex_shrink_0()
                                     .flex()
@@ -1215,7 +2251,13 @@ impl Wiesel {
                             .border_1()
                             .border_color(rgba(theme::INPUT_BORDER))
                             .bg(rgb(theme::CARD))
-                            .child(div().flex_1().min_w_0().child(self.composer.clone()))
+                            .child(
+                                div()
+                                    .debug_selector(|| "chat-composer".into())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.composer.clone()),
+                            )
                             .child(
                                 div()
                                     .font_family(theme::MONO)
@@ -1226,6 +2268,14 @@ impl Wiesel {
                             .child(
                                 div()
                                     .id("send")
+                                    .debug_selector(|| "send".into())
+                                    .role(Role::Button)
+                                    .accessibility_id("wiesel.chat.send")
+                                    .aria_label(if self.busy {
+                                        "Sending message"
+                                    } else {
+                                        "Send message"
+                                    })
                                     .size(px(28.))
                                     .flex_shrink_0()
                                     .flex()
@@ -1362,6 +2412,21 @@ impl Render for Wiesel {
             Page::Writing => self.writing_view(cx).into_any_element(),
         };
         div()
+            .id("wiesel-root")
+            .role(Role::Group)
+            .accessibility_id(match self.page {
+                Page::Setup => "wiesel.page.setup",
+                Page::Launcher => "wiesel.page.launcher",
+                Page::Chat => "wiesel.page.chat",
+                Page::Writing => "wiesel.page.writing",
+            })
+            .aria_label("Wiesel")
+            .aria_description(match (self.authenticated, self.busy) {
+                (true, false) => "Signed in; request idle",
+                (true, true) => "Signed in; request pending",
+                (false, false) => "Signed out; request idle",
+                (false, true) => "Signed out; request pending",
+            })
             .size_full()
             .rounded(px(14.))
             .border_1()
@@ -1409,6 +2474,11 @@ impl Render for Wiesel {
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         if !this.busy {
+                                            if this.session.attempt.is_some()
+                                                || this.session.exchanging
+                                            {
+                                                this.cancel_login(cx);
+                                            }
                                             this.page = Page::Launcher;
                                             window.focus(&this.launcher_input.focus_handle(cx), cx);
                                             cx.notify();
@@ -1475,66 +2545,158 @@ impl Render for Wiesel {
             .child(self.notifications.render())
     }
 }
+#[cfg(test)]
+mod diagnostic_integration_tests {
+    use super::*;
+    use diagnostics::tests::{Temp, records};
+
+    #[test]
+    fn finder_command_passes_the_entire_folder_as_one_argument_without_a_shell() {
+        let path = std::path::Path::new("/tmp/user home/Logs/$(private); Wiesel");
+        let command = finder_command(path);
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-a"),
+                std::ffi::OsStr::new("Finder"),
+                std::ffi::OsStr::new("--"),
+                path.as_os_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_control_waits_for_storage_completion_then_future_events_persist() {
+        let temp = Temp::new();
+        let diagnostics = temp.logger();
+        diagnostics.record(Event::new(Category::Application, EventKind::Started), None);
+        run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs).unwrap();
+        assert!(records(&temp.logs).is_empty());
+        diagnostics.record(
+            Event::new(Category::Diagnostics, EventKind::Succeeded).at_stage(Stage::ClearLogs, 1),
+            None,
+        );
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        assert_eq!(records(&temp.logs)[0]["stage"], "clear_logs");
+    }
+
+    #[test]
+    fn clear_control_surfaces_active_session_refusal_and_can_be_retried() {
+        let temp = Temp::new();
+        let diagnostics = temp.logger();
+        let other = temp.logger();
+        assert_eq!(
+            run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs),
+            Err(DiagnosticError::OtherSessionActive)
+        );
+        assert_eq!(
+            diagnostic_failure_message(DiagnosticError::OtherSessionActive),
+            "Close other Wiesel instances, then clear logs again."
+        );
+        other.shutdown().unwrap().wait().unwrap();
+        run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs).unwrap();
+        diagnostics.shutdown().unwrap().wait().unwrap();
+    }
+}
+
 fn main() {
-    gpui_platform::application()
-        .with_assets(theme::Assets)
-        .run(|cx: &mut App| {
-            cx.set_reduce_motion(
-                objc2_app_kit::NSWorkspace::sharedWorkspace()
-                    .accessibilityDisplayShouldReduceMotion(),
-            );
-            theme::load_fonts(cx);
-            cx.on_action(|_: &input::Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("cmd-q", input::Quit, None)]);
-            cx.bind_keys([
-                KeyBinding::new("backspace", input::Backspace, Some("TextInput")),
-                KeyBinding::new("delete", input::Delete, Some("TextInput")),
-                KeyBinding::new("left", input::Left, Some("TextInput")),
-                KeyBinding::new("right", input::Right, Some("TextInput")),
-                KeyBinding::new("shift-left", input::SelectLeft, Some("TextInput")),
-                KeyBinding::new("shift-right", input::SelectRight, Some("TextInput")),
-                KeyBinding::new("cmd-a", input::SelectAll, Some("TextInput")),
-                KeyBinding::new("cmd-v", input::Paste, Some("TextInput")),
-                KeyBinding::new("cmd-c", input::Copy, Some("TextInput")),
-                KeyBinding::new("cmd-x", input::Cut, Some("TextInput")),
-                KeyBinding::new("home", input::Home, Some("TextInput")),
-                KeyBinding::new("end", input::End, Some("TextInput")),
-            ]);
-            let bounds = Bounds::centered(None, size(px(800.), px(450.)), cx);
-            let handle = match cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: None,
-                    app_owns_titlebar_drag: true,
-                    is_resizable: false,
-                    is_minimizable: false,
-                    window_min_size: Some(size(px(580.), px(450.))),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| Wiesel::new(window, cx)),
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    // No notification surface exists yet; fail gracefully with a diagnostic.
-                    eprintln!("Cannot open Wiesel window: {error:#}");
-                    cx.quit();
-                    return;
-                }
+    let (diagnostics_tx, diagnostics_rx) = mpsc::channel();
+    let init_tx = diagnostics_tx.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("wiesel-diagnostics-init".into())
+        .spawn(move || {
+            let _ = init_tx.send(DiagnosticUpdate::Initialized(Diagnostics::init()));
+        })
+    {
+        let _ = diagnostics_tx.send(DiagnosticUpdate::Initialized(Err(error.into())));
+    }
+    let application = gpui_platform::application().with_assets(theme::Assets);
+    let (url_tx, urls) = mpsc::sync_channel(16);
+    application.on_open_urls(move |raw_urls| {
+        for raw in raw_urls {
+            // Oversized input is represented as invalid, never truncated into a valid URL.
+            let raw = zeroize::Zeroizing::new(raw);
+            let raw = if raw.len() <= 1024 {
+                raw
+            } else {
+                zeroize::Zeroizing::new(String::new())
             };
-            cx.spawn(async move |cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(40))
-                        .await;
-                    if handle
-                        .update(cx, |app, window, cx| app.poll(window, cx))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .detach();
-            cx.activate(true);
+            let _ = url_tx.try_send(raw);
+        }
+    });
+    application.run(move |cx: &mut App| {
+        cx.set_reduce_motion(
+            objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
+        );
+        theme::load_fonts(cx);
+        cx.on_action(|_: &input::Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", input::Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("backspace", input::Backspace, Some("TextInput")),
+            KeyBinding::new("delete", input::Delete, Some("TextInput")),
+            KeyBinding::new("left", input::Left, Some("TextInput")),
+            KeyBinding::new("right", input::Right, Some("TextInput")),
+            KeyBinding::new("shift-left", input::SelectLeft, Some("TextInput")),
+            KeyBinding::new("shift-right", input::SelectRight, Some("TextInput")),
+            KeyBinding::new("cmd-a", input::SelectAll, Some("TextInput")),
+            KeyBinding::new("cmd-v", input::Paste, Some("TextInput")),
+            KeyBinding::new("cmd-c", input::Copy, Some("TextInput")),
+            KeyBinding::new("cmd-x", input::Cut, Some("TextInput")),
+            KeyBinding::new("home", input::Home, Some("TextInput")),
+            KeyBinding::new("end", input::End, Some("TextInput")),
+        ]);
+        let bounds = Bounds::centered(None, size(px(800.), px(450.)), cx);
+        let handle = match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                app_owns_titlebar_drag: true,
+                is_resizable: false,
+                is_minimizable: false,
+                window_min_size: Some(size(px(580.), px(450.))),
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Wiesel::new(urls, diagnostics_tx, diagnostics_rx, window, cx);
+                    app.register_diagnostic_shutdown(cx);
+                    app
+                })
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                // No notification surface exists yet; never print arbitrary error chains.
+                eprintln!("Cannot open Wiesel window. Quit and relaunch Wiesel.");
+                cx.quit();
+                return;
+            }
+        };
+        cx.bind_keys([KeyBinding::new("cmd-shift-l", Login, None)]);
+        cx.on_action(move |_: &Login, cx| {
+            let _ = handle.update(cx, |app, window, cx| {
+                app.notifications.suppress_motion = true;
+                app.start_login(window, cx);
+                app.notifications
+                    .update(Instant::now(), app.idle_notification());
+                app.notifications.suppress_motion = false;
+            });
         });
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                if handle
+                    .update(cx, |app, window, cx| app.poll(window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
 }

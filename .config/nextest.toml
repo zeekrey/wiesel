@@ -1,0 +1,8 @@
+[test-groups.native-ui-live]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(native_chat_smoke) & test(=native_chat_completed_reply)'
+test-group = 'native-ui-live'
+threads-required = 'num-test-threads'
+retries = 0
