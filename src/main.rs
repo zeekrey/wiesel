@@ -2,7 +2,10 @@
 compile_error!("Wiesel currently supports macOS only (native selection and Keychain backend).");
 
 mod auth;
+#[cfg(test)]
+mod chat_tests;
 mod clipboard_capture;
+mod completion_backend;
 mod gateway;
 mod input;
 mod model_picker;
@@ -12,11 +15,15 @@ mod selection;
 mod settings;
 mod theme;
 
-use anyhow::Context as _;
 use auth::{AuthError, DesktopClient, DeviceCredential};
 use gateway::Message;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
-use gpui::{KeyBinding, prelude::*, *};
+use gpui::{
+    App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, FontWeight,
+    KeyBinding, KeyDownEvent, MouseButton, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    Stateful, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*, px, relative,
+    rgb, rgba, size,
+};
 use input::TextInput;
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::{QUICK_ACTIONS, QuickAction};
@@ -489,6 +496,7 @@ struct Wiesel {
     chat_scroll: ScrollHandle,
     chat_follow_bottom: bool,
     streaming_chat: Option<Message>,
+    completion_backend: completion_backend::CompletionBackend,
 }
 impl Wiesel {
     fn new(
@@ -556,7 +564,10 @@ impl Wiesel {
             status_loading: false,
             device_status: None,
             recovery,
-            composer: cx.new(|cx| TextInput::new("Ask anything…", false, cx)),
+            composer: cx.new(|cx| {
+                TextInput::new("Ask anything…", false, cx)
+                    .with_accessibility_id("wiesel.chat.composer")
+            }),
             launcher_input: cx.new(TextInput::launcher),
             focus: cx.focus_handle(),
             recording: false,
@@ -579,6 +590,7 @@ impl Wiesel {
             chat_scroll: ScrollHandle::new(),
             chat_follow_bottom: true,
             streaming_chat: None,
+            completion_backend: completion_backend::CompletionBackend::Gateway,
         };
         for input in [
             &app.hotkey_input,
@@ -846,18 +858,21 @@ impl Wiesel {
         {
             self.chat_follow_bottom = true;
         }
+        self.receive_results(window, cx);
+        if self
+            .notifications
+            .update(Instant::now(), self.idle_notification())
+        {
+            cx.notify();
+        }
+    }
+    fn receive_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(event) = self.rx.try_recv() {
             if !self.session.accepts(event.scope) {
                 // In particular, never persist a canceled/replaced exchange result.
                 continue;
             }
             self.apply_result(event.scope, event.result, window, cx);
-            cx.notify();
-        }
-        if self
-            .notifications
-            .update(Instant::now(), self.idle_notification())
-        {
             cx.notify();
         }
     }
@@ -1322,33 +1337,16 @@ impl Wiesel {
         if chat {
             self.streaming_chat = Some(Message::new("assistant", ""));
         }
-        std::thread::spawn(move || {
-            let result = credential
-                .ensure_valid()
-                .map_err(anyhow::Error::from)
-                .and_then(|()| {
-                    if chat {
-                        gateway::complete_stream(
-                            credential.access_token(),
-                            &model,
-                            &messages,
-                            |delta| {
-                                tx.send(ResultEvent {
-                                    scope,
-                                    result: ResultPayload::ChatDelta(delta.to_owned()),
-                                })
-                                .context("Chat window closed")
-                            },
-                        )
-                    } else {
-                        gateway::complete(credential.access_token(), &model, &messages)
-                    }
-                });
-            let _ = tx.send(ResultEvent {
+        self.completion_backend.start(
+            completion_backend::CompletionRequest {
+                credential,
+                model,
+                messages,
+                chat,
                 scope,
-                result: ResultPayload::Completion(result, chat),
-            });
-        });
+            },
+            tx,
+        );
         cx.notify();
     }
     fn run_quick_action(
@@ -1678,6 +1676,10 @@ impl Wiesel {
                     actions.iter().copied().map(|action| {
                         div()
                             .id(action.id())
+                            .debug_selector(|| action.id().into())
+                            .role(Role::Button)
+                            .accessibility_id(format!("wiesel.action.{}", action.id()))
+                            .aria_label(action.title())
                             .relative()
                             .flex_1()
                             .h(px(106.))
@@ -1774,7 +1776,23 @@ impl Wiesel {
                             .map(|(index, message)| {
                                 let user = message.role == "user";
                                 let text = message.content.clone();
+                                // Only committed messages use user/assistant identifiers. A
+                                // streaming preview must never satisfy a completed-reply check.
+                                let message_kind = if index >= self.messages.len() {
+                                    "streaming"
+                                } else if user {
+                                    "user"
+                                } else {
+                                    "assistant"
+                                };
                                 div()
+                                    .id(("chat-message", index))
+                                    .role(Role::Group)
+                                    .accessibility_id(format!(
+                                        "wiesel.message.{message_kind}.{index}"
+                                    ))
+                                    .aria_label(if user { "Your message" } else { "Wiesel reply" })
+                                    .aria_value(text.clone())
                                     .w_full()
                                     .flex_shrink_0()
                                     .flex()
@@ -1879,7 +1897,13 @@ impl Wiesel {
                             .border_1()
                             .border_color(rgba(theme::INPUT_BORDER))
                             .bg(rgb(theme::CARD))
-                            .child(div().flex_1().min_w_0().child(self.composer.clone()))
+                            .child(
+                                div()
+                                    .debug_selector(|| "chat-composer".into())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.composer.clone()),
+                            )
                             .child(
                                 div()
                                     .font_family(theme::MONO)
@@ -1890,6 +1914,14 @@ impl Wiesel {
                             .child(
                                 div()
                                     .id("send")
+                                    .debug_selector(|| "send".into())
+                                    .role(Role::Button)
+                                    .accessibility_id("wiesel.chat.send")
+                                    .aria_label(if self.busy {
+                                        "Sending message"
+                                    } else {
+                                        "Send message"
+                                    })
                                     .size(px(28.))
                                     .flex_shrink_0()
                                     .flex()
@@ -2026,6 +2058,21 @@ impl Render for Wiesel {
             Page::Writing => self.writing_view(cx).into_any_element(),
         };
         div()
+            .id("wiesel-root")
+            .role(Role::Group)
+            .accessibility_id(match self.page {
+                Page::Setup => "wiesel.page.setup",
+                Page::Launcher => "wiesel.page.launcher",
+                Page::Chat => "wiesel.page.chat",
+                Page::Writing => "wiesel.page.writing",
+            })
+            .aria_label("Wiesel")
+            .aria_description(match (self.authenticated, self.busy) {
+                (true, false) => "Signed in; request idle",
+                (true, true) => "Signed in; request pending",
+                (false, false) => "Signed out; request idle",
+                (false, true) => "Signed out; request pending",
+            })
             .size_full()
             .rounded(px(14.))
             .border_1()

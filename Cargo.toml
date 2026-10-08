@@ -21,6 +21,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-segmentation = "1"
 
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "f8c2cc844057540ca1eac7de4f19f50d7597dead", features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7", default-features = false }
 objc2 = "0.6.3"

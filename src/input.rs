@@ -52,6 +52,7 @@ pub struct TextInput {
     secret: bool,
     launcher_style: bool,
     placeholder: SharedString,
+    accessibility_id: Option<SharedString>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -71,6 +72,7 @@ impl TextInput {
             secret,
             launcher_style: false,
             placeholder: placeholder.to_owned().into(),
+            accessibility_id: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -85,6 +87,11 @@ impl TextInput {
             launcher_style: true,
             ..Self::new("What would you like to do?", false, cx)
         }
+    }
+
+    pub fn with_accessibility_id(mut self, id: &'static str) -> Self {
+        self.accessibility_id = Some(id.into());
+        self
     }
 
     pub fn is_composing(&self) -> bool {
@@ -669,6 +676,31 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("text-input")
+            .when_some(self.accessibility_id.clone(), |d, id| {
+                d.role(if self.secret {
+                    gpui::Role::PasswordInput
+                } else {
+                    gpui::Role::TextInput
+                })
+                .accessibility_id(id)
+                .aria_label(self.placeholder.clone())
+                .aria_value(if self.secret {
+                    SharedString::default()
+                } else {
+                    self.content.clone()
+                })
+                .on_a11y_action(gpui::AccessibleAction::SetValue, {
+                    let input = cx.entity().downgrade();
+                    move |data, _, cx| {
+                        if let Some(gpui::accesskit::ActionData::Value(value)) = data {
+                            let _ = input.update(cx, |this, cx| {
+                                this.set(value.to_string(), cx);
+                            });
+                        }
+                    }
+                })
+            })
             .flex()
             .w_full()
             .min_w_0()

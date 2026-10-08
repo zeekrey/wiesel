@@ -188,6 +188,8 @@ self.notifications.clear(Source::Request); // recover only this source
 cargo fmt --check
 cargo check --offline --locked
 cargo test --offline --locked
+# Focused offline native-wrapper tests (the live scenario stays ignored):
+cargo test --offline --locked --test native_chat_smoke
 cargo clippy --offline --all-targets --all-features --locked -- -D warnings
 # Build/restart script tests (Python 3, mocked OS commands):
 python3 scripts/test-app-scripts.py
@@ -197,6 +199,107 @@ python3 scripts/test-release.py
 ```
 
 Unit tests cover PKCE/callback grammar, single-use exchanges, fixed-origin authenticated wire contracts, sanitized failures, SSE bounds/fragmentation, mock Keychain lifecycle/native-delete status rejection, cross-process file-lock contention and pointer-mutation races, stale-device cleanup/retry identity, startup recovery, generation/device guards and stale-exchange persistence suppression, plus model search, settings, hotkeys, Unicode/IME, selection and draft preservation. Native clipboard tests use private pasteboards, not your general clipboard. Build/restart scripts use mocked OS commands. **These automated checks are local source/mocked validation, not live backend, website, browser, production Keychain, signed-bundle routing or deployment verification. No deployment or live request is implied.**
+
+### Native chat UI smoke test (macOS, opt-in live request)
+
+The two-layer strategy and complete Cargo/optional Nextest commands are in
+[docs/testing.md](docs/testing.md). Normal `cargo test` runs the native wrapper
+tests offline and ignores `native_chat_completed_reply`; it never launches the bundle
+or invokes the live driver.
+
+`scripts/ui-smoke.sh` compiles a small Swift Accessibility runner at
+`target/ui-smoke/wiesel-ui-smoke`. It launches or activates the **specified bundle**,
+presses the Chat tile, enters a prompt through the native text-field Accessibility
+API, presses Send, and asserts a **committed** assistant reply. No private app IPC,
+HTTP test client, clipboard access, coordinate clicks, or screenshot/OCR is used.
+This MVP exercises the Send button, not the Enter key or global selection hotkey.
+
+Build the current source into the bundle first. Quit Wiesel manually before using
+`build-app.sh`; it refuses to replace a running bundle. Use your usual persistent
+signing identity when configured, or `dev.sh` for your normal signed restart.
+
+```sh
+bash scripts/build-app.sh
+# Compile/check the runner without launching Wiesel or sending requests:
+bash scripts/ui-smoke.sh --self-test
+# One-time authorization (does not grant permission automatically):
+bash scripts/ui-smoke.sh --request-permission
+# Launch and inspect selectors without sending a chat message:
+bash scripts/ui-smoke.sh --preflight
+# Submit ONE potentially billable live chat request and assert its reply:
+bash scripts/ui-smoke.sh --live
+# Optional custom prompt and exact expected answer:
+bash scripts/ui-smoke.sh --live --prompt 'Reply with only: WIESEL_SMOKE_OK' \
+  --expect WIESEL_SMOKE_OK --timeout 150
+# Optional explicit bundle path:
+bash scripts/ui-smoke.sh --preflight --app /absolute/path/to/Wiesel.app
+```
+
+**One-time manual prerequisites:** allow the terminal/runner under System Settings
+→ Privacy & Security → Accessibility (separate from Wiesel's selected-text
+permission). The helper prints its executable path; if needed, use the `+` button
+and Command-Shift-G to add that path. macOS can attribute the helper to its hosting
+terminal. Rebuilding the helper can require reauthorizing it. Complete browser
+login and model setup in Wiesel using an authorized test account. Permission and
+login are never bypassed or configured by the runner.
+
+Start from the launcher or an **empty Chat with an empty composer**, with no request
+pending. The runner refuses existing history/drafts instead of deleting them;
+choose **New chat** and clear any draft manually before another run. Other running
+copies of Wiesel are rejected. Leave the app alone during testing. Wiesel is left
+open afterward; settings, Keychain entries, and the general clipboard are not
+modified by the runner. Normal app startup can perform session/catalog requests
+even in preflight mode.
+
+The default prompt requests a fresh unique marker on each run. Success requires
+that the submitted user message is displayed, a completed assistant message
+matches the marker (ignoring surrounding whitespace), the request is idle, and
+the composer is empty. Streaming previews cannot pass. This is a live-model smoke
+test, not deterministic CI: model noncompliance, network issues, and allowance
+failures can fail it. The reply deadline defaults to 150 seconds (`--timeout`,
+1–600). There is **no automatic retry**, including after timeouts with unknown
+billing outcomes. Inspect the app's status bar before deciding to rerun.
+
+Logs contain phase/selector diagnostics, never prompt/reply contents or tokens.
+No screenshots are captured. Exit codes: `0` success, `1` reply/assertion failure,
+`2` permission/setup/usage failure. `--self-test` validates the runner's parser and
+reply assertions only; it does **not** prove native UI or backend success.
+
+#### Cargo / optional Nextest live entry point
+
+After completing the manual prerequisites above, the ignored Rust integration
+test runs exactly the same live scenario with the default unique-marker prompt:
+
+```sh
+WIESEL_UI_LIVE=1 cargo test --offline --locked --test native_chat_smoke \
+  native_chat_completed_reply -- --ignored --exact --test-threads=1 --nocapture
+# Optional bundle override (otherwise this checkout's dist/Wiesel.app):
+WIESEL_UI_LIVE=1 WIESEL_UI_APP='/absolute/path/to/Wiesel.app' \
+  cargo test --offline --locked --test native_chat_smoke \
+  native_chat_completed_reply -- --ignored --exact --test-threads=1 --nocapture
+# Optional, only if Cargo Nextest is already installed:
+WIESEL_UI_LIVE=1 cargo nextest run --offline --locked --test native_chat_smoke \
+  --run-ignored only -E 'test(=native_chat_completed_reply)' \
+  --test-threads 1 --retries 0
+```
+
+`WIESEL_UI_LIVE=1` is a second explicit gate for the **Rust entry point**:
+selecting the ignored test without it fails before any driver invocation. A
+normal run reports the live scenario as ignored/skipped; once explicitly
+selected, missing prerequisites or a nonzero driver exit are failures, not
+skips. `WIESEL_UI_APP` is passed as a single bundle-path argument, resolving
+relative paths from the repository root. Do not run live commands concurrently.
+The Nextest default-profile override serializes this test and disables retries;
+neither runner should be wrapped in a retry loop.
+
+Cargo/Nextest receive sanitized exit-category diagnostics, never subprocess
+stdout/stderr or message contents. The reply deadline is fixed at 150 seconds;
+the wrapper's total driver deadline is 300 seconds (including compilation and
+startup). On a process timeout it stops/reaps only its driver, never Wiesel,
+and does not reset state or retry. A request may still be pending or charged.
+Investigate setup with `--self-test` or an explicitly chosen manual `--preflight`;
+inspect the app's status bar before considering another billable attempt.
+Offline fake-driver tests and runner self-tests are not live-request evidence.
 
 ### Manual launch checklist (required before release)
 
