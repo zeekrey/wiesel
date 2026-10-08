@@ -63,3 +63,66 @@ direct driver process, not Wiesel or any compiler descendant. No automatic retry
 state reset, login bypass, or credential/message logging is allowed. An ambiguous
 submission may have been charged; inspect Wiesel before deciding to rerun.
 `--preflight` sends no chat message but can cause normal startup session/catalog requests.
+
+
+## 3. Local diagnostic integration (offline)
+
+```sh
+cargo test --offline --locked --bin wiesel diagnostic
+cargo test --offline --locked --bin wiesel gateway::tests
+cargo test --offline --locked --bin wiesel chat_tests
+cargo test --offline --locked --bin wiesel notifications::tests
+cargo test --offline --locked --all-targets
+cargo fmt --all -- --check
+cargo clippy --offline --all-targets --all-features --locked -- -D warnings
+```
+
+The logger is registered in the actual application, not an external test harness.
+Storage/control tests create private disposable directories beneath the canonical
+temporary folder. Gateway tests use local mock HTTP servers and synthetic private
+markers, verifying status/stage/elapsed/action correlation while keeping bodies,
+URLs, tokens and replies absent from persisted JSONL. They preserve the conservative
+unknown-outcome billing warning and no-retry policy. Finder tests inspect command
+arguments without launching Finder. In-process chat fixtures never initialize the
+real logger; injected initialization/control results test nonfatal behavior and
+completion independence from login generation. No test reads credentials, clears
+the user's logs or sends authenticated inference.
+
+### Manual Settings smoke checks (disposable macOS test account)
+
+These checks are **not** automated acceptance evidence. Use a disposable macOS
+account with test-only logs/settings; do not clear an ordinary user's logs as a test.
+No login, credential inspection or live inference is needed for the local controls.
+
+1. Launch the bundle, open Settings before any login/request, and find Diagnostics
+   by scrolling. Check privacy/retention text wraps within the existing layout and
+   the bottom notification bar stays 48px high at the minimum supported width.
+2. Click **Open Logs Folder**: Finder opens `~/Library/Logs/Wiesel`. Check Tab focus,
+   Enter/Space activation, button labels and VoiceOver descriptions. Check that
+   in-progress controls do not enqueue duplicate actions. No shell is involved.
+3. Inspect JSONL locally: version/timestamp/session/action/category/kind and optional
+   failure/stage/status/elapsed, validated request model_id, and raw error_type.
+   Types up to 256 UTF-8 bytes are preserved exactly; larger/non-string types and
+   malformed/oversized envelopes omit the type but retain HTTP status. Check that
+   control characters are JSON-escaped, not additional log lines. Other response
+   fields and request draft/reply/URL/token/other settings values should not appear.
+   Error types are server-controlled: review them for sensitive text before sharing. IDs are diagnostic correlation, never billing proof.
+4. Click **Clear Logs** and wait for the bottom-bar result. Old recognized files
+   disappear, a fresh active file and the coordination lock remain, and new typed
+   events (including clear completion) can be written. Chat/settings remain unchanged.
+5. Launch a second instance in the test account and retry Clear Logs: it must refuse
+   with a close-other-instances message, not partial deletion. Close the second
+   instance and retry; then inspect fresh logging. Do not remove the lock manually.
+6. In the disposable account only, use an unavailable/unsafe log path or denied
+   folder permissions before launch: startup and unauthenticated UI remain usable,
+   a safe diagnostic warning is shown, and controls do not claim success. Restore
+   permissions/path and relaunch. Finder/clear failures must be visible, not hidden.
+7. Quit normally and inspect completed local events. Forced termination/stalled disk
+   can lose logs; retention runs on init/write/flush, not exactly at seven days while
+   idle. Active files are protected and cannot force writes over the 20 MiB budget.
+
+For gateway unknown-outcome evidence, prefer the offline local HTTP/partial-stream/
+timeout tests above. A future explicitly authorized live reproduction can correlate
+its local diagnostic action and stages, but must retain the may-have-been-charged
+warning and must not be automatically retried. No live reproduction was performed
+as part of this integration.

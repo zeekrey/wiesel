@@ -8,6 +8,7 @@ pub(super) struct CompletionRequest {
     pub messages: Vec<gateway::Message>,
     pub chat: bool,
     pub scope: EventScope,
+    pub diagnostic_action: Option<gateway::DiagnosticAction>,
 }
 
 // There is only one production route. The controlled implementation is compiled
@@ -26,13 +27,19 @@ impl CompletionBackend {
                     let result = request
                         .credential
                         .ensure_valid()
-                        .map_err(anyhow::Error::from)
+                        .map_err(|error| {
+                            if let Some(action) = &request.diagnostic_action {
+                                action.credential_rejected();
+                            }
+                            anyhow::Error::from(error)
+                        })
                         .and_then(|()| {
                             if request.chat {
                                 gateway::complete_stream(
                                     request.credential.access_token(),
                                     &request.model,
                                     &request.messages,
+                                    request.diagnostic_action.as_ref(),
                                     |delta| {
                                         tx.send(ResultEvent {
                                             scope: request.scope,
@@ -46,6 +53,7 @@ impl CompletionBackend {
                                     request.credential.access_token(),
                                     &request.model,
                                     &request.messages,
+                                    request.diagnostic_action.as_ref(),
                                 )
                             }
                         });

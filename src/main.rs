@@ -6,6 +6,7 @@ mod auth;
 mod chat_tests;
 mod clipboard_capture;
 mod completion_backend;
+mod diagnostics;
 mod gateway;
 mod input;
 mod model_picker;
@@ -16,6 +17,9 @@ mod settings;
 mod theme;
 
 use auth::{AuthError, DesktopClient, DeviceCredential};
+use diagnostics::{
+    Category, Completion, DiagnosticError, Diagnostics, Event, EventKind, FailureCode, Stage,
+};
 use gateway::Message;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use gpui::{
@@ -461,9 +465,88 @@ enum ResultPayload {
     Completion(anyhow::Result<String>, bool),
     SignOut(Result<(), AuthError>),
 }
+#[derive(Clone, Copy)]
+enum DiagnosticControl {
+    OpenFolder,
+    ClearLogs,
+}
+impl DiagnosticControl {
+    fn stage(self) -> Stage {
+        match self {
+            Self::OpenFolder => Stage::OpenFolder,
+            Self::ClearLogs => Stage::ClearLogs,
+        }
+    }
+}
+enum DiagnosticUpdate {
+    Initialized(Result<Diagnostics, DiagnosticError>),
+    Controlled(DiagnosticControl, Result<(), DiagnosticError>),
+}
+fn diagnostic_failure_message(error: DiagnosticError) -> &'static str {
+    match error {
+        DiagnosticError::OtherSessionActive => {
+            "Close other Wiesel instances, then clear logs again."
+        }
+        DiagnosticError::UnsafePath => {
+            "Unsafe logs path refused. Check ~/Library/Logs/Wiesel and relaunch."
+        }
+        DiagnosticError::InvalidHome => {
+            "Logs folder unavailable. Check your home folder and relaunch."
+        }
+        DiagnosticError::QueueFull => "Diagnostics busy. Wait and try again.",
+        DiagnosticError::StorageBudget => {
+            "Logs storage full. Close other Wiesel instances and clear logs."
+        }
+        DiagnosticError::Io(std::io::ErrorKind::PermissionDenied) => {
+            "Logs permission denied. Check folder permissions and relaunch."
+        }
+        _ => "Local diagnostics unavailable. Check disk space and folder permissions; relaunch.",
+    }
+}
+fn finder_command(path: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command
+        .args(["-a", "Finder", "--"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+fn run_diagnostic_control(
+    diagnostics: &Diagnostics,
+    control: DiagnosticControl,
+) -> Result<(), DiagnosticError> {
+    match control {
+        DiagnosticControl::ClearLogs => diagnostics.clear()?.wait(),
+        DiagnosticControl::OpenFolder => {
+            let path = diagnostics.log_directory()?;
+            let status = finder_command(&path)
+                .status()
+                .map_err(DiagnosticError::from)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(DiagnosticError::Io(std::io::ErrorKind::Other))
+            }
+        }
+    }
+}
+
 struct Wiesel {
     page: Page,
     settings: Settings,
+    diagnostics: Option<Diagnostics>,
+    diagnostics_initializing: bool,
+    diagnostics_busy: bool,
+    #[cfg(test)]
+    controlled_diagnostic_requests: Option<Vec<DiagnosticControl>>,
+    diagnostics_tx: mpsc::Sender<DiagnosticUpdate>,
+    diagnostics_rx: mpsc::Receiver<DiagnosticUpdate>,
+    diagnostic_flush: Option<Completion>,
+    diagnostic_flushed_at: Instant,
+    diagnostics_open_focus: FocusHandle,
+    diagnostics_clear_focus: FocusHandle,
     manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
     hotkey_input: Entity<TextInput>,
@@ -501,6 +584,8 @@ struct Wiesel {
 impl Wiesel {
     fn new(
         urls: mpsc::Receiver<zeroize::Zeroizing<String>>,
+        diagnostics_tx: mpsc::Sender<DiagnosticUpdate>,
+        diagnostics_rx: mpsc::Receiver<DiagnosticUpdate>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -549,6 +634,17 @@ impl Wiesel {
         let mut app = Self {
             page: Page::Setup,
             settings,
+            diagnostics: None,
+            diagnostics_initializing: true,
+            diagnostics_busy: false,
+            #[cfg(test)]
+            controlled_diagnostic_requests: None,
+            diagnostics_tx,
+            diagnostics_rx,
+            diagnostic_flush: None,
+            diagnostic_flushed_at: Instant::now(),
+            diagnostics_open_focus: cx.focus_handle().tab_stop(true),
+            diagnostics_clear_focus: cx.focus_handle().tab_stop(true),
             manager,
             hotkey: None,
             hotkey_input,
@@ -629,9 +725,186 @@ impl Wiesel {
             false
         });
         window.focus(&app.login_focus, cx);
+        app.poll_diagnostics(cx);
         app.sync_permission_issue();
         app.refresh_status(true, cx);
         app
+    }
+    // Called only by the production entry point, never by in-process UI fixtures.
+    fn register_diagnostic_shutdown(&mut self, cx: &mut Context<Self>) {
+        cx.on_app_quit(|this, cx| {
+            let diagnostics = this.diagnostics.take();
+            cx.background_executor().spawn(async move {
+                if let Some(diagnostics) = diagnostics {
+                    let _ = diagnostics.record(
+                        Event::new(Category::Application, EventKind::Succeeded),
+                        None,
+                    );
+                    if let Err(error) = diagnostics.shutdown().and_then(Completion::wait) {
+                        // Closed storage errors only; no arbitrary app/network errors.
+                        eprintln!("Diagnostics shutdown incomplete: {error}");
+                    }
+                }
+            })
+        })
+        .detach();
+    }
+    fn poll_diagnostics(&mut self, cx: &mut Context<Self>) {
+        while let Ok(update) = self.diagnostics_rx.try_recv() {
+            match update {
+                DiagnosticUpdate::Initialized(result) => {
+                    self.diagnostics_initializing = false;
+                    match result {
+                        Ok(diagnostics) => {
+                            let _ = diagnostics.record(
+                                Event::new(Category::Application, EventKind::Started),
+                                None,
+                            );
+                            self.diagnostic_flush = diagnostics.flush().ok();
+                            self.diagnostics = Some(diagnostics);
+                            self.record_diagnostic_outcome(
+                                Category::Accessibility,
+                                self.accessibility_granted,
+                                FailureCode::Permission,
+                            );
+                        }
+                        Err(error) => self.notifications.issue(
+                            Source::Diagnostics,
+                            Severity::Warning,
+                            diagnostic_failure_message(error),
+                        ),
+                    }
+                }
+                DiagnosticUpdate::Controlled(control, result) => {
+                    self.diagnostics_busy = false;
+                    self.notifications.clear(Source::Diagnostics);
+                    match result {
+                        Ok(()) => self.notifications.success(match control {
+                            DiagnosticControl::OpenFolder => "Logs folder opened in Finder.",
+                            DiagnosticControl::ClearLogs => "Logs cleared. New diagnostics continue locally.",
+                        }),
+                        Err(error) => self.notifications.issue(Source::Diagnostics, Severity::Warning,
+                            if matches!(control, DiagnosticControl::OpenFolder) && matches!(error, DiagnosticError::Io(_)) {
+                                "Could not open logs in Finder. Check folder permissions and try again."
+                            } else { diagnostic_failure_message(error) }),
+                    }
+                }
+            }
+            cx.notify();
+        }
+        if let Some(result) = self
+            .diagnostic_flush
+            .as_ref()
+            .and_then(Completion::try_wait)
+        {
+            self.diagnostic_flush = None;
+            if let Err(error) = result {
+                self.notifications.issue(
+                    Source::Diagnostics,
+                    Severity::Warning,
+                    diagnostic_failure_message(error),
+                );
+                cx.notify();
+            }
+        }
+        if self.diagnostic_flush.is_none()
+            && self.diagnostic_flushed_at.elapsed() >= Duration::from_secs(30)
+        {
+            self.diagnostic_flushed_at = Instant::now();
+            if let Some(diagnostics) = &self.diagnostics {
+                match diagnostics.flush() {
+                    Ok(completion) => self.diagnostic_flush = Some(completion),
+                    Err(error) => {
+                        self.notifications.issue(
+                            Source::Diagnostics,
+                            Severity::Warning,
+                            diagnostic_failure_message(error),
+                        );
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+    fn diagnostic_control(&mut self, control: DiagnosticControl, cx: &mut Context<Self>) {
+        if self.diagnostics_busy || self.diagnostics_initializing {
+            return;
+        }
+        // Controlled UI tests release completions explicitly, without storage or Finder.
+        #[cfg(test)]
+        if let Some(requests) = &mut self.controlled_diagnostic_requests {
+            requests.push(control);
+            self.diagnostics_busy = true;
+            cx.notify();
+            return;
+        }
+        let Some(diagnostics) = self.diagnostics.clone() else {
+            self.notifications
+                .warning("Local diagnostics unavailable. Check folder permissions and relaunch.");
+            cx.notify();
+            return;
+        };
+        self.diagnostics_busy = true;
+        self.notifications.working(
+            Source::Diagnostics,
+            match control {
+                DiagnosticControl::OpenFolder => "Opening logs folder…",
+                DiagnosticControl::ClearLogs => "Clearing local logs…",
+            },
+        );
+        let tx = self.diagnostics_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("wiesel-diagnostic-control".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let id = diagnostics.new_action_id();
+                let _ = diagnostics.record(
+                    Event::new(Category::Diagnostics, EventKind::Started)
+                        .at_stage(control.stage(), 0),
+                    Some(id),
+                );
+                let result = run_diagnostic_control(&diagnostics, control);
+                let event = match result {
+                    Ok(()) => Event::new(Category::Diagnostics, EventKind::Succeeded),
+                    Err(DiagnosticError::OtherSessionActive) => {
+                        Event::failure(Category::Diagnostics, FailureCode::Conflict)
+                    }
+                    Err(
+                        DiagnosticError::UnsafePath
+                        | DiagnosticError::Io(std::io::ErrorKind::PermissionDenied),
+                    ) => Event::failure(Category::Diagnostics, FailureCode::Permission),
+                    Err(_) => Event::failure(Category::Diagnostics, FailureCode::Storage),
+                };
+                let _ = diagnostics.record(
+                    event.at_stage(
+                        control.stage(),
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    ),
+                    Some(id),
+                );
+                let _ = tx.send(DiagnosticUpdate::Controlled(control, result));
+            });
+        if let Err(error) = spawned {
+            self.diagnostics_busy = false;
+            self.notifications.issue(
+                Source::Diagnostics,
+                Severity::Warning,
+                diagnostic_failure_message(error.into()),
+            );
+        }
+        cx.notify();
+    }
+    fn record_diagnostic(&self, event: Event) {
+        if let Some(diagnostics) = &self.diagnostics {
+            let _ = diagnostics.record(event, Some(diagnostics.new_action_id()));
+        }
+    }
+    fn record_diagnostic_outcome(&self, category: Category, succeeded: bool, code: FailureCode) {
+        self.record_diagnostic(if succeeded {
+            Event::new(category, EventKind::Succeeded)
+        } else {
+            Event::failure(category, code)
+        });
     }
     fn input_notification(&mut self, notification: &Notification, cx: &mut Context<Self>) {
         self.notifications.suppress_motion = true;
@@ -676,6 +949,7 @@ impl Wiesel {
         }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&text) {
+            self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
             self.notifications.report(
                 Source::Hotkey,
                 "Could not activate shortcut. Choose another and retry.",
@@ -687,11 +961,16 @@ impl Wiesel {
             next.hotkey = text;
             match settings::save(&next) {
                 Ok(()) => {
+                    self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
                     self.settings = next;
                     self.notifications.clear(Source::Settings);
                     self.notifications.success("Shortcut active and saved.");
                 }
                 Err(e) => {
+                    self.record_diagnostic(Event::failure(
+                        Category::Settings,
+                        FailureCode::Storage,
+                    ));
                     self.notifications.report(
                         Source::Settings,
                         "Could not save shortcut. Try again.",
@@ -739,6 +1018,11 @@ impl Wiesel {
         self.permission_checked_at = Instant::now();
         let granted = selection::accessibility_granted();
         if self.accessibility_granted != granted {
+            self.record_diagnostic_outcome(
+                Category::Accessibility,
+                granted,
+                FailureCode::Permission,
+            );
             self.accessibility_granted = granted;
             // Never leave a previously captured selection ready after permission is revoked.
             if !granted {
@@ -818,6 +1102,11 @@ impl Wiesel {
             && let Some(result) = capture.poll()
         {
             self.pending_capture = None;
+            self.record_diagnostic_outcome(
+                Category::Selection,
+                result.is_ok(),
+                FailureCode::Unavailable,
+            );
             self.notifications.clear(Source::Selection);
             match &result {
                 Ok(text) => self.notifications.success(format!(
@@ -826,7 +1115,6 @@ impl Wiesel {
                 )),
                 Err(e) => {
                     let (severity, message) = notifications::capture_issue(e);
-                    eprintln!("Wiesel selection: {e:#}");
                     self.notifications
                         .issue(Source::Selection, severity, message);
                 }
@@ -858,6 +1146,7 @@ impl Wiesel {
         {
             self.chat_follow_bottom = true;
         }
+        self.poll_diagnostics(cx);
         self.receive_results(window, cx);
         if self
             .notifications
@@ -1068,6 +1357,7 @@ impl Wiesel {
         cx.notify();
     }
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        self.record_diagnostic(Event::new(Category::Authentication, EventKind::Cancelled));
         self.session.cancel_login();
         self.notifications.clear(Source::Request);
         self.notifications
@@ -1096,9 +1386,10 @@ impl Wiesel {
                 self.notifications
                     .warning("Login expired. Start a new login.");
             }
-            Err(AuthError::Inactive) => self.notifications.warning(
-                "No matching active login. Reopen Login / Sign up; old links cannot be restored.",
-            ),
+            Err(AuthError::Inactive) => {
+                self.record_diagnostic(Event::new(Category::Authentication, EventKind::Rejected));
+                self.notifications.warning("No matching active login. Reopen Login / Sign up; old links cannot be restored.");
+            }
             Err(_) => self
                 .notifications
                 .warning("Login link did not match. Continue in your browser or reopen login."),
@@ -1138,6 +1429,7 @@ impl Wiesel {
         let removed = self
             .recovery
             .remove(target, settings::delete_device_credential);
+        self.record_diagnostic_outcome(Category::Keychain, removed.is_ok(), FailureCode::Storage);
         if removed.is_err() {
             self.notifications.issue(
                 Source::Keychain,
@@ -1242,11 +1534,20 @@ impl Wiesel {
             .working(Source::Models, "Loading model catalog…");
         let tx = self.tx.clone();
         let scope = self.session.scope();
+        let action = self
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| gateway::DiagnosticAction::new(diagnostics, Category::Models));
         std::thread::spawn(move || {
             let result = credential
                 .ensure_valid()
-                .map_err(anyhow::Error::from)
-                .and_then(|()| gateway::models(credential.access_token()));
+                .map_err(|error| {
+                    if let Some(action) = &action {
+                        action.credential_rejected();
+                    }
+                    anyhow::Error::from(error)
+                })
+                .and_then(|()| gateway::models(credential.access_token(), action.as_ref()));
             let _ = tx.send(ResultEvent {
                 scope,
                 result: ResultPayload::Models(result),
@@ -1284,6 +1585,7 @@ impl Wiesel {
         }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&hotkey) {
+            self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
             self.notifications.report(
                 Source::Hotkey,
                 "Could not activate shortcut. Choose another and retry.",
@@ -1301,6 +1603,7 @@ impl Wiesel {
         next.onboarded = true;
         match settings::save(&next) {
             Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
                 self.settings = next;
                 self.page = Page::Launcher;
                 self.notifications.clear(Source::Settings);
@@ -1308,6 +1611,7 @@ impl Wiesel {
                 window.focus(&self.launcher_input.focus_handle(cx), cx);
             }
             Err(e) => {
+                self.record_diagnostic(Event::failure(Category::Settings, FailureCode::Storage));
                 self.notifications.report(
                     Source::Settings,
                     "Could not save settings. Try again.",
@@ -1344,6 +1648,9 @@ impl Wiesel {
                 messages,
                 chat,
                 scope,
+                diagnostic_action: self.diagnostics.as_ref().map(|diagnostics| {
+                    gateway::DiagnosticAction::new(diagnostics, Category::Request)
+                }),
             },
             tx,
         );
@@ -1515,6 +1822,20 @@ impl Wiesel {
             return;
         }
         if self.page == Page::Setup
+            && key.key == "tab"
+            && !key.modifiers.platform
+            && !key.modifiers.control
+            && !key.modifiers.alt
+        {
+            if key.modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.page == Page::Setup
             && key.key == "enter"
             && !key.modifiers.shift
             && self.login_focus.is_focused(window)
@@ -1633,6 +1954,38 @@ impl Wiesel {
                     if this.recovery.restore_only() { this.retry_restore(cx); } else { this.sign_out(cx); }
                 }))))
     }
+    fn diagnostics_controls(&self, cx: &mut Context<Self>) -> Div {
+        let unavailable = self.diagnostics.is_none() || self.diagnostics_busy;
+        div().flex().flex_col().gap_2()
+            .child(Self::label("Diagnostics"))
+            .child(Self::label("Local JSONL logs · ~/Library/Logs/Wiesel. Includes model ID and raw server error type; review logs before sharing."))
+            .child(Self::label("Inactive logs pruned after 7 days, up to 20 MiB; active sessions protected. Cleanup runs on logging/flush, not an idle timer."))
+            .child(Self::label(if self.diagnostics_initializing { "Preparing local diagnostics…" }
+                else if self.diagnostics.is_none() { "Diagnostics unavailable; other features still work. Check folder permissions and relaunch." }
+                else if self.diagnostics_busy { "Working…" }
+                else { "Clearing logs does not clear chat or settings. Close other Wiesel instances first." }))
+            .child(div().flex().gap_2()
+                .child(Self::button("open-logs-folder", "Open Logs Folder")
+                    .debug_selector(|| "open-logs-folder".into())
+                    .role(Role::Button).aria_label("Open Logs Folder in Finder")
+                    .accessibility_id("wiesel.diagnostics.open-folder")
+                    .aria_description(if unavailable { "Unavailable or busy; check Diagnostics status." } else { "Ready" })
+                    .when(unavailable, |d| d.opacity(0.5))
+                    .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                    .active(|s| s.bg(rgb(theme::ACCENT)))
+                    .track_focus(&self.diagnostics_open_focus)
+                    .on_click(cx.listener(|this, _, _, cx| this.diagnostic_control(DiagnosticControl::OpenFolder, cx))))
+                .child(Self::button("clear-logs", "Clear Logs")
+                    .debug_selector(|| "clear-logs".into())
+                    .role(Role::Button).aria_label("Clear local diagnostic logs")
+                    .accessibility_id("wiesel.diagnostics.clear")
+                    .aria_description(if unavailable { "Unavailable or busy; check Diagnostics status." } else { "Ready" })
+                    .when(unavailable, |d| d.opacity(0.5))
+                    .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                    .active(|s| s.bg(rgb(theme::ACCENT)))
+                    .track_focus(&self.diagnostics_clear_focus)
+                    .on_click(cx.listener(|this, _, _, cx| this.diagnostic_control(DiagnosticControl::ClearLogs, cx)))))
+    }
     fn setup(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         // Keep scrollable content at its natural height instead of shrinking every field to fit.
         div().id("settings-scroll").flex_1().min_h_0().overflow_y_scroll()
@@ -1659,6 +2012,7 @@ impl Wiesel {
             .child(Self::label("Wiesel captures selected text using ⌘C and restores your previous clipboard before opening. Release the shortcut keys and keep the source app active. Clipboard managers may retain the temporary selection."))
             .child(Self::label("Input Monitoring, Screen Recording, and Automation are not required. On newer macOS versions, allow Wiesel to paste from other apps if asked so it can save and restore the clipboard."))
             .child(Self::label("If macOS shows Wiesel enabled but the bottom bar still requests access after a rebuild, remove the old entry, add this Wiesel.app again, and relaunch it."))
+            .child(self.diagnostics_controls(cx))
             .child(Self::button("save", "Save & start").on_click(cx.listener(|this, _, window, cx| this.finish_setup(window, cx)))))
     }
     fn launcher(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2191,7 +2545,72 @@ impl Render for Wiesel {
             .child(self.notifications.render())
     }
 }
+#[cfg(test)]
+mod diagnostic_integration_tests {
+    use super::*;
+    use diagnostics::tests::{Temp, records};
+
+    #[test]
+    fn finder_command_passes_the_entire_folder_as_one_argument_without_a_shell() {
+        let path = std::path::Path::new("/tmp/user home/Logs/$(private); Wiesel");
+        let command = finder_command(path);
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-a"),
+                std::ffi::OsStr::new("Finder"),
+                std::ffi::OsStr::new("--"),
+                path.as_os_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_control_waits_for_storage_completion_then_future_events_persist() {
+        let temp = Temp::new();
+        let diagnostics = temp.logger();
+        diagnostics.record(Event::new(Category::Application, EventKind::Started), None);
+        run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs).unwrap();
+        assert!(records(&temp.logs).is_empty());
+        diagnostics.record(
+            Event::new(Category::Diagnostics, EventKind::Succeeded).at_stage(Stage::ClearLogs, 1),
+            None,
+        );
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        assert_eq!(records(&temp.logs)[0]["stage"], "clear_logs");
+    }
+
+    #[test]
+    fn clear_control_surfaces_active_session_refusal_and_can_be_retried() {
+        let temp = Temp::new();
+        let diagnostics = temp.logger();
+        let other = temp.logger();
+        assert_eq!(
+            run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs),
+            Err(DiagnosticError::OtherSessionActive)
+        );
+        assert_eq!(
+            diagnostic_failure_message(DiagnosticError::OtherSessionActive),
+            "Close other Wiesel instances, then clear logs again."
+        );
+        other.shutdown().unwrap().wait().unwrap();
+        run_diagnostic_control(&diagnostics, DiagnosticControl::ClearLogs).unwrap();
+        diagnostics.shutdown().unwrap().wait().unwrap();
+    }
+}
+
 fn main() {
+    let (diagnostics_tx, diagnostics_rx) = mpsc::channel();
+    let init_tx = diagnostics_tx.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("wiesel-diagnostics-init".into())
+        .spawn(move || {
+            let _ = init_tx.send(DiagnosticUpdate::Initialized(Diagnostics::init()));
+        })
+    {
+        let _ = diagnostics_tx.send(DiagnosticUpdate::Initialized(Err(error.into())));
+    }
     let application = gpui_platform::application().with_assets(theme::Assets);
     let (url_tx, urls) = mpsc::sync_channel(16);
     application.on_open_urls(move |raw_urls| {
@@ -2238,12 +2657,18 @@ fn main() {
                 window_min_size: Some(size(px(580.), px(450.))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Wiesel::new(urls, window, cx)),
+            |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Wiesel::new(urls, diagnostics_tx, diagnostics_rx, window, cx);
+                    app.register_diagnostic_shutdown(cx);
+                    app
+                })
+            },
         ) {
             Ok(handle) => handle,
-            Err(error) => {
-                // No notification surface exists yet; fail gracefully with a diagnostic.
-                eprintln!("Cannot open Wiesel window: {error:#}");
+            Err(_) => {
+                // No notification surface exists yet; never print arbitrary error chains.
+                eprintln!("Cannot open Wiesel window. Quit and relaunch Wiesel.");
                 cx.quit();
                 return;
             }

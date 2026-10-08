@@ -126,7 +126,7 @@ Native removal uses Security.framework's status-checked `SecItemDelete` for both
 - **Summarize** (`4`) and **Explain** (`5`) send the captured selection with built-in prompts to wiesel.run and its model provider and show the result for review and copying.
 - The bottom-right **Add quick action** tile has a plus icon and a **Soon** badge. Clicking it only shows a coming-soon message; custom action creation is not implemented yet.
 - Escape or **Hide** hides Wiesel while keeping its global shortcut active. Command-Q quits it. The native titlebar controls are removed; drag the custom header text to move the fixed-size window.
-- **Settings** lets you change your shortcut, model, prompts, or account login.
+- **Settings** lets you change your shortcut, model, prompts, or account login, and open or clear local diagnostic logs.
 
 Text capture identifies the frontmost process using `NSWorkspace` before Wiesel takes focus. Accessibility is used only to check permission and reject focused fields identified as protected; selected text is captured exclusively using simulated **⌘C**:
 
@@ -143,11 +143,56 @@ Copy capture does not use AppleScript, Automation, Input Monitoring, or Screen R
 
 - Settings: `~/Library/Application Support/Wiesel/settings.json` (shortcut, model, prompts, onboarding completion; no credentials).
 - Device bearer token, expiry and device ID: device-scoped macOS Keychain entries only (never settings, clipboard or logs). `desktop-auth.lock` alongside settings contains no credentials or state; it coordinates Keychain operations across app processes.
+- Local diagnostic JSONL files: `~/Library/Logs/Wiesel` (folder 0700, files 0600). They contain only version/timestamp, random session ID, session-local diagnostic action ID, closed category/event/failure codes, optional closed operation stage, numeric HTTP status, elapsed action milliseconds, validated request `model_id`, and raw gateway `error_type` (up to 256 UTF-8 bytes). Wiesel does not log request prompts, replies, selected text, clipboard contents, other settings values, credentials, URLs, headers, raw response bodies or raw error chains. **`error_type` is server-controlled and preserved verbatim; it could contain sensitive text. Review logs before sharing them.** Logs stay local; Wiesel does not upload them automatically. They are not conversation history or a settings database.
 - Conversation, selected text, generated results, and temporary clipboard snapshots: memory only in Wiesel; not saved to disk. External clipboard managers may retain the temporary Copy selection.
 - Text is sent to the fixed HTTPS Wiesel backend at `https://wiesel.run/v1` and its model provider **only after a writing action or Send**. Browser login, device status and authenticated model-catalog requests send no selected text. Wiesel receives only the text/chat fields needed for the action; provider routing and allowance enforcement are backend responsibilities.
 - HTTP requests run off the UI thread, with connection/overall timeouts, no automatic retries or redirect following, and no desktop cookie jar. Async results are bound to their login generation and device identity; stale status/catalog/401/stream/exchange results are discarded after cancellation or sign-out. Keychain operations are serialized on the UI thread so stale exchanges cannot persist credentials. Failed chat sends restore the original draft only if the composer is empty; otherwise your new draft is preserved and **Restore failed message** keeps the failed text recoverable (except when the session is cleared).
 - Chat streams text as it arrives; incomplete answers are not committed to conversation history. Network/stream ambiguity may mean the action was charged: do not retry blindly. HTTP 402 means insufficient allowance, 409 means already submitted/do not retry, and 429 means throttling. No local credit projection authorizes admission, and there is no cancellation/refund promise.
 - Capturing a new selection during a request updates the next writing action without changing the in-flight request's original text.
+
+### Local diagnostics controls
+
+In **Settings → Diagnostics**, **Open Logs Folder** opens the containing folder in
+Finder, even before login or the first request. It uses the system `open` executable
+with separate arguments, not a shell. **Clear Logs** waits for coordinated storage
+completion before showing success; later events continue in a fresh file. Clearing
+logs does not clear settings, Keychain entries or in-memory chat. Close other Wiesel
+instances first: active-session protection refuses a clear rather than deleting
+another instance's active file. The empty `.wiesel-diagnostics.lock` stays in the
+folder; unrelated files are left untouched.
+
+Files rotate before crossing 2 MiB. On initialization, logging and flush, inactive
+recognized logs older than seven days are pruned, then the oldest inactive logs are
+removed to fit a 20 MiB app-wide budget. **Retention is lazy, not an idle timer**;
+active files are protected. Protected files or disk/permission errors can prevent
+pruning; writes that cannot safely fit the budget fail instead of growing it.
+Symlinked/replaced log paths are refused, including benign symlinked home ancestors.
+
+Initialization, Finder opening and clear waits run off the UI thread. Logging uses
+a bounded best-effort queue: storage/queue failures never block requests or startup,
+and events may be dropped. A failed initialization gives a nonfatal status warning
+and leaves controls unavailable until relaunch. The app periodically requests a
+flush and attempts a final flush/close on normal quit within GPUI's shutdown window;
+force-quit, crashes, SIGTERM or stalled storage can lose diagnostics. Successful
+clear confirms deletion/reopening, not durable storage of every future event.
+
+Gateway model/chat/writing operations record safe stage/classification and elapsed
+action timing, with HTTP status when a response was received. Chat/writing events
+include the model ID actually passed to that request (ASCII identifier syntax,
+maximum 128 bytes; invalid or credential-prefixed values are omitted). Error
+responses are read up to 64 KiB to extract only `error.type`. String values up to
+256 UTF-8 bytes are preserved exactly, including unknown types; JSON encoding
+escapes control characters so they cannot inject log lines. Larger values are
+omitted, not truncated. Missing/non-string types, malformed or oversized bodies
+omit the field without losing HTTP status. SSE error events use the same rules. Free-form `message`, `param`,
+`code`, and response bodies are never logged. Transport predicates
+classify timeouts/connection/body/decode errors before raw reqwest errors are
+discarded. A generic **outcome unknown** warning can therefore be correlated with
+local events without exposing input or remote error bodies. Elapsed time is cumulative
+from the local action's start, not server execution time. **Diagnostic action IDs are
+local correlation only, not gateway request IDs or billing proof**. Unknown outcomes
+may still have been charged; no automatic retries or refund/cancellation promises
+are added. Share logs manually only if you choose to, after reviewing their contents.
 
 ## Notifications (developer API)
 
@@ -170,7 +215,7 @@ self.notifications.clear(Source::Request); // recover only this source
 - Child components implement `EventEmitter<Notification>`, call `cx.emit(Notification::new(Severity::Warning, "No text available to paste."))`, and their owner forwards the event to `Notifications::push`. Text inputs and model-search input use this path.
 - Messages normalize whitespace and cap at 96 Unicode graphemes. The renderer also enforces no wrapping and width-aware ellipsis. Never put raw errors, remote response bodies, credentials, or selected text in notification copy.
 - Dot/text changes use a restrained 180ms ease-out opacity transition, no looping pulses or layout animation. Repeated identical statuses do not restart it. Keyboard feedback is immediate, and macOS Reduce Motion disables motion.
-- Authentication and inference failures are published as client-safe messages without raw error logging. The HTTP components discard sensitive transport/source chains and remote bodies; never log callback/login URLs, state, verifier, tokens or credential payloads. Other local subsystems may emit diagnostic logs.
+- Authentication and inference failures are published as client-safe messages without raw error logging. The HTTP components discard sensitive transport/source chains and remote bodies; never log callback/login URLs, state, verifier, tokens or credential payloads. Local operation owners emit bounded structured JSONL events, including the explicitly retained raw gateway `error_type`; notification reporting does not format raw errors or source chains.
 - Startup window creation failures occur before a bar exists and remain diagnostic-only; expected shutdown channel failures, empty sends, and protected-field Copy/Cut no-ops do not generate notifications.
 
 ### Status-bar acceptance checks
@@ -198,7 +243,7 @@ python3 scripts/release.py version
 python3 scripts/test-release.py
 ```
 
-Unit tests cover PKCE/callback grammar, single-use exchanges, fixed-origin authenticated wire contracts, sanitized failures, SSE bounds/fragmentation, mock Keychain lifecycle/native-delete status rejection, cross-process file-lock contention and pointer-mutation races, stale-device cleanup/retry identity, startup recovery, generation/device guards and stale-exchange persistence suppression, plus model search, settings, hotkeys, Unicode/IME, selection and draft preservation. Native clipboard tests use private pasteboards, not your general clipboard. Build/restart scripts use mocked OS commands. **These automated checks are local source/mocked validation, not live backend, website, browser, production Keychain, signed-bundle routing or deployment verification. No deployment or live request is implied.**
+Unit tests cover PKCE/callback grammar, single-use exchanges, fixed-origin authenticated wire contracts, sanitized failures, SSE bounds/fragmentation, mock Keychain lifecycle/native-delete status rejection, cross-process file-lock contention and pointer-mutation races, stale-device cleanup/retry identity, startup recovery, generation/device guards and stale-exchange persistence suppression, plus model search, settings, hotkeys, Unicode/IME, selection and draft preservation. Diagnostic tests cover private JSONL storage, rotation/retention, cross-process clear protection, typed gateway status/stage/timing correlation and privacy, argument-safe Finder command construction, clear completion/recovery and nonfatal UI initialization failure. Diagnostic filesystem tests use only disposable test-owned folders, never the real user log directory. Native clipboard tests use private pasteboards, not your general clipboard. Build/restart scripts use mocked OS commands. **These automated checks are local source/mocked validation, not live backend, website, browser, production Keychain, signed-bundle routing or deployment verification. No deployment or live request is implied.**
 
 ### Native chat UI smoke test (macOS, opt-in live request)
 

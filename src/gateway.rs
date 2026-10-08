@@ -1,15 +1,22 @@
-use anyhow::{Context, Result, anyhow, bail};
+use crate::diagnostics::{
+    ActionId, Category, Diagnostics, Event, EventKind, FailureCode, GatewayErrorType, ModelId,
+    Stage,
+};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::{anyhow, bail};
 use reqwest::blocking::{Client, ClientBuilder, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const BASE: &str = "https://wiesel.run/v1";
 const MAX_REQUEST_BODY_BYTES: usize = 4_000_000;
 const MAX_TOKENS: u32 = 2048;
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_TEXT_BYTES: usize = 1024 * 1024;
 const UNKNOWN_OUTCOME: &str =
@@ -38,19 +45,153 @@ fn client_builder() -> ClientBuilder {
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
 }
+// Only safe classifications survive this boundary. Never retain a reqwest error,
+// including its URL-bearing source chain, in an application error or event.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct GatewayFailure {
+    code: FailureCode,
+    message: &'static str,
+    error_type: Option<GatewayErrorType>,
+}
+fn safe_failure(code: FailureCode, message: &'static str) -> anyhow::Error {
+    GatewayFailure {
+        code,
+        message,
+        error_type: None,
+    }
+    .into()
+}
+fn reqwest_failure_code(error: &reqwest::Error) -> FailureCode {
+    if error.is_timeout() {
+        FailureCode::Timeout
+    } else if error.is_decode() {
+        FailureCode::InvalidResponse
+    } else if error.is_connect() || error.is_body() || error.is_request() {
+        FailureCode::Transport
+    } else {
+        FailureCode::UnknownOutcome
+    }
+}
 fn client() -> Result<Client> {
-    client_builder()
-        .build()
-        .map_err(|_| anyhow!("Cannot create the Wiesel HTTP client"))
+    client_builder().build().map_err(|_| {
+        safe_failure(
+            FailureCode::Unavailable,
+            "Cannot create the Wiesel HTTP client",
+        )
+    })
 }
 fn send(request: RequestBuilder) -> Result<Response> {
-    // Discard reqwest errors: even their source chains can contain URLs or credentials.
-    request
-        .send()
-        .map_err(|_| anyhow!("Cannot complete the Wiesel request"))
+    request.send().map_err(|error| {
+        safe_failure(
+            reqwest_failure_code(&error),
+            "Cannot complete the Wiesel request",
+        )
+    })
+}
+
+/// One local diagnostic action, not a backend request identifier or billing proof.
+/// Only validated request model IDs are retained; no content or credentials.
+/// It never blocks on the diagnostic writer.
+pub struct DiagnosticAction {
+    diagnostics: Diagnostics,
+    category: Category,
+    id: ActionId,
+    started: Instant,
+    model_id: Option<ModelId>,
+}
+impl DiagnosticAction {
+    pub fn new(diagnostics: &Diagnostics, category: Category) -> Self {
+        let action = Self {
+            diagnostics: diagnostics.clone(),
+            category,
+            id: diagnostics.new_action_id(),
+            started: Instant::now(),
+            model_id: None,
+        };
+        action.record(
+            Event::new(category, EventKind::Started),
+            Stage::ValidateCredential,
+            None,
+        );
+        action
+    }
+    fn for_model(&self, model: &str) -> Self {
+        Self {
+            diagnostics: self.diagnostics.clone(),
+            category: self.category,
+            id: self.id,
+            started: self.started,
+            model_id: ModelId::parse(model),
+        }
+    }
+    fn record(&self, event: Event, stage: Stage, status: Option<u16>) {
+        let mut event = event.with_model_id(self.model_id).at_stage(
+            stage,
+            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        );
+        if let Some(status) = status {
+            event = event.with_http_status(status);
+        }
+        let _ = self.diagnostics.record(event, Some(self.id));
+    }
+    pub fn credential_rejected(&self) {
+        self.record(
+            Event::failure(self.category, FailureCode::Unauthorized),
+            Stage::ValidateCredential,
+            None,
+        );
+    }
+}
+fn observed<T>(
+    action: Option<&DiagnosticAction>,
+    stage: Stage,
+    status: Option<u16>,
+    result: Result<T>,
+) -> Result<T> {
+    if let Some(action) = action {
+        let event = match &result {
+            Ok(_) => Event::new(action.category, EventKind::Succeeded),
+            Err(error) => Event::failure(action.category, failure_code(error)).with_error_type(
+                error
+                    .downcast_ref::<GatewayHttpError>()
+                    .and_then(|error| error.1.clone())
+                    .or_else(|| {
+                        error
+                            .downcast_ref::<GatewayFailure>()
+                            .and_then(|error| error.error_type.clone())
+                    }),
+            ),
+        };
+        let status = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<GatewayHttpError>())
+            .map(|error| error.0.as_u16())
+            .or(status);
+        action.record(event, stage, status);
+    }
+    result
+}
+fn failure_code(error: &anyhow::Error) -> FailureCode {
+    if let Some(error) = error.downcast_ref::<GatewayHttpError>() {
+        return match error.0.as_u16() {
+            401 => FailureCode::Unauthorized,
+            402 => FailureCode::AllowanceExhausted,
+            403 => FailureCode::AccessDenied,
+            409 => FailureCode::Conflict,
+            429 => FailureCode::RateLimited,
+            500..=599 => FailureCode::Server,
+            _ => FailureCode::UnknownOutcome,
+        };
+    }
+    error
+        .downcast_ref::<GatewayFailure>()
+        .map(|error| error.code)
+        .unwrap_or(FailureCode::UnknownOutcome)
 }
 #[derive(Debug)]
-struct GatewayHttpError(reqwest::StatusCode);
+struct GatewayHttpError(reqwest::StatusCode, Option<GatewayErrorType>);
 impl std::fmt::Display for GatewayHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Wiesel returned HTTP {}", self.0)
@@ -58,16 +199,47 @@ impl std::fmt::Display for GatewayHttpError {
 }
 impl std::error::Error for GatewayHttpError {}
 
+fn response_error_type(value: &Value) -> Option<GatewayErrorType> {
+    value
+        .pointer("/error/type")
+        .and_then(Value::as_str)
+        .and_then(GatewayErrorType::parse)
+}
+
+fn http_error(mut response: Response) -> GatewayHttpError {
+    let status = response.status();
+    // Bound allocation even for chunked/HTML responses. Keep only bounded raw
+    // error.type; body, message, param, code and parsing errors are discarded.
+    let mut bytes = Vec::new();
+    let error_type = if response
+        .by_ref()
+        .take(MAX_ERROR_BODY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_ok()
+        && bytes.len() as u64 <= MAX_ERROR_BODY_BYTES
+    {
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .as_ref()
+            .and_then(response_error_type)
+    } else {
+        None
+    };
+    GatewayHttpError(status, error_type)
+}
+
 fn checked(response: Response) -> Result<Value> {
     let status = response.status();
     if !status.is_success() {
-        // Classify before decoding: outages often return HTML, not JSON.
-        // Neither remote response bodies nor credentials belong in diagnostics.
-        return Err(GatewayHttpError(status).into());
+        // Preserve status even when the bounded error envelope cannot be decoded.
+        return Err(http_error(response).into());
     }
-    response
-        .json()
-        .map_err(|_| anyhow!("Wiesel returned an invalid JSON response"))
+    response.json().map_err(|error| {
+        safe_failure(
+            reqwest_failure_code(&error),
+            "Wiesel returned an invalid JSON response",
+        )
+    })
 }
 
 /// Whether the UI must discard the rejected device credential and require login again.
@@ -99,17 +271,28 @@ pub fn failure_message(error: &anyhow::Error) -> &'static str {
 }
 
 /// Loads the model catalog using the current device Bearer token.
-pub fn models(token: &str) -> Result<Vec<String>> {
-    let value = checked(send(models_request(&client()?, token))?)?;
-    parse_models(&value)
+pub fn models(token: &str, action: Option<&DiagnosticAction>) -> Result<Vec<String>> {
+    let client = observed(action, Stage::BuildClient, None, client())?;
+    let response = observed(
+        action,
+        Stage::Send,
+        None,
+        send(models_request(&client, token)),
+    )?;
+    let status = Some(response.status().as_u16());
+    let value = observed(action, Stage::DecodeResponse, status, checked(response))?;
+    observed(action, Stage::ParseResponse, status, parse_models(&value))
 }
 fn models_request(client: &Client, token: &str) -> RequestBuilder {
     client.get(format!("{BASE}/models")).bearer_auth(token)
 }
 fn parse_models(value: &Value) -> Result<Vec<String>> {
-    let data = value["data"]
-        .as_array()
-        .context("Wiesel returned an invalid model catalog")?;
+    let data = value["data"].as_array().ok_or_else(|| {
+        safe_failure(
+            FailureCode::InvalidResponse,
+            "Wiesel returned an invalid model catalog",
+        )
+    })?;
     let mut models: Vec<String> = data
         .iter()
         .filter_map(|model| model["id"].as_str())
@@ -119,7 +302,10 @@ fn parse_models(value: &Value) -> Result<Vec<String>> {
     models.sort();
     models.dedup();
     if models.is_empty() {
-        bail!("Wiesel returned no available models");
+        return Err(safe_failure(
+            FailureCode::InvalidResponse,
+            "Wiesel returned no available models",
+        ));
     }
     Ok(models)
 }
@@ -159,7 +345,12 @@ fn completion_body(model: &str, messages: &[Message], stream: bool) -> Result<Ve
             max_tokens: MAX_TOKENS,
         },
     )
-    .map_err(|_| anyhow!("Wiesel request body is too large"))?;
+    .map_err(|_| {
+        safe_failure(
+            FailureCode::InputTooLarge,
+            "Wiesel request body is too large",
+        )
+    })?;
     Ok(body.0)
 }
 fn completion_request(
@@ -183,32 +374,66 @@ fn completion_request(
 }
 
 /// Completes a text/chat request authenticated with the current device token.
-pub fn complete(token: &str, model: &str, messages: &[Message]) -> Result<String> {
-    let value = checked(send(completion_request(
-        &client()?,
-        token,
-        model,
-        messages,
-        false,
-    )?)?)?;
-    parse_completion(&value)
+pub fn complete(
+    token: &str,
+    model: &str,
+    messages: &[Message],
+    action: Option<&DiagnosticAction>,
+) -> Result<String> {
+    let action = action.map(|action| action.for_model(model));
+    let action = action.as_ref();
+    let client = observed(action, Stage::BuildClient, None, client())?;
+    let request = observed(
+        action,
+        Stage::BuildRequest,
+        None,
+        completion_request(&client, token, model, messages, false),
+    )?;
+    let response = observed(action, Stage::Send, None, send(request))?;
+    let status = Some(response.status().as_u16());
+    let value = observed(action, Stage::DecodeResponse, status, checked(response))?;
+    observed(
+        action,
+        Stage::ParseResponse,
+        status,
+        parse_completion(&value),
+    )
 }
 /// Streams text deltas without putting incomplete answers into conversation history.
 pub fn complete_stream(
     token: &str,
     model: &str,
     messages: &[Message],
+    action: Option<&DiagnosticAction>,
     on_delta: impl FnMut(&str) -> Result<()>,
 ) -> Result<String> {
-    let response = send(completion_request(
-        &client()?,
-        token,
-        model,
-        messages,
-        true,
-    )?)?;
+    let action = action.map(|action| action.for_model(model));
+    let action = action.as_ref();
+    let client = observed(action, Stage::BuildClient, None, client())?;
+    let request = observed(
+        action,
+        Stage::BuildRequest,
+        None,
+        completion_request(&client, token, model, messages, true),
+    )?;
+    let response = observed(action, Stage::Send, None, send(request))?;
+    let status = Some(response.status().as_u16());
+    let response = observed(
+        action,
+        Stage::DecodeResponse,
+        status,
+        checked_stream(response),
+    )?;
+    observed(
+        action,
+        Stage::ReadStream,
+        status,
+        parse_stream(BufReader::new(response), on_delta),
+    )
+}
+fn checked_stream(response: Response) -> Result<Response> {
     if !response.status().is_success() {
-        return Err(GatewayHttpError(response.status()).into());
+        return Err(http_error(response).into());
     }
     let content_type = response
         .headers()
@@ -220,9 +445,12 @@ pub fn complete_stream(
         .trim()
         .eq_ignore_ascii_case("text/event-stream")
     {
-        bail!("Wiesel returned an invalid streaming response");
+        return Err(safe_failure(
+            FailureCode::InvalidResponse,
+            "Wiesel returned an invalid streaming response",
+        ));
     }
-    parse_stream(BufReader::new(response), on_delta)
+    Ok(response)
 }
 
 fn parse_stream(
@@ -240,13 +468,27 @@ fn parse_stream(
             .by_ref()
             .take((MAX_STREAM_EVENT_BYTES - event_bytes + 1) as u64)
             .read_line(&mut line)
-            .map_err(|_| anyhow!("Cannot read Wiesel stream"))?;
+            .map_err(|error| {
+                let code = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                    .map(reqwest_failure_code)
+                    .unwrap_or(if error.kind() == io::ErrorKind::TimedOut {
+                        FailureCode::Timeout
+                    } else {
+                        FailureCode::Transport
+                    });
+                safe_failure(code, "Cannot read Wiesel stream")
+            })?;
         if read == 0 {
             break;
         }
         event_bytes += read;
         if event_bytes > MAX_STREAM_EVENT_BYTES {
-            bail!("Wiesel stream event is too large");
+            return Err(safe_failure(
+                FailureCode::InvalidResponse,
+                "Wiesel stream event is too large",
+            ));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if !line.is_empty() {
@@ -265,23 +507,38 @@ fn parse_stream(
         }
         if data.trim() == "[DONE]" {
             if text.trim().is_empty() {
-                bail!("Model returned an empty response");
+                return Err(safe_failure(
+                    FailureCode::NoText,
+                    "Model returned an empty response",
+                ));
             }
             return Ok(text);
         }
-        let value: Value = serde_json::from_str(&data)
-            .map_err(|_| anyhow!("Wiesel returned an invalid streaming response"))?;
+        let value: Value = serde_json::from_str(&data).map_err(|_| {
+            safe_failure(
+                FailureCode::InvalidResponse,
+                "Wiesel returned an invalid streaming response",
+            )
+        })?;
         data.clear();
         if value.get("error").is_some() {
             // Provider error bodies may contain private input; never expose them.
-            bail!("Wiesel stream failed");
+            return Err(GatewayFailure {
+                code: FailureCode::UnknownOutcome,
+                message: "Wiesel stream failed",
+                error_type: response_error_type(&value),
+            }
+            .into());
         }
         if value
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
             == Some("length")
         {
-            bail!("Model response was truncated before completion");
+            return Err(safe_failure(
+                FailureCode::InvalidResponse,
+                "Model response was truncated before completion",
+            ));
         }
         if let Some(delta) = value
             .pointer("/choices/0/delta/content")
@@ -289,30 +546,52 @@ fn parse_stream(
             && !delta.is_empty()
         {
             if text.len() + delta.len() > MAX_STREAM_TEXT_BYTES {
-                bail!("Wiesel response is too large");
+                return Err(safe_failure(
+                    FailureCode::InvalidResponse,
+                    "Wiesel response is too large",
+                ));
             }
             text.push_str(delta);
-            on_delta(delta).map_err(|_| anyhow!("Streaming consumer closed before completion"))?;
+            on_delta(delta).map_err(|_| {
+                safe_failure(
+                    FailureCode::Unavailable,
+                    "Streaming consumer closed before completion",
+                )
+            })?;
         }
     }
     // An abruptly closed connection is not a successful, complete answer.
-    bail!("Wiesel stream ended before completion")
+    Err(safe_failure(
+        FailureCode::UnknownOutcome,
+        "Wiesel stream ended before completion",
+    ))
 }
 
 fn parse_completion(value: &Value) -> Result<String> {
     let text = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
-        .context("Model returned no text. Choose a text/chat model.")?;
+        .ok_or_else(|| {
+            safe_failure(
+                FailureCode::NoText,
+                "Model returned no text. Choose a text/chat model.",
+            )
+        })?;
     if text.trim().is_empty() {
-        bail!("Model returned an empty response");
+        return Err(safe_failure(
+            FailureCode::NoText,
+            "Model returned an empty response",
+        ));
     }
     if value
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
         == Some("length")
     {
-        bail!("Model response was truncated before completion");
+        return Err(safe_failure(
+            FailureCode::InvalidResponse,
+            "Model response was truncated before completion",
+        ));
     }
     Ok(text.to_owned())
 }
@@ -373,6 +652,204 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn diagnostic_http_failure_preserves_status_stage_timing_and_action_without_private_body() {
+        let temp = crate::diagnostics::tests::Temp::new();
+        let diagnostics = temp.logger();
+        let action = DiagnosticAction::new(&diagnostics, Category::Request);
+        let (url, server) = mock_response(
+            "HTTP/1.1 503 Unavailable\r\nConnection: close\r\n\r\nprivate-prompt-token-body".into(),
+        );
+        let response = observed(
+            Some(&action),
+            Stage::Send,
+            None,
+            send(mock_client().get(url).bearer_auth("private-token")),
+        )
+        .unwrap();
+        let error = observed(
+            Some(&action),
+            Stage::DecodeResponse,
+            Some(503),
+            checked(response),
+        )
+        .unwrap_err();
+        assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+        server.join().unwrap();
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        let records = crate::diagnostics::tests::records(&temp.logs);
+        let failure = records.last().unwrap();
+        assert_eq!(failure["category"], "request");
+        assert_eq!(failure["stage"], "decode_response");
+        assert_eq!(failure["http_status"], 503);
+        assert_eq!(failure["failure_code"], "server");
+        assert!(failure["elapsed_ms"].is_u64());
+        assert_eq!(failure["action_id"], records[0]["action_id"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record["session_id"] == failure["session_id"])
+        );
+        let serialized = serde_json::to_string(&records).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn http_rejections_log_actual_model_and_raw_type_for_both_completion_modes() {
+        for stream in [false, true] {
+            let temp = crate::diagnostics::tests::Temp::new();
+            let diagnostics = temp.logger();
+            let original = DiagnosticAction::new(&diagnostics, Category::Request);
+            let action = original.for_model("openai/gpt-4o-mini");
+            let body = r#"{"error":{"type":"new_gateway_rejection","message":"private prompt","param":"private-token","code":"private-code"}}"#;
+            let (url, server) = mock_response(format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+            ));
+            let response = send(mock_client().get(url)).unwrap();
+            let result = if stream {
+                checked_stream(response).map(|_| ())
+            } else {
+                checked(response).map(|_| ())
+            };
+            let error =
+                observed(Some(&action), Stage::DecodeResponse, Some(422), result).unwrap_err();
+            assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+            assert!(!format!("{error:?}").contains("private"));
+            server.join().unwrap();
+            diagnostics.shutdown().unwrap().wait().unwrap();
+            let records = crate::diagnostics::tests::records(&temp.logs);
+            let failure = records.last().unwrap();
+            assert_eq!(failure["model_id"], "openai/gpt-4o-mini");
+            assert_eq!(failure["error_type"], "new_gateway_rejection");
+            assert_eq!(failure["http_status"], 422);
+            assert_eq!(failure["action_id"], records[0]["action_id"]);
+            assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+        }
+    }
+
+    #[test]
+    fn error_envelope_failures_preserve_http_status_without_retaining_remote_content() {
+        let oversized = format!(
+            r#"{{"error":{{"type":"invalid_request_error","message":"{}"}}}}"#,
+            "x".repeat(MAX_ERROR_BODY_BYTES as usize)
+        );
+        for (body, expected) in [
+            (
+                r#"{"error":{"type":"private-secret","message":"private"}}"#,
+                Some("private-secret"),
+            ),
+            (r#"{"error":{"type":42}}"#, None),
+            (r#"{"error":{"message":"private"}}"#, None),
+            ("<html>private</html>", None),
+            (oversized.as_str(), None),
+        ] {
+            let (url, server) = mock_response(format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nConnection: close\r\n\r\n{body}"
+            ));
+            let error = checked(send(mock_client().get(url)).unwrap()).unwrap_err();
+            server.join().unwrap();
+            let http = error.downcast_ref::<GatewayHttpError>().unwrap();
+            assert_eq!(http.0.as_u16(), 422);
+            let value = serde_json::to_value(&http.1).unwrap();
+            assert_eq!(value.as_str(), expected);
+            assert!(!format!("{error:?}").contains("private"));
+        }
+    }
+
+    #[test]
+    fn sse_errors_log_raw_type_and_request_model() {
+        let temp = crate::diagnostics::tests::Temp::new();
+        let diagnostics = temp.logger();
+        let action =
+            DiagnosticAction::new(&diagnostics, Category::Request).for_model("anthropic/claude");
+        let input =
+            "data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"private-reply\"}}\n\n";
+        let error = observed(
+            Some(&action),
+            Stage::ReadStream,
+            Some(200),
+            parse_stream(input.as_bytes(), |_| Ok(())),
+        )
+        .unwrap_err();
+        assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        let records = crate::diagnostics::tests::records(&temp.logs);
+        let failure = records.last().unwrap();
+        assert_eq!(failure["error_type"], "overloaded_error");
+        assert_eq!(failure["model_id"], "anthropic/claude");
+        assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn diagnostic_transport_failure_classifies_before_discarding_reqwest_error() {
+        let temp = crate::diagnostics::tests::Temp::new();
+        let diagnostics = temp.logger();
+        let action = DiagnosticAction::new(&diagnostics, Category::Request);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = observed(
+            Some(&action),
+            Stage::Send,
+            None,
+            send(mock_client().get(format!("http://{address}/?private=token"))),
+        )
+        .unwrap_err();
+        assert!(matches!(failure_code(&error), FailureCode::Transport));
+        assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        let records = crate::diagnostics::tests::records(&temp.logs);
+        let failure = records.last().unwrap();
+        assert_eq!(failure["stage"], "send");
+        assert_eq!(failure["failure_code"], "transport");
+        assert!(failure.get("http_status").is_none());
+        assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn diagnostic_partial_stream_failure_records_read_stage_and_conservative_ui_warning() {
+        let temp = crate::diagnostics::tests::Temp::new();
+        let diagnostics = temp.logger();
+        let action = DiagnosticAction::new(&diagnostics, Category::Request);
+        let input = "data: {\"choices\":[{\"delta\":{\"content\":\"private-reply\"}}]}\n\n";
+        let error = observed(
+            Some(&action),
+            Stage::ReadStream,
+            Some(200),
+            parse_stream(input.as_bytes(), |_| Ok(())),
+        )
+        .unwrap_err();
+        assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+        diagnostics.shutdown().unwrap().wait().unwrap();
+        let records = crate::diagnostics::tests::records(&temp.logs);
+        let failure = records.last().unwrap();
+        assert_eq!(failure["stage"], "read_stream");
+        assert_eq!(failure["http_status"], 200);
+        assert_eq!(failure["failure_code"], "unknown_outcome");
+        assert_eq!(failure["action_id"], records[0]["action_id"]);
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("private-reply")
+        );
+    }
+
+    #[test]
+    fn safe_parser_failures_are_typed_without_changing_ui_contracts() {
+        let error = parse_completion(&json!({"choices":[]})).unwrap_err();
+        assert!(matches!(failure_code(&error), FailureCode::NoText));
+        assert_eq!(
+            failure_message(&error),
+            "Model returned no text. Choose a text/chat model in Settings."
+        );
+        let error =
+            parse_stream("data: private-invalid-json\n\n".as_bytes(), |_| Ok(())).unwrap_err();
+        assert!(matches!(failure_code(&error), FailureCode::InvalidResponse));
+        assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
+        assert!(!format!("{error:?}").contains("private-invalid-json"));
     }
 
     #[test]
@@ -588,6 +1065,7 @@ mod tests {
         let error = send(client.get(format!("http://{address}/v1/chat/completions"))).unwrap_err();
         server.join().unwrap();
         assert_eq!(format!("{error:#}"), "Cannot complete the Wiesel request");
+        assert!(matches!(failure_code(&error), FailureCode::Timeout));
         assert_eq!(failure_message(&error), UNKNOWN_OUTCOME);
     }
 
@@ -611,7 +1089,8 @@ mod tests {
     #[test]
     fn unauthorized_classification_does_not_clear_credentials_on_other_failures() {
         for status in [403, 402, 409, 429, 503] {
-            let error = GatewayHttpError(reqwest::StatusCode::from_u16(status).unwrap()).into();
+            let error =
+                GatewayHttpError(reqwest::StatusCode::from_u16(status).unwrap(), None).into();
             assert!(!is_unauthorized(&error));
         }
         assert!(!is_unauthorized(&anyhow!("untrusted error")));
@@ -712,6 +1191,7 @@ mod tests {
         for (status, message) in cases {
             let error = anyhow::Error::new(GatewayHttpError(
                 reqwest::StatusCode::from_u16(status).unwrap(),
+                None,
             ));
             assert_eq!(failure_message(&error), message);
         }

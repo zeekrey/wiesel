@@ -1,7 +1,7 @@
 //! In-process chat tests: no settings, Keychain, clipboard, hotkeys, or network.
 use super::*;
 use completion_backend::{CompletionBackend, ControlledBackend};
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui::{KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext};
 
 fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel {
     let now = settings::utc_now_ms().unwrap();
@@ -18,6 +18,7 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         ..Default::default()
     };
     let (tx, rx) = mpsc::channel();
+    let (diagnostics_tx, diagnostics_rx) = mpsc::channel();
     // Deliberately construct state rather than calling Wiesel::new, which loads
     // user settings/credentials, checks OS permission, and registers a hotkey.
     Wiesel {
@@ -27,13 +28,23 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         grammar_input: cx.new(|cx| TextInput::new("Grammar", false, cx)),
         improve_input: cx.new(|cx| TextInput::new("Improve", false, cx)),
         settings,
+        diagnostics: None,
+        diagnostics_initializing: false,
+        diagnostics_busy: false,
+        controlled_diagnostic_requests: None,
+        diagnostics_tx,
+        diagnostics_rx,
+        diagnostic_flush: None,
+        diagnostic_flushed_at: Instant::now(),
+        diagnostics_open_focus: cx.focus_handle().tab_stop(true),
+        diagnostics_clear_focus: cx.focus_handle().tab_stop(true),
         manager: None,
         hotkey: None,
         session: DesktopSession {
             credential: Some(Arc::new(credential)),
             ..Default::default()
         },
-        login_focus: cx.focus_handle(),
+        login_focus: cx.focus_handle().tab_stop(true),
         urls: mpsc::channel().1,
         status_loading: false,
         device_status: None,
@@ -368,4 +379,213 @@ fn chat_requires_device_credential_even_with_injected_backend(cx: &mut TestAppCo
         assert!(app.streaming_chat.is_none());
         assert_eq!(app.composer.read(cx).content.as_ref(), "Unsent draft");
     });
+}
+
+#[gpui::test]
+fn diagnostic_initialization_failure_does_not_block_chat_or_authentication(
+    cx: &mut TestAppContext,
+) {
+    let (app, backend, cx) = setup(cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.diagnostics_initializing = true;
+            app.diagnostics_tx
+                .send(DiagnosticUpdate::Initialized(Err(
+                    DiagnosticError::UnsafePath,
+                )))
+                .unwrap();
+            app.poll_diagnostics(cx);
+            assert!(!app.diagnostics_initializing);
+            assert!(app.diagnostics.is_none());
+            assert!(app.authenticated);
+            assert!(!app.busy);
+        })
+    });
+    open_chat(&app, cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.composer
+                .update(cx, |input, cx| input.set("private draft", cx));
+            app.send_chat(cx);
+        })
+    });
+    assert_eq!(backend.request_count(), 1);
+    backend.finish(0, Ok("private reply".into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, _| assert_eq!(app.messages.len(), 2));
+}
+
+#[gpui::test]
+fn diagnostic_controls_complete_independently_of_login_generation(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.diagnostics_busy = true;
+            app.session.cancel_login();
+            app.diagnostics_tx
+                .send(DiagnosticUpdate::Controlled(
+                    DiagnosticControl::ClearLogs,
+                    Err(DiagnosticError::OtherSessionActive),
+                ))
+                .unwrap();
+            app.poll_diagnostics(cx);
+            assert!(!app.diagnostics_busy);
+            app.diagnostics_busy = true;
+            app.diagnostics_tx
+                .send(DiagnosticUpdate::Controlled(
+                    DiagnosticControl::ClearLogs,
+                    Ok(()),
+                ))
+                .unwrap();
+            app.poll_diagnostics(cx);
+            assert!(!app.diagnostics_busy);
+            assert!(app.authenticated);
+        })
+    });
+}
+
+fn setup_settings(cx: &mut TestAppContext) -> (Entity<Wiesel>, &mut VisualTestContext) {
+    let (app, _, cx) = setup(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.page = Page::Setup;
+            window.focus(&app.login_focus, cx);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    (app, cx)
+}
+
+#[gpui::test]
+fn settings_tab_and_shift_tab_reach_both_diagnostic_controls(cx: &mut TestAppContext) {
+    let (app, cx) = setup_settings(cx);
+    cx.simulate_keystrokes("tab");
+    cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
+    cx.simulate_keystrokes("tab");
+    cx.update(|window, cx| assert!(app.read(cx).diagnostics_clear_focus.is_focused(window)));
+    cx.simulate_keystrokes("shift-tab");
+    cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
+    cx.simulate_keystrokes("shift-tab");
+    cx.update(|window, cx| assert!(app.read(cx).login_focus.is_focused(window)));
+}
+
+#[gpui::test]
+fn settings_tab_does_not_traverse_while_recording_a_shortcut(cx: &mut TestAppContext) {
+    let (app, cx) = setup_settings(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.recording = true;
+            window.focus(&app.focus, cx);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    // These modifier-free shortcuts are rejected by recording without touching
+    // hotkey registration/settings persistence. They must not become traversal.
+    cx.simulate_keystrokes("tab shift-tab");
+    cx.update(|window, cx| {
+        let app = app.read(cx);
+        assert!(app.recording);
+        assert!(app.focus.is_focused(window));
+        assert!(app.hotkey_input.read(cx).content.is_empty());
+    });
+}
+
+#[gpui::test]
+fn settings_modified_tab_does_not_traverse(cx: &mut TestAppContext) {
+    let (app, cx) = setup_settings(cx);
+    cx.simulate_keystrokes("cmd-tab ctrl-tab alt-tab cmd-shift-tab");
+    cx.update(|window, cx| assert!(app.read(cx).login_focus.is_focused(window)));
+}
+
+#[gpui::test]
+fn settings_tab_traversal_preserves_text_input_contents(cx: &mut TestAppContext) {
+    let (app, cx) = setup_settings(cx);
+    cx.update(|window, cx| {
+        window.focus(&app.read(cx).grammar_input.focus_handle(cx), cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_input("private draft");
+    cx.simulate_keystrokes("tab");
+    cx.read_entity(&app, |app, cx| {
+        assert_eq!(app.grammar_input.read(cx).content.as_ref(), "private draft")
+    });
+}
+
+fn assert_diagnostic_key_press_activates_once(
+    cx: &mut TestAppContext,
+    control: DiagnosticControl,
+    key: &str,
+) {
+    let (app, cx) = setup_settings(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.controlled_diagnostic_requests = Some(Vec::new());
+            window.focus(
+                match control {
+                    DiagnosticControl::OpenFolder => &app.diagnostics_open_focus,
+                    DiagnosticControl::ClearLogs => &app.diagnostics_clear_focus,
+                },
+                cx,
+            );
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let keystroke = Keystroke::parse(key).unwrap();
+    cx.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    // Inject the fast-completion race while the key is still held. With the old
+    // handlers this completes the key-down operation and permits a duplicate
+    // key-up click. With keyboard on_click alone no action has started yet.
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.diagnostics_tx
+                .send(DiagnosticUpdate::Controlled(control, Ok(())))
+                .unwrap();
+            app.poll_diagnostics(cx);
+            assert!(!app.diagnostics_busy);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_event(KeyUpEvent { keystroke });
+    cx.read_entity(&app, |app, _| {
+        let requests = app.controlled_diagnostic_requests.as_ref().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one activation for the entire held key press"
+        );
+        assert!(matches!(
+            (requests[0], control),
+            (DiagnosticControl::OpenFolder, DiagnosticControl::OpenFolder)
+                | (DiagnosticControl::ClearLogs, DiagnosticControl::ClearLogs)
+        ));
+        assert!(app.diagnostics_busy);
+        assert!(app.diagnostics.is_none());
+    });
+}
+
+#[gpui::test]
+fn diagnostic_open_folder_held_enter_activates_once(cx: &mut TestAppContext) {
+    assert_diagnostic_key_press_activates_once(cx, DiagnosticControl::OpenFolder, "enter");
+}
+
+#[gpui::test]
+fn diagnostic_open_folder_held_space_activates_once(cx: &mut TestAppContext) {
+    assert_diagnostic_key_press_activates_once(cx, DiagnosticControl::OpenFolder, "space");
+}
+
+#[gpui::test]
+fn diagnostic_clear_logs_held_enter_activates_once(cx: &mut TestAppContext) {
+    assert_diagnostic_key_press_activates_once(cx, DiagnosticControl::ClearLogs, "enter");
+}
+
+#[gpui::test]
+fn diagnostic_clear_logs_held_space_activates_once(cx: &mut TestAppContext) {
+    assert_diagnostic_key_press_activates_once(cx, DiagnosticControl::ClearLogs, "space");
 }
