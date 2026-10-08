@@ -9,8 +9,16 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>run.wiesel.auth</string>
+            <key>CFBundleURLSchemes</key><array><string>wiesel</string></array>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+        </dict>
+    </array>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
-    <key>NSAccessibilityUsageDescription</key><string>Wiesel reads selected text from your active app when you press your shortcut. Text is sent to AI Gateway only when you choose a writing action.</string>
+    <key>NSAccessibilityUsageDescription</key><string>Wiesel reads selected text from your active app when you press your shortcut. Text is sent to wiesel.run and its model provider only when you choose a writing action.</string>
 </dict>
 </plist>

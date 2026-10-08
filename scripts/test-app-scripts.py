@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mock lifecycle tests: no Keychain changes, real app signals, or GUI launches."""
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,7 +41,7 @@ class LifecycleTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve() / "repo with spaces"
         shutil.copytree(SCRIPTS, self.root / "scripts")
         (self.root / "resources").mkdir()
-        (self.root / "resources/Info.plist").write_text("plist")
+        shutil.copyfile(SCRIPTS.parent / "resources/Info.plist", self.root / "resources/Info.plist")
         for profile in ("debug", "release"):
             target = self.root / "target" / profile
             target.mkdir(parents=True)
@@ -103,6 +104,18 @@ bash "$TEST_ROOT/scripts/$1.sh" "${@:2}"
         self.assertEqual((self.app / "Contents/MacOS/Wiesel").read_text(), "new executable")
         self.assertIn("456 /Applications/", self.processes.read_text())
         self.assertFalse((self.root / "dist/.build-lock").exists())
+
+    def test_build_preserves_desktop_login_scheme_registration(self):
+        self.processes.write_text("456 /Applications/Wiesel.app/Contents/MacOS/Wiesel\n")
+        result, _ = self.run_script(mode="build-app", identity="-")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (self.app / "Contents/Info.plist").open("rb") as file:
+            plist = plistlib.load(file)
+        self.assertEqual(plist["CFBundleURLTypes"], [{
+            "CFBundleURLName": "run.wiesel.auth",
+            "CFBundleURLSchemes": ["wiesel"],
+            "CFBundleTypeRole": "Viewer",
+        }])
 
     def test_failures_before_stop(self):
         for scenario in ("compile", "sign", "verify", "invalid", "inspect"):
