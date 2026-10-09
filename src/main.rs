@@ -1,6 +1,9 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("Wiesel currently supports macOS only (native selection and Keychain backend).");
 
+mod action_builder;
+#[cfg(test)]
+mod action_builder_tests;
 mod auth;
 #[cfg(test)]
 mod chat_tests;
@@ -10,6 +13,7 @@ mod diagnostics;
 mod gateway;
 mod input;
 mod model_picker;
+mod navigation;
 mod notifications;
 mod quick_actions;
 mod selection;
@@ -29,6 +33,7 @@ use gpui::{
     rgb, rgba, size,
 };
 use input::TextInput;
+use navigation::{EntryId, Navigation};
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::{QUICK_ACTIONS, QuickAction};
 use settings::Settings;
@@ -91,13 +96,27 @@ mod draft_tests {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Page {
-    Setup,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    Settings,
     Launcher,
     Chat,
     Writing,
+    ActionManager,
+    ActionEditor,
 }
+struct ScreenLifecycle {
+    restore_focus: Option<FocusHandle>,
+    startup: bool,
+}
+
+// Completion ownership survives an entry's pop, but cannot be reused by a newer request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletionScope {
+    entry: EntryId,
+    generation: u64,
+}
+
 struct HeaderTooltip(&'static str);
 impl Render for HeaderTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -122,6 +141,7 @@ actions!(wiesel, [Login]);
 struct EventScope {
     generation: u64,
     device_id: Option<uuid::Uuid>,
+    completion: Option<CompletionScope>,
 }
 #[derive(Default)]
 struct DesktopSession {
@@ -135,10 +155,12 @@ impl DesktopSession {
         EventScope {
             generation: self.generation,
             device_id: self.credential.as_ref().map(|c| c.device_id()),
+            completion: None,
         }
     }
     fn accepts(&self, scope: EventScope) -> bool {
-        self.scope() == scope
+        let current = self.scope();
+        current.generation == scope.generation && current.device_id == scope.device_id
     }
     fn cancel_login(&mut self) {
         self.generation += 1;
@@ -379,7 +401,8 @@ mod desktop_session_tests {
         };
         assert!(!session.accepts(EventScope {
             generation: session.generation,
-            device_id: Some(uuid::Uuid::from_u128(1))
+            device_id: Some(uuid::Uuid::from_u128(1)),
+            completion: None,
         }));
     }
     #[test]
@@ -534,8 +557,13 @@ fn run_diagnostic_control(
 }
 
 struct Wiesel {
-    page: Page,
+    navigation: Navigation<Screen, ScreenLifecycle>,
+    request_generation: u64,
+    active_request: Option<CompletionScope>,
+    #[cfg(test)]
+    recorded_hides: Option<usize>,
     settings: Settings,
+    actions: action_builder::ActionBuilder,
     diagnostics: Option<Diagnostics>,
     diagnostics_initializing: bool,
     diagnostics_busy: bool,
@@ -570,6 +598,7 @@ struct Wiesel {
     notifications: Notifications,
     selection: selection::Capture,
     pending_capture: Option<selection::PendingCapture>,
+    capture_scope: Option<EventScope>,
     failed_chat: std::collections::VecDeque<String>,
     result: String,
     writing_title: String,
@@ -582,6 +611,166 @@ struct Wiesel {
     completion_backend: completion_backend::CompletionBackend,
 }
 impl Wiesel {
+    fn current_screen(&self) -> Screen {
+        self.navigation.current().component
+    }
+
+    fn screen_focus(&self, cx: &App) -> FocusHandle {
+        match self.current_screen() {
+            Screen::Launcher => self.launcher_input.focus_handle(cx),
+            Screen::Chat => self.composer.focus_handle(cx),
+            Screen::Settings => self.login_focus.clone(),
+            Screen::Writing | Screen::ActionManager => self.focus.clone(),
+            Screen::ActionEditor => self
+                .actions
+                .editor
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |editor| editor.name.focus_handle(cx)),
+        }
+    }
+
+    /// Push without resetting retained screen state; capture the covered screen's focus.
+    fn push_screen(
+        &mut self,
+        screen: Screen,
+        startup: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EntryId {
+        debug_assert_eq!(self.navigation.root().component, Screen::Launcher);
+        if screen == Screen::Launcher {
+            self.pop_to_root(window, cx);
+            return self.navigation.root().id;
+        }
+        if self.current_screen() == screen {
+            return self.navigation.current().id;
+        }
+        let restore_focus = window.focused(cx).or_else(|| Some(self.screen_focus(cx)));
+        let id = self.navigation.push(
+            screen,
+            ScreenLifecycle {
+                restore_focus,
+                startup,
+            },
+        );
+        window.focus(&self.screen_focus(cx), cx);
+        cx.notify();
+        id
+    }
+
+    fn redirect_deleted_home_restore_focus(&mut self, deleted: &FocusHandle, cx: &App) {
+        for lifecycle in self.navigation.lifecycles_mut() {
+            if lifecycle.restore_focus.as_ref() == Some(deleted) {
+                lifecycle.restore_focus = Some(self.launcher_input.focus_handle(cx));
+            }
+        }
+    }
+
+    fn push_settings(&mut self, startup: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.actions.dialog.is_some() {
+            return;
+        }
+        let existing = self
+            .navigation
+            .entries()
+            .find(|entry| entry.component == Screen::Settings)
+            .map(|entry| entry.id);
+        if let Some(id) = existing {
+            if id != self.navigation.current().id {
+                self.pop_to_screen(id, window, cx);
+            }
+            return;
+        }
+        self.push_screen(Screen::Settings, startup, window, cx);
+    }
+
+    // Built-in screen drafts are retained outside mounted entries. New destructive
+    // editors must confirm all removals BEFORE invoking this atomic transition.
+    fn pop_to_screen(&mut self, id: EntryId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.guard_action_removal(action_builder::Removal::To(id), window, cx) {
+            return false;
+        }
+        let Some(entries) = self.navigation.pop_to(id) else {
+            return false;
+        };
+        let mut restored = None;
+        for entry in entries {
+            restored = self.finish_pop(entry, cx);
+        }
+        window.focus(&restored.unwrap_or_else(|| self.screen_focus(cx)), cx);
+        cx.notify();
+        true
+    }
+
+    fn finish_pop(
+        &mut self,
+        entry: navigation::Entry<Screen, ScreenLifecycle>,
+        cx: &mut Context<Self>,
+    ) -> Option<FocusHandle> {
+        if entry.component == Screen::ActionEditor {
+            self.actions.editor = None;
+        }
+        if entry.component == Screen::Settings {
+            self.recording = false;
+            if self.session.attempt.is_some() || self.session.exchanging {
+                self.cancel_login(cx);
+            }
+        }
+        // Inference is not canceled: retained state and busy ownership outlive the entry.
+        entry.on_pop.and_then(|lifecycle| lifecycle.restore_focus)
+    }
+
+    /// Returns false only at the permanent Launcher root.
+    fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.navigation.is_root() {
+            return false;
+        }
+        if self.guard_action_removal(action_builder::Removal::One, window, cx) {
+            return true;
+        }
+        let Some(entry) = self.navigation.pop() else {
+            return false;
+        };
+        let focus = self
+            .finish_pop(entry, cx)
+            .unwrap_or_else(|| self.screen_focus(cx));
+        window.focus(&focus, cx);
+        cx.notify();
+        true
+    }
+
+    fn pop_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_action_removal(action_builder::Removal::Root, window, cx) {
+            return;
+        }
+        for entry in self.navigation.pop_to_root() {
+            self.finish_pop(entry, cx);
+        }
+        window.focus(&self.launcher_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    // A completed selection capture activates Home unless Settings or an inference is active.
+    fn activate_from_hotkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.actions.dialog.is_some() {
+            return;
+        }
+        if !self.busy && self.current_screen() != Screen::Settings {
+            self.pop_to_root(window, cx);
+        } else {
+            window.focus(&self.screen_focus(cx), cx);
+        }
+    }
+
+    fn hide_window(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(hides) = &mut self.recorded_hides {
+            *hides += 1;
+            return;
+        }
+        cx.hide();
+    }
+
     fn new(
         urls: mpsc::Receiver<zeroize::Zeroizing<String>>,
         diagnostics_tx: mpsc::Sender<DiagnosticUpdate>,
@@ -590,12 +779,14 @@ impl Wiesel {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut notifications = Notifications::default();
+        let mut settings_read_only = false;
         let settings = match settings::load() {
             Ok(s) => s,
             Err(e) => {
+                settings_read_only = true;
                 notifications.report(
                     Source::Settings,
-                    "Could not load settings. Using defaults.",
+                    "Settings could not be read. Saving is disabled; repair the settings file and relaunch.",
                     &e,
                 );
                 Settings::default()
@@ -632,8 +823,13 @@ impl Wiesel {
         improve_input.update(cx, |i, cx| i.set(settings.improve_prompt.clone(), cx));
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
-            page: Page::Setup,
+            navigation: Navigation::new(Screen::Launcher),
+            request_generation: 0,
+            active_request: None,
+            #[cfg(test)]
+            recorded_hides: None,
             settings,
+            actions: action_builder::ActionBuilder::new(settings_read_only),
             diagnostics: None,
             diagnostics_initializing: true,
             diagnostics_busy: false,
@@ -664,7 +860,7 @@ impl Wiesel {
                 TextInput::new("Ask anything…", false, cx)
                     .with_accessibility_id("wiesel.chat.composer")
             }),
-            launcher_input: cx.new(TextInput::launcher),
+            launcher_input: cx.new(|cx| TextInput::launcher(cx).with_tab_stop()),
             focus: cx.focus_handle(),
             recording: false,
             authenticated: false,
@@ -677,6 +873,7 @@ impl Wiesel {
                 ..Default::default()
             },
             pending_capture: None,
+            capture_scope: None,
             failed_chat: std::collections::VecDeque::new(),
             result: String::new(),
             writing_title: String::new(),
@@ -718,13 +915,12 @@ impl Wiesel {
                 },
                 &e,
             );
-            app.page = Page::Setup;
         }
         window.on_window_should_close(cx, |_, cx| {
             cx.hide();
             false
         });
-        window.focus(&app.login_focus, cx);
+        app.push_settings(true, window, cx);
         app.poll_diagnostics(cx);
         app.sync_permission_issue();
         app.refresh_status(true, cx);
@@ -947,6 +1143,12 @@ impl Wiesel {
             cx.notify();
             return;
         }
+        if self.actions.read_only {
+            self.notifications
+                .warning("Saving is disabled. Repair the settings file and relaunch.");
+            cx.notify();
+            return;
+        }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&text) {
             self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
@@ -1093,52 +1295,16 @@ impl Wiesel {
                         Source::Selection,
                         "Capturing selection… release the shortcut keys.",
                     );
+                    self.capture_scope = Some(self.session.scope());
                     self.pending_capture = Some(selection::begin());
                     cx.notify();
                 }
             }
         }
-        if let Some(capture) = self.pending_capture.as_mut()
-            && let Some(result) = capture.poll()
-        {
-            self.pending_capture = None;
-            self.record_diagnostic_outcome(
-                Category::Selection,
-                result.is_ok(),
-                FailureCode::Unavailable,
-            );
-            self.notifications.clear(Source::Selection);
-            match &result {
-                Ok(text) => self.notifications.success(format!(
-                    "Captured {} characters. Ready for writing.",
-                    text.chars().count()
-                )),
-                Err(e) => {
-                    let (severity, message) = notifications::capture_issue(e);
-                    self.notifications
-                        .issue(Source::Selection, severity, message);
-                }
-            }
-            self.selection.update(result);
-            if !self.busy && self.page != Page::Setup {
-                self.page = Page::Launcher;
-            }
-            cx.activate(true);
-            window.activate_window();
-            if self.page == Page::Launcher {
-                window.focus(&self.launcher_input.focus_handle(cx), cx);
-            } else if self.page == Page::Setup && !self.authenticated {
-                window.focus(&self.login_focus, cx);
-            } else {
-                window.focus(&self.focus, cx);
-            }
-            cx.notify();
-        }
+        self.poll_capture(window, cx);
         // Callback activation must not steal focus before Copy restoration finishes.
         if self.pending_capture.is_none() {
-            while let Ok(raw) = self.urls.try_recv() {
-                self.handle_callback(&raw, window, cx);
-            }
+            self.receive_callbacks(window, cx);
         }
         // Resume following only once the reader has returned to the bottom.
         if !self.chat_follow_bottom
@@ -1155,10 +1321,74 @@ impl Wiesel {
             cx.notify();
         }
     }
+    // Drain physical capture even after its identity is invalidated, so Copy can
+    // restore the clipboard. A late ended-session result never repopulates the UI.
+    fn poll_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(capture) = self.pending_capture.as_mut()
+            && let Some(result) = capture.poll()
+        {
+            self.pending_capture = None;
+            self.finish_capture(result, window, cx);
+        }
+    }
+
+    fn finish_capture(
+        &mut self,
+        result: anyhow::Result<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .capture_scope
+            .take()
+            .is_some_and(|scope| self.session.accepts(scope))
+        {
+            return;
+        }
+        self.record_diagnostic_outcome(
+            Category::Selection,
+            result.is_ok(),
+            FailureCode::Unavailable,
+        );
+        self.notifications.clear(Source::Selection);
+        match &result {
+            Ok(text) => self.notifications.success(format!(
+                "Captured {} characters. Ready for writing.",
+                text.chars().count()
+            )),
+            Err(e) => {
+                let (severity, message) = notifications::capture_issue(e);
+                self.notifications
+                    .issue(Source::Selection, severity, message);
+            }
+        }
+        self.selection.update(result);
+        self.activate_from_hotkey(window, cx);
+        cx.activate(true);
+        window.activate_window();
+        cx.notify();
+    }
     fn receive_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(event) = self.rx.try_recv() {
+            let inference = matches!(
+                event.result,
+                ResultPayload::ChatDelta(_) | ResultPayload::Completion(_, _)
+            );
+            if inference
+                && (event.scope.completion.is_none()
+                    || event.scope.completion != self.active_request)
+            {
+                continue;
+            }
             if !self.session.accepts(event.scope) {
-                // In particular, never persist a canceled/replaced exchange result.
+                // Discard payloads from ended/replaced sessions. Only the exact
+                // pending physical request's terminal event can release its slot.
+                if matches!(event.result, ResultPayload::Completion(_, _)) {
+                    self.busy = false;
+                    self.active_request = None;
+                    self.streaming_chat = None;
+                    cx.notify();
+                }
                 continue;
             }
             self.apply_result(event.scope, event.result, window, cx);
@@ -1247,6 +1477,9 @@ impl Wiesel {
                         gateway::failure_message(e),
                     );
                 }
+                if let Ok(models) = &result {
+                    self.update_action_catalog(models.clone(), cx);
+                }
                 self.model_picker
                     .update(cx, |picker, cx| picker.finish_load(result, cx));
             }
@@ -1258,6 +1491,7 @@ impl Wiesel {
             }
             ResultPayload::Completion(result, chat) => {
                 self.busy = false;
+                self.active_request = None;
                 if chat {
                     self.streaming_chat = None;
                 }
@@ -1316,17 +1550,40 @@ impl Wiesel {
     }
     fn login_ready(&mut self, show_launcher: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_models(cx);
+        self.finish_startup_navigation(show_launcher, window, cx);
+    }
+
+    fn finish_startup_navigation(
+        &mut self,
+        show_launcher: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if show_launcher
+            && self.authenticated
             && self.hotkey.is_some()
             && self.settings.onboarded
-            && self.page == Page::Setup
+            && self.current_screen() == Screen::Settings
+            && self
+                .navigation
+                .current()
+                .on_pop
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.startup)
         {
-            self.page = Page::Launcher;
-            window.focus(&self.launcher_input.focus_handle(cx), cx);
+            self.pop_screen(window, cx);
         }
     }
     fn start_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.page = Page::Setup;
+        if self.actions.dialog.is_some() {
+            return;
+        }
+        self.push_settings(false, window, cx);
+        // Revealing lower Settings may need dirty-editor confirmation. Never
+        // start browser login or focus an unmounted control before that decision.
+        if self.current_screen() != Screen::Settings || self.actions.dialog.is_some() {
+            return;
+        }
         window.focus(&self.login_focus, cx);
         if self.session.credential.is_some() {
             self.notifications
@@ -1364,6 +1621,11 @@ impl Wiesel {
             .info("Login canceled. Old browser links cannot sign you in.");
         cx.notify();
     }
+    fn receive_callbacks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Ok(raw) = self.urls.try_recv() {
+            self.handle_callback(&raw, window, cx);
+        }
+    }
     fn handle_callback(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
         cx.activate(true);
         window.activate_window();
@@ -1395,8 +1657,10 @@ impl Wiesel {
                 .warning("Login link did not match. Continue in your browser or reopen login."),
         }
         if !self.authenticated {
-            self.page = Page::Setup;
-            window.focus(&self.login_focus, cx);
+            self.push_settings(false, window, cx);
+            if self.current_screen() == Screen::Settings && self.actions.dialog.is_none() {
+                window.focus(&self.login_focus, cx);
+            }
         }
         cx.notify();
     }
@@ -1408,22 +1672,35 @@ impl Wiesel {
         }
         Some(credential)
     }
-    fn clear_session(&mut self, message: &'static str, cx: &mut Context<Self>) {
-        let request_pending = self.busy;
+    // Account-privacy boundary, separate from native credential cleanup. Navigation
+    // stays intact and physical inference/capture must still settle independently.
+    fn end_session_state(&mut self, cx: &mut Context<Self>) -> Option<settings::CleanupTarget> {
         let target = self.session.end_session();
         self.authenticated = false;
         self.status_loading = false;
         self.device_status = None;
-        self.busy = false;
+        self.busy = self.active_request.is_some();
         self.streaming_chat = None;
         self.messages.clear();
         self.failed_chat.clear();
         self.result.clear();
-        self.page = Page::Setup;
+        self.writing_title.clear();
+        self.composer.update(cx, |input, cx| input.set("", cx));
+        self.launcher_input
+            .update(cx, |input, cx| input.set("", cx));
+        self.selection = selection::Capture::default();
+        self.capture_scope = None;
+        self.update_action_catalog(vec![], cx);
         self.model_picker
             .update(cx, |picker, cx| picker.finish_load(Ok(vec![]), cx));
+        self.notifications.clear(Source::Selection);
         self.notifications.clear(Source::Models);
         self.notifications.clear(Source::Request);
+        target
+    }
+    fn clear_session(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        let request_pending = self.busy;
+        let target = self.end_session_state(cx);
         // Local removal is independent of remote success. A failure is never labeled
         // persistent logout, and blocks a new login until removal is retried.
         let removed = self
@@ -1555,9 +1832,6 @@ impl Wiesel {
         });
     }
     fn finish_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
         let picker = self.model_picker.read(cx);
         let model = picker.selected.clone();
         let grammar = self.grammar_input.read(cx).content.trim().to_owned();
@@ -1583,6 +1857,12 @@ impl Wiesel {
             cx.notify();
             return;
         }
+        if self.actions.read_only {
+            self.notifications
+                .warning("Saving is disabled. Repair the settings file and relaunch.");
+            cx.notify();
+            return;
+        }
         let previous = self.settings.hotkey.clone();
         if let Err(e) = self.register(&hotkey) {
             self.record_diagnostic(Event::failure(Category::Hotkey, FailureCode::Conflict));
@@ -1605,10 +1885,9 @@ impl Wiesel {
             Ok(()) => {
                 self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
                 self.settings = next;
-                self.page = Page::Launcher;
+                self.pop_screen(window, cx);
                 self.notifications.clear(Source::Settings);
                 self.notifications.success("Settings saved. Ready to go.");
-                window.focus(&self.launcher_input.focus_handle(cx), cx);
             }
             Err(e) => {
                 self.record_diagnostic(Event::failure(Category::Settings, FailureCode::Storage));
@@ -1623,20 +1902,40 @@ impl Wiesel {
         cx.notify();
     }
     fn request(&mut self, messages: Vec<Message>, chat: bool, cx: &mut Context<Self>) {
-        if !self.authenticated {
+        self.request_with_model(messages, chat, self.settings.model.clone(), cx);
+    }
+    fn request_with_model(
+        &mut self,
+        messages: Vec<Message>,
+        chat: bool,
+        model: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        if !self.authenticated || !self.settings.onboarded {
             self.notifications
-                .warning("Log in to Wiesel and check your device login first.");
+                .warning("Complete login and setup in Settings before sending a request.");
             cx.notify();
             return;
         }
         let Some(credential) = self.valid_credential(cx) else {
             return;
         };
-        let scope = self.session.scope();
+        self.request_generation += 1;
+        let completion = CompletionScope {
+            entry: self.navigation.current().id,
+            generation: self.request_generation,
+        };
+        self.active_request = Some(completion);
+        let scope = EventScope {
+            completion: Some(completion),
+            ..self.session.scope()
+        };
         self.busy = true;
         self.notifications.clear(Source::Keychain);
         self.notifications.working(Source::Request, "Thinking…");
-        let model = self.settings.model.clone();
         let tx = self.tx.clone();
         if chat {
             self.streaming_chat = Some(Message::new("assistant", ""));
@@ -1662,24 +1961,28 @@ impl Wiesel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
+        if action == QuickAction::Add {
+            self.open_action_editor(None, window, cx);
+            return;
+        }
+        if !self.authenticated || !self.settings.onboarded {
+            self.push_settings(false, window, cx);
+            self.notifications
+                .warning("Complete login and setup in Settings first.");
+            cx.notify();
             return;
         }
         match action {
             QuickAction::Chat => {
-                self.page = Page::Chat;
+                self.push_screen(Screen::Chat, false, window, cx);
                 window.focus(&self.composer.focus_handle(cx), cx);
                 cx.notify();
             }
-            QuickAction::Add => {
-                self.notifications
-                    .info("Custom quick actions are coming soon.");
-                cx.notify();
-            }
-            _ => self.writing(action, cx),
+            QuickAction::Add => self.open_action_editor(None, window, cx),
+            _ => self.writing(action, window, cx),
         }
     }
-    fn writing(&mut self, action: QuickAction, cx: &mut Context<Self>) {
+    fn writing(&mut self, action: QuickAction, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -1700,7 +2003,7 @@ impl Wiesel {
         }
         let prompt = prompt.to_owned();
         self.selection.snapshot_writing();
-        self.page = Page::Writing;
+        self.push_screen(Screen::Writing, false, window, cx);
         self.result.clear();
         self.writing_title = action.title().into();
         self.request(
@@ -1711,6 +2014,10 @@ impl Wiesel {
     }
     fn submit_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.launcher_input.read(cx).is_composing() {
+            return;
+        }
+        if !self.authenticated || !self.settings.onboarded {
+            self.run_quick_action(QuickAction::Chat, window, cx);
             return;
         }
         let text = self.launcher_input.read(cx).content.trim().to_owned();
@@ -1771,6 +2078,9 @@ impl Wiesel {
         self.notifications.suppress_motion = false;
     }
     fn key_down_impl(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.action_builder_key(event, window, cx) {
+            return;
+        }
         let key = &event.keystroke;
         if self.recording {
             cx.stop_propagation();
@@ -1821,7 +2131,7 @@ impl Wiesel {
             self.apply_hotkey(cx);
             return;
         }
-        if self.page == Page::Setup
+        if self.current_screen() == Screen::Settings
             && key.key == "tab"
             && !key.modifiers.platform
             && !key.modifiers.control
@@ -1835,7 +2145,7 @@ impl Wiesel {
             cx.stop_propagation();
             return;
         }
-        if self.page == Page::Setup
+        if self.current_screen() == Screen::Settings
             && key.key == "enter"
             && !key.modifiers.shift
             && self.login_focus.is_focused(window)
@@ -1843,13 +2153,18 @@ impl Wiesel {
             self.start_login(window, cx);
             cx.stop_propagation();
         } else if key.key == "escape" {
-            if self.session.attempt.is_some() || self.session.exchanging {
-                self.cancel_login(cx);
+            if !self.pop_screen(window, cx) {
+                self.hide_window(cx);
             }
-            cx.hide();
             cx.stop_propagation();
-        } else if self.page == Page::Launcher {
-            if key.key == "enter" && !key.modifiers.shift {
+        } else if self.current_screen() == Screen::Launcher {
+            if key.key == "enter"
+                && !key.modifiers.shift
+                && !key.modifiers.platform
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !event.is_held
+            {
                 self.submit_launcher(window, cx);
                 cx.stop_propagation();
             } else if !self.launcher_input.focus_handle(cx).is_focused(window)
@@ -1862,7 +2177,14 @@ impl Wiesel {
                 self.run_quick_action(action, window, cx);
                 cx.stop_propagation();
             }
-        } else if self.page == Page::Chat && key.key == "enter" && !key.modifiers.shift {
+        } else if self.current_screen() == Screen::Chat
+            && key.key == "enter"
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !event.is_held
+        {
             self.send_chat(cx);
             cx.stop_propagation();
         }
@@ -1870,6 +2192,7 @@ impl Wiesel {
     fn button(id: &'static str, title: &str) -> Stateful<Div> {
         div()
             .id(id)
+            .debug_selector(move || id.into())
             .h(px(28.))
             .flex_shrink_0()
             .flex()
@@ -1889,6 +2212,9 @@ impl Wiesel {
     fn icon_button(id: &'static str, icon: &'static str, label: &'static str) -> Stateful<Div> {
         div()
             .id(id)
+            .debug_selector(move || id.into())
+            // Preserve the covered screen's focus before the click pushes a route.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .size(px(28.))
             .flex_shrink_0()
             .flex()
@@ -1995,11 +2321,11 @@ impl Wiesel {
             .child(Self::label("1 · Global hotkey"))
             .child(div().flex().gap_2().child(div().flex_1().child(self.hotkey_input.clone()))
                 .child(Self::button("record", if self.recording { "Press shortcut…" } else { "Record shortcut" }).on_click(cx.listener(|this, _, window, cx| { this.recording = true; this.notifications.info("Press your shortcut. Escape cancels."); window.focus(&this.focus, cx); cx.notify(); }))))
-            .child(Self::button("apply-hotkey", "Apply shortcut").on_click(cx.listener(|this, _, _, cx| this.apply_hotkey(cx))))
+            .child(Self::button("apply-hotkey", "Apply shortcut").when(self.actions.read_only, |d| d.opacity(0.5).aria_description("Saving disabled until the settings file is repaired and Wiesel relaunched")).on_click(cx.listener(|this, _, _, cx| this.apply_hotkey(cx))))
             .child(Self::label("Command (⌘) is called Super in the field above. Recorded shortcuts activate immediately; typed changes need Apply shortcut."))
             .child(self.login_controls(cx))
             .child(Self::label("3 · Model"))
-            .child(self.model_picker.clone())
+            .child(div().w_full().flex_shrink_0().debug_selector(|| "settings-model-picker".into()).child(self.model_picker.clone()))
             .child(Self::button("refresh-models", "Refresh models").on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx))))
             .child(Self::label("The authenticated Wiesel catalog lists model IDs. Choose a text/chat model; only text/chat requests are supported."))
             .child(Self::label("Custom prompt · Fix grammar"))
@@ -2013,11 +2339,13 @@ impl Wiesel {
             .child(Self::label("Input Monitoring, Screen Recording, and Automation are not required. On newer macOS versions, allow Wiesel to paste from other apps if asked so it can save and restore the clipboard."))
             .child(Self::label("If macOS shows Wiesel enabled but the bottom bar still requests access after a rebuild, remove the old entry, add this Wiesel.app again, and relaunch it."))
             .child(self.diagnostics_controls(cx))
-            .child(Self::button("save", "Save & start").on_click(cx.listener(|this, _, window, cx| this.finish_setup(window, cx)))))
+            .child(Self::button("save", "Save & start").when(self.actions.read_only, |d| d.opacity(0.5).aria_description("Saving disabled until the settings file is repaired and Wiesel relaunched")).on_click(cx.listener(|this, _, window, cx| this.finish_setup(window, cx)))))
     }
     fn launcher(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
             .id("quick-actions-scroll")
+            .debug_selector(|| "quick-actions-scroll".into())
+            .track_scroll(&self.actions.home_scroll)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2025,15 +2353,41 @@ impl Wiesel {
             .flex_col()
             .gap(px(12.))
             .p(px(20.))
-            .children(QUICK_ACTIONS.chunks(3).map(|actions| {
-                div().flex().flex_shrink_0().gap(px(12.)).w_full().children(
-                    actions.iter().copied().map(|action| {
+            .children(self.home_actions().chunks(3).map(|actions| {
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .gap(px(12.))
+                    .w_full()
+                    .children(actions.iter().cloned().map(|item| {
+                        let (id, title, icon, shortcut, add) = item.presentation();
+                        let debug_id = id.clone();
+                        let keyboard_item = item.clone();
                         div()
-                            .id(action.id())
-                            .debug_selector(|| action.id().into())
+                            .id(gpui::SharedString::from(id.clone()))
+                            .debug_selector(move || debug_id.clone())
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.prevent_default()
+                            })
                             .role(Role::Button)
-                            .accessibility_id(format!("wiesel.action.{}", action.id()))
-                            .aria_label(action.title())
+                            .track_focus(&self.action_control_focus(&id, cx))
+                            .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                            .on_key_down(cx.listener(
+                                move |this, event: &KeyDownEvent, window, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        && !event.keystroke.modifiers.platform
+                                        && !event.keystroke.modifiers.control
+                                        && !event.keystroke.modifiers.alt
+                                    {
+                                        if !event.is_held {
+                                            this.run_home_action(keyboard_item.clone(), window, cx);
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .accessibility_id(format!("wiesel.action.{id}"))
+                            .aria_label(title.clone())
                             .relative()
                             .flex_1()
                             .h(px(106.))
@@ -2048,35 +2402,39 @@ impl Wiesel {
                             .border_color(rgba(theme::BORDER))
                             .bg(rgb(theme::CARD))
                             .cursor_pointer()
-                            .when(action == QuickAction::Add, |d| {
-                                d.text_color(rgb(theme::MUTED))
-                            })
+                            .when(add, |d| d.text_color(rgb(theme::MUTED)))
                             .hover(|s| s.bg(rgb(theme::ACCENT)).border_color(rgb(theme::RING)))
-                            .child(theme::icon(action.icon(), 24.).text_color(rgb(
-                                if action == QuickAction::Add {
-                                    theme::MUTED
-                                } else {
-                                    theme::FOREGROUND
-                                },
-                            )))
+                            .child(theme::icon(icon, 24.).text_color(rgb(if add {
+                                theme::MUTED
+                            } else {
+                                theme::FOREGROUND
+                            })))
                             .child(
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child(action.title()),
+                                    .w_full()
+                                    .px_2()
+                                    .text_center()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(title),
                             )
-                            .child(div().absolute().top(px(10.)).right(px(10.)).child(
-                                theme::badge(if action == QuickAction::Add {
-                                    "Soon"
-                                } else {
-                                    action.shortcut()
-                                }),
-                            ))
+                            .when(add || !shortcut.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(10.))
+                                        .right(px(10.))
+                                        .child(theme::badge(if add { "+" } else { shortcut })),
+                                )
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run_quick_action(action, window, cx);
+                                this.run_home_action(item.clone(), window, cx);
                             }))
-                    }),
-                )
+                    }))
+                    .children(std::iter::repeat_with(|| div().flex_1()).take(3 - actions.len()))
             }))
     }
     fn chat(&self, cx: &mut Context<Self>) -> Div {
@@ -2405,20 +2763,24 @@ impl Render for Wiesel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.notifications
             .update(Instant::now(), self.idle_notification());
-        let content = match self.page {
-            Page::Setup => self.setup(cx).into_any_element(),
-            Page::Launcher => self.launcher(cx).into_any_element(),
-            Page::Chat => self.chat(cx).into_any_element(),
-            Page::Writing => self.writing_view(cx).into_any_element(),
+        let content = match self.current_screen() {
+            Screen::Settings => self.setup(cx).into_any_element(),
+            Screen::Launcher => self.launcher(cx).into_any_element(),
+            Screen::Chat => self.chat(cx).into_any_element(),
+            Screen::Writing => self.writing_view(cx).into_any_element(),
+            Screen::ActionManager => self.action_manager(cx).into_any_element(),
+            Screen::ActionEditor => self.action_editor(cx).into_any_element(),
         };
         div()
             .id("wiesel-root")
             .role(Role::Group)
-            .accessibility_id(match self.page {
-                Page::Setup => "wiesel.page.setup",
-                Page::Launcher => "wiesel.page.launcher",
-                Page::Chat => "wiesel.page.chat",
-                Page::Writing => "wiesel.page.writing",
+            .accessibility_id(match self.current_screen() {
+                Screen::Settings => "wiesel.page.setup",
+                Screen::Launcher => "wiesel.page.launcher",
+                Screen::Chat => "wiesel.page.chat",
+                Screen::Writing => "wiesel.page.writing",
+                Screen::ActionManager => "wiesel.page.actions",
+                Screen::ActionEditor => "wiesel.page.action-editor",
             })
             .aria_label("Wiesel")
             .aria_description(match (self.authenticated, self.busy) {
@@ -2427,6 +2789,7 @@ impl Render for Wiesel {
                 (false, false) => "Signed out; request idle",
                 (false, true) => "Signed out; request pending",
             })
+            .relative()
             .size_full()
             .rounded(px(14.))
             .border_1()
@@ -2450,14 +2813,44 @@ impl Render for Wiesel {
                     .px(px(20.))
                     .border_b_1()
                     .border_color(rgba(theme::BORDER))
-                    .when(self.page == Page::Launcher, |d| {
+                    .when(self.current_screen() == Screen::Launcher, |d| {
                         d.child(div().flex_1().min_w_0().child(self.launcher_input.clone()))
                     })
-                    .when(self.page != Page::Launcher, |d| {
-                        d.when(self.page != Page::Setup, |d| {
+                    .when(self.current_screen() != Screen::Launcher, |d| {
+                        d.when(self.navigation.depth() > 1, |d| {
                             d.child(
                                 div()
                                     .id("back")
+                                    .debug_selector(|| "back".into())
+                                    .role(Role::Button)
+                                    .aria_label("Back")
+                                    .accessibility_id("wiesel.navigation.back")
+                                    .when(
+                                        matches!(
+                                            self.current_screen(),
+                                            Screen::ActionEditor | Screen::ActionManager
+                                        ),
+                                        |d| d.track_focus(&self.action_control_focus("back", cx)),
+                                    )
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) && !event.keystroke.modifiers.platform
+                                                && !event.keystroke.modifiers.control
+                                                && !event.keystroke.modifiers.alt
+                                            {
+                                                if !event.is_held {
+                                                    this.pop_screen(window, cx);
+                                                }
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.prevent_default()
+                                    })
                                     .size(px(28.))
                                     .flex()
                                     .items_center()
@@ -2472,31 +2865,30 @@ impl Render for Wiesel {
                                         theme::icon("arrow-left", 18.)
                                             .text_color(rgb(theme::MUTED)),
                                     )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if !this.busy {
-                                            if this.session.attempt.is_some()
-                                                || this.session.exchanging
-                                            {
-                                                this.cancel_login(cx);
-                                            }
-                                            this.page = Page::Launcher;
-                                            window.focus(&this.launcher_input.focus_handle(cx), cx);
-                                            cx.notify();
-                                        }
+                                    .on_click(cx.listener(|this, event, window, cx| {
+                                        this.back_clicked(event, window, cx);
                                     })),
                             )
                             .child(div().w(px(1.)).h(px(18.)).bg(rgba(theme::BORDER)))
                         })
-                        .child(theme::icon(
-                            match self.page {
-                                Page::Writing => QUICK_ACTIONS
-                                    .iter()
-                                    .find(|action| action.title() == self.writing_title)
-                                    .map_or("spell-check", |action| action.icon()),
-                                _ => "chat",
+                        .when(
+                            !matches!(
+                                self.current_screen(),
+                                Screen::ActionManager | Screen::ActionEditor
+                            ),
+                            |d| {
+                                d.child(theme::icon(
+                                    match self.current_screen() {
+                                        Screen::Writing => QUICK_ACTIONS
+                                            .iter()
+                                            .find(|action| action.title() == self.writing_title)
+                                            .map_or("spell-check", |action| action.icon()),
+                                        _ => "chat",
+                                    },
+                                    18.,
+                                ))
                             },
-                            18.,
-                        ))
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -2505,14 +2897,26 @@ impl Render for Wiesel {
                                 .on_mouse_down(MouseButton::Left, |_, window, _| {
                                     window.start_window_move();
                                 })
-                                .child(match self.page {
-                                    Page::Writing => self.writing_title.clone(),
-                                    Page::Setup => "Wiesel · Settings".to_owned(),
+                                .child(match self.current_screen() {
+                                    Screen::Writing => self.writing_title.clone(),
+                                    Screen::Settings => "Wiesel · Settings".to_owned(),
+                                    Screen::ActionManager => "Manage actions".to_owned(),
+                                    Screen::ActionEditor => if self
+                                        .actions
+                                        .editor
+                                        .as_ref()
+                                        .is_some_and(|editor| editor.existing)
+                                    {
+                                        "Edit action"
+                                    } else {
+                                        "New action"
+                                    }
+                                    .to_owned(),
                                     _ => "Chat".to_owned(),
                                 }),
                         )
                     })
-                    .when(self.page == Page::Chat, |d| {
+                    .when(self.current_screen() == Screen::Chat, |d| {
                         d.child(Self::icon_button("new-chat", "plus", "New chat").on_click(
                             cx.listener(|this, _, _, cx| {
                                 if !this.busy {
@@ -2527,22 +2931,56 @@ impl Render for Wiesel {
                             }),
                         ))
                     })
+                    .when(self.current_screen() == Screen::Launcher, |d| {
+                        d.child(self.builder_button(
+                            "manage-actions",
+                            "Manage actions",
+                            action_builder::Command::Manage,
+                            cx,
+                        ))
+                        .when(
+                            !self.settings.custom_actions.is_empty(),
+                            |d| {
+                                d.child(self.builder_button(
+                                    "home-new-action",
+                                    "Add action",
+                                    action_builder::Command::New,
+                                    cx,
+                                ))
+                            },
+                        )
+                    })
+                    .when(self.current_screen() == Screen::ActionManager, |d| {
+                        d.child(self.builder_button(
+                            "new-action",
+                            "New action",
+                            action_builder::Command::New,
+                            cx,
+                        ))
+                    })
                     .child(
                         Self::icon_button("settings", "settings", "Settings").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if !this.busy {
-                                    this.page = Page::Setup;
-                                    cx.notify();
-                                }
+                            cx.listener(|this, _, window, cx| {
+                                this.push_settings(false, window, cx);
                             }),
                         ),
                     )
                     .child(
-                        Self::icon_button("hide", "minus", "Hide").on_click(|_, _, cx| cx.hide()),
+                        Self::icon_button("hide", "minus", "Hide")
+                            .on_click(cx.listener(|this, _, _, cx| this.hide_window(cx))),
                     ),
             )
             .child(content)
-            .child(self.notifications.render())
+            .child(
+                div()
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .debug_selector(|| "notifications-footer".into())
+                    .child(self.notifications.render()),
+            )
+            .when(self.actions.dialog.is_some(), |d| {
+                d.child(self.action_dialog(cx))
+            })
     }
 }
 #[cfg(test)]

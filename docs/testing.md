@@ -7,15 +7,31 @@ coverage, and a Swift Accessibility smoke test for the actual macOS bundle.
 
 Ordinary Rust unit tests cover isolated logic. `#[gpui::test]` scenarios in
 `src/chat_tests.rs` simulate clicks, typing, and Enter through the real chat UI.
+`src/action_builder_tests.rs` reuses that ephemeral fixture for real create/edit/
+delete, icon/model selection, multiline input, confirmation and custom dispatch.
+Persistence is injected into memory or a private disposable directory, including
+failed saves and corrupt-file recovery. These tests also cover busy/nested navigation
+and three-column overflow with the fixed 48px notification footer.
 A test-only controlled backend records requests and explicitly releases streaming
 deltas, replies, or failures through the application's normal scoped event path.
 Assertions cover history, committed versus partial replies, busy/composer state,
 duplicate sends, draft recovery, authentication, and stale-session/device events.
-The fixture avoids user settings, credentials, clipboard, hotkeys, and network.
+The fixture avoids user settings, credentials, general/user clipboard access,
+hotkeys, and network. Paste coverage injects a test-only text reader through the
+actual Paste action handler; it never reads a native pasteboard.
+
+The full unit/all-targets suite separately includes existing native
+`clipboard_capture` tests using `NSPasteboard::pasteboardWithUniqueName`. They
+write, snapshot, restore and clear only private unique test pasteboards, not the
+general/user clipboard. These native pasteboard operations are distinct from
+in-process GPUI fixtures and do not verify native application rendering or AX.
+Action fixtures also cover retained control focus and scroll, popup-first mouse
+gestures, held model-selection keys, modal-safe scoped events and catalog updates.
 
 ```sh
 cargo test --offline --locked
 cargo test --offline --locked --bin wiesel chat_tests
+cargo test --offline --locked --bin wiesel action_builder_tests
 # Optional suite runner, if Cargo Nextest is installed:
 cargo nextest run --offline --locked
 ```
