@@ -58,7 +58,6 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     pub content: SharedString,
     secret: bool,
-    launcher_style: bool,
     multiline: bool,
     placeholder: SharedString,
     accessibility_id: Option<SharedString>,
@@ -83,7 +82,6 @@ impl TextInput {
             focus_handle: cx.focus_handle(),
             content: "".into(),
             secret,
-            launcher_style: false,
             multiline: false,
             placeholder: placeholder.to_owned().into(),
             accessibility_id: None,
@@ -114,13 +112,6 @@ impl TextInput {
             ..Self::new(placeholder, false, cx)
         }
     }
-    pub fn launcher(cx: &mut Context<Self>) -> Self {
-        Self {
-            launcher_style: true,
-            ..Self::new("What would you like to do?", false, cx)
-        }
-    }
-
     pub fn with_accessibility_id(mut self, id: &'static str) -> Self {
         self.accessibility_id = Some(id.into());
         self
@@ -613,7 +604,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(theme::MUTED).into())
+            (input.placeholder.clone(), rgb(theme::p().muted).into())
         } else {
             (
                 if input.secret {
@@ -625,6 +616,13 @@ impl Element for TextElement {
             )
         };
 
+        // Loaded values and native input can contain newlines even in single-line
+        // fields. Flatten only the display, preserving byte offsets and stored prompts.
+        let display_text = if !input.multiline && display_text.contains('\n') {
+            display_text.replace('\n', " ").into()
+        } else {
+            display_text
+        };
         let font_size = style.font_size.to_pixels(window.rem_size());
         let mut start = 0;
         let parts: Vec<&str> = if input.multiline {
@@ -713,7 +711,7 @@ impl Element for TextElement {
                     ),
                     size(px(2.), line_height),
                 ),
-                rgb(theme::PRIMARY),
+                rgb(theme::p().ring),
             )
         });
         let selections = lines
@@ -742,7 +740,7 @@ impl Element for TextElement {
                             line_height,
                         ),
                     ),
-                    rgba(0xffffff30),
+                    rgba((theme::p().ring << 8) | 0x40),
                 ))
             })
             .collect();
@@ -904,20 +902,27 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .overflow_hidden()
-            .bg(rgb(if self.launcher_style {
-                theme::BACKGROUND
-            } else {
-                theme::CARD
-            }))
-            .text_color(rgb(theme::FOREGROUND))
+            .map(|d| {
+                let p = theme::p();
+                d.rounded(px(4.))
+                    .border_1()
+                    .border_color(rgba(p.input_border))
+                    .bg(rgb(p.field))
+                    .shadow(vec![
+                        theme::shadow(0., 1., 0., 0., p.edge_highlight),
+                        theme::shadow(0., 1., 2., 0., 0x0000001f).inset(),
+                    ])
+                    .focus(|s| s.border_color(rgb(p.ring)))
+                    .text_color(rgb(p.foreground))
+                    .text_size(px(13.))
+            })
             .line_height(px(28.))
-            .text_size(px(if self.launcher_style { 18. } else { 13. }))
             .child(
                 div()
                     .h(px(if self.multiline { 120. } else { 38. }))
                     .w_full()
                     .py(px(4.))
-                    .px(px(if self.launcher_style { 0. } else { 4. }))
+                    .px(px(8.))
                     .child(TextElement { input: cx.entity() }),
             )
     }
@@ -931,7 +936,59 @@ impl Focusable for TextInput {
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_offset_for_utf16, normalize_pasted_text};
+    use super::{TextInput, byte_offset_for_utf16, normalize_pasted_text};
+    use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn single_line_renders_saved_newlines_without_changing_content(cx: &mut TestAppContext) {
+        let value = "First é\nSecond 😀\n";
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            let mut input = TextInput::new("Prompt", false, cx);
+            input.set(value, cx);
+            input
+        });
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.content.as_ref(), value);
+            assert_eq!(input.selected_range, value.len()..value.len());
+            assert_eq!(input.last_lines.len(), 1);
+            assert_eq!(input.last_lines[0].1.text.as_ref(), "First é Second 😀 ");
+        });
+    }
+
+    #[gpui::test]
+    fn single_line_renders_newlines_in_placeholder(cx: &mut TestAppContext) {
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new("First\nSecond", false, cx));
+        cx.read_entity(&input, |input, _| {
+            assert!(input.content.is_empty());
+            assert_eq!(input.last_lines[0].1.text.as_ref(), "First Second");
+        });
+    }
+
+    #[gpui::test]
+    fn multiline_render_preserves_rows_and_utf8_offsets(cx: &mut TestAppContext) {
+        let value = "First é\nSecond 😀\n";
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            let mut input = TextInput::multiline("Prompt", cx);
+            input.set(value, cx);
+            input
+        });
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.content.as_ref(), value);
+            assert_eq!(
+                input
+                    .last_lines
+                    .iter()
+                    .map(|(offset, line)| (*offset, line.text.as_ref()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, "First é"),
+                    ("First é\n".len(), "Second 😀"),
+                    (value.len(), "")
+                ]
+            );
+        });
+    }
+
     #[test]
     fn multiline_paste_preserves_lines_and_normalizes_crlf() {
         assert_eq!(

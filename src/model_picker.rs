@@ -181,10 +181,10 @@ impl Render for ModelPicker {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgba(theme::INPUT_BORDER))
-                    .bg(rgb(theme::CARD))
+                    .border_color(rgba(theme::p().input_border))
+                    .bg(rgb(theme::p().card))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::ACCENT)))
+                    .hover(|s| s.bg(rgb(theme::p().accent)))
                     .child(if selected.is_empty() {
                         if self.include_default {
                             "Default model · follows app setting"
@@ -221,8 +221,8 @@ impl Render for ModelPicker {
                         .p_2()
                         .rounded_md()
                         .border_1()
-                        .border_color(rgba(theme::INPUT_BORDER))
-                        .bg(rgb(theme::CARD))
+                        .border_color(rgba(theme::p().input_border))
+                        .bg(rgb(theme::p().card))
                         .child(self.search.clone())
                         .child(
                             div()
@@ -257,11 +257,11 @@ impl Render for ModelPicker {
                                         .cursor_pointer()
                                         .rounded_sm()
                                         .bg(rgb(if index == self.highlighted {
-                                            theme::ACCENT
+                                            theme::p().accent
                                         } else {
-                                            theme::CARD
+                                            theme::p().card
                                         }))
-                                        .hover(|s| s.bg(rgb(theme::ACCENT)))
+                                        .hover(|s| s.bg(rgb(theme::p().accent)))
                                         .child(format!(
                                             "{}{}",
                                             if model == self.selected { "✓ " } else { "" },
@@ -279,7 +279,7 @@ impl Render for ModelPicker {
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(rgb(theme::p().muted))
                                 .child(format!(
                                     "{} of {} models · ↑↓ navigate · Enter selects · Esc closes",
                                     options.len(),

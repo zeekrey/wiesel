@@ -49,11 +49,16 @@ All route-changing UI handlers use these owner helpers in `src/main.rs`:
   startup. `finish_pop` cancels an active browser login only when leaving Settings
   and exits shortcut recording. It does **not** cancel inference.
 
-Header navigation controls prevent mouse-down's default focus transfer, so the
-push snapshots the input that was actually focused, not the header/root handle.
-Back is shown on Settings as well as Chat/Writing, and works while inference is
-busy. Save Settings pops Settings to its underlying screen rather than resetting
-the stack to Home. Header Settings remains usable while inference is busy.
+Toolbar navigation controls prevent mouse-down's default focus transfer, so the
+push snapshots the input that was actually focused, not the root handle. Every
+child screen shows Back in its toolbar, and it works while inference is busy.
+Save Settings pops Settings to its underlying screen rather than resetting the
+stack to Home. Settings and quick-action management are macOS menu commands
+(`OpenSettings`, `AdjustQuickActions`) handled on the root view; both are
+singletons that reveal an existing entry instead of stacking a duplicate
+(`push_settings`, `open_action_manager`), remain usable while inference is busy,
+and first close any action-editor popup, since a menu click has no outside
+mouse-down to dismiss it.
 
 ### New screens and dirty editors
 
@@ -83,7 +88,7 @@ Key handling is deliberately layered:
 3. Otherwise Escape pops **one** child and restores focus, including Settings.
 4. At root Escape requests application hiding; it never underflows the stack.
 
-Hide/minus hides without changing navigation or clearing drafts. Completed global
+Hide (Wiesel menu, ⌘H) hides without changing navigation or clearing drafts. Completed global
 hotkey selection capture activates Home by unwinding idle non-Settings screens.
 It retains Settings (onboarding/editing) and retains the current route while an
 inference is busy. This preserves the prior intentional hotkey behavior, now via
@@ -96,8 +101,7 @@ onboarding and registered-hotkey requirements are met. Explicitly opened Setting
 never auto-pops, and startup Settings below another screen is never implicitly
 removed. Authentication changes do not replace/reset the navigation stack.
 Leaving setup does not bypass inference gates: requests still require verified
-login, a valid credential and completed onboarding. Unsent Home drafts are not
-consumed by a setup-gated submission.
+login, a valid credential and completed onboarding.
 
 ## Retained state and asynchronous ownership
 

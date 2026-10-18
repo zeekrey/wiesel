@@ -7,7 +7,10 @@ use gpui::{prelude::*, *};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const STATUS_BAR_HEIGHT: f32 = 48.;
+/// Two lines of header status text.
+pub const STATUS_BAR_HEIGHT: f32 = 28.;
+/// Messages up to this length are printed as tracked caps, like the design's READY.
+const PRINTED_STATUS_GRAPHEMES: usize = 22;
 const MAX_MESSAGE_GRAPHEMES: usize = 96;
 const FEEDBACK_DURATION: Duration = Duration::from_secs(5);
 
@@ -19,12 +22,23 @@ pub enum Severity {
     Error,
 }
 impl Severity {
-    fn color(self) -> u32 {
+    fn led_color(self) -> u32 {
         match self {
-            Self::Info => theme::MUTED,
-            Self::Success => 0x22c55e,
-            Self::Warning => 0xeab308,
-            Self::Error => 0xef4444,
+            Self::Info => theme::PAD_GLOW,
+            Self::Success => theme::LED_GREEN,
+            Self::Warning => theme::LED_AMBER,
+            Self::Error => theme::LED_RED,
+        }
+    }
+    /// Readable text on either chassis; LEDs stay saturated, copy is darkened in light mode.
+    fn text_color(self) -> u32 {
+        let dark = theme::p().dark;
+        match self {
+            Self::Info | Self::Success => theme::p().status_label,
+            Self::Warning if dark => 0xf0b65a,
+            Self::Warning => 0x9a5d0e,
+            Self::Error if dark => 0xf06a55,
+            Self::Error => 0xb32a17,
         }
     }
     fn label(self) -> &'static str {
@@ -188,7 +202,9 @@ impl Notifications {
         self.animate = !self.suppress_motion;
         true
     }
-    pub fn render(&self) -> Div {
+    /// The header status: an LED plus a short printed label, or up to two lines of copy.
+    /// `busy` lights the LED amber while a request is pending.
+    pub fn render(&self, busy: bool) -> Div {
         let notification = self
             .visible
             .clone()
@@ -197,69 +213,68 @@ impl Notifications {
         // GPUI honors App::reduce_motion for this native animation wrapper.
         let animate = self.animate;
         let duration = Duration::from_millis(180);
+        let severity = notification.severity;
+        let led = if busy && severity <= Severity::Success {
+            theme::LED_AMBER
+        } else {
+            severity.led_color()
+        };
+        let message = format!(
+            "{}{}",
+            if matches!(severity, Severity::Warning | Severity::Error) {
+                format!("{}: ", severity.label())
+            } else {
+                String::new()
+            },
+            notification.message
+        );
+        let printed = message.graphemes(true).count() <= PRINTED_STATUS_GRAPHEMES;
+        let text = if printed {
+            theme::silkscreen(message, severity.text_color())
+        } else {
+            div()
+                .text_size(px(11.))
+                .line_height(px(14.))
+                .text_color(rgb(severity.text_color()))
+                .text_right()
+                .line_clamp(2)
+                .text_ellipsis()
+                .overflow_hidden()
+                .child(message)
+        };
         div()
             .h(px(STATUS_BAR_HEIGHT))
             .min_h(px(STATUS_BAR_HEIGHT))
             .max_h(px(STATUS_BAR_HEIGHT))
-            .w_full()
-            .flex_shrink_0()
+            .min_w_0()
             .flex()
             .items_center()
+            .justify_end()
             .gap(px(8.))
-            .px(px(20.))
-            .border_t_1()
-            .border_color(rgba(theme::BORDER))
-            .child(
-                div()
-                    .size(px(6.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(notification.severity.color()))
-                    .map(|dot| {
-                        if animate {
-                            dot.with_animation(
-                                ("status-dot", self.revision),
-                                Animation::new(duration).with_easing(ease_out_quint()),
-                                |dot, progress| dot.opacity(0.55 + 0.45 * progress),
-                            )
-                            .into_any_element()
-                        } else {
-                            dot.into_any_element()
-                        }
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.))
-                    .line_height(px(16.))
-                    .text_color(rgb(theme::MUTED))
-                    .text_ellipsis()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(format!(
-                        "{}{}",
-                        if matches!(notification.severity, Severity::Warning | Severity::Error) {
-                            format!("{}: ", notification.severity.label())
-                        } else {
-                            String::new()
-                        },
-                        notification.message
-                    ))
-                    .map(|text| {
-                        if animate {
-                            text.with_animation(
-                                ("status-text", self.revision),
-                                Animation::new(duration).with_easing(ease_out_quint()),
-                                |text, progress| text.opacity(0.65 + 0.35 * progress),
-                            )
-                            .into_any_element()
-                        } else {
-                            text.into_any_element()
-                        }
-                    }),
-            )
+            .child(theme::led(led).map(|chip| {
+                if animate {
+                    chip.with_animation(
+                        ("status-dot", self.revision),
+                        Animation::new(duration).with_easing(ease_out_quint()),
+                        |chip, progress| chip.opacity(0.55 + 0.45 * progress),
+                    )
+                    .into_any_element()
+                } else {
+                    chip.into_any_element()
+                }
+            }))
+            .child(div().min_w_0().flex_shrink(1.).child(text).map(|text| {
+                if animate {
+                    text.with_animation(
+                        ("status-text", self.revision),
+                        Animation::new(duration).with_easing(ease_out_quint()),
+                        |text, progress| text.opacity(0.65 + 0.35 * progress),
+                    )
+                    .into_any_element()
+                } else {
+                    text.into_any_element()
+                }
+            }))
     }
 }
 
@@ -466,12 +481,11 @@ mod tests {
     #[test]
     fn status_bar_has_fixed_dimensions() {
         use gpui::{Styled, px};
-        let mut bar = Notifications::default().render();
+        let mut bar = Notifications::default().render(false);
         let height = Some(px(super::STATUS_BAR_HEIGHT).into());
         assert_eq!(bar.style().size.height, height);
         assert_eq!(bar.style().min_size.height, height);
         assert_eq!(bar.style().max_size.height, height);
-        assert_eq!(bar.style().flex_shrink, Some(0.));
     }
     #[test]
     fn clipboard_restoration_failure_is_an_error() {

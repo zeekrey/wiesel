@@ -1,6 +1,6 @@
 //! Real in-process UI input with isolated settings persistence and ControlledBackend.
 use super::*;
-use chat_tests::{receive_results, setup};
+use chat_tests::{menu, receive_results, setup};
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
 use quick_actions::{CustomActionFields, CustomQuickAction};
 use std::{cell::RefCell, rc::Rc};
@@ -9,6 +9,31 @@ fn click(cx: &mut VisualTestContext, selector: &str) {
     // GPUI debug selectors require static lifetimes; these tiny test-only IDs
     // live for the test process, not application state.
     let selector = Box::leak(selector.to_owned().into_boxed_str());
+    // Built-ins precede custom rows now; scroll manager controls into view before clicking.
+    if selector.starts_with("edit-") || selector.starts_with("delete-") {
+        for _ in 0..3 {
+            let Some(bounds) = cx.debug_bounds(selector) else {
+                break;
+            };
+            let Some(viewport) = cx.debug_bounds("action-manager-scroll") else {
+                break;
+            };
+            let delta = if bounds.bottom() > viewport.bottom() {
+                viewport.bottom() - bounds.bottom() - px(8.)
+            } else if bounds.top() < viewport.top() {
+                viewport.top() - bounds.top() + px(8.)
+            } else {
+                break;
+            };
+            cx.simulate_event(ScrollWheelEvent {
+                position: viewport.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), delta)),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+    }
     let bounds = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("rendered {selector}"));
@@ -32,7 +57,7 @@ fn action(name: &str, model: Option<&str>) -> CustomQuickAction {
         name: name.into(),
         icon: "wand".into(),
         model_override: model.map(str::to_owned),
-        instructions: "Exact custom instructions\n with whitespace ".into(),
+        instructions: "Exact custom instructions\n with whitespace \n{selection}".into(),
     })
     .unwrap()
 }
@@ -54,9 +79,237 @@ fn seed(app: &Entity<Wiesel>, cx: &mut VisualTestContext, action: CustomQuickAct
 }
 
 #[gpui::test]
-fn create_icon_model_multiline_and_edit_preserve_uuid_and_home_draft(cx: &mut TestAppContext) {
+fn builtin_manager_edit_dispatch_delete_and_shortcut_follow_saved_customization(
+    cx: &mut TestAppContext,
+) {
     let (app, backend, cx) = setup(cx);
-    cx.simulate_input("retained Home draft");
+    seed(&app, cx, action("User action", None));
+    let id = QuickAction::FixSpelling.persistent_id();
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("edit-{id}"));
+    cx.read_entity(&app, |app, cx| {
+        let editor = app.actions.editor.as_ref().unwrap();
+        assert!(editor.instructions.read(cx).content.contains("{selection}"));
+    });
+    fill(
+        cx,
+        "Fix grammar",
+        "Fix grammar and spelling for the following text:\n\n{selection}",
+    );
+    click(cx, "action-icon");
+    click(cx, "icon-lightbulb");
+    click(cx, "model-select");
+    click(cx, "model-option-2");
+    click(cx, "action-save");
+    cx.read_entity(&app, |app, _| {
+        let configured = &app.settings.actions()[0];
+        assert_eq!(configured.id, id);
+        assert_eq!(configured.name, "Fix grammar");
+        assert_eq!(configured.icon, "lightbulb");
+        assert_eq!(configured.model_override.as_deref(), Some("test/override"));
+    });
+    click(cx, "back");
+    click(cx, "grammar");
+    let (model, messages, chat) = backend.request(0);
+    assert_eq!(model, "test/override");
+    assert!(!chat);
+    assert_eq!(
+        messages[1].content,
+        "Fix grammar and spelling for the following text:\n\nSelected source text"
+    );
+    assert!(!messages[0].content.contains("Selected source text"));
+    backend.finish(0, Ok("Corrected text".into()));
+    receive_results(&app, cx);
+    click(cx, "back");
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("delete-{id}"));
+    click(cx, "dialog-confirm");
+    click(cx, "back");
+    assert!(cx.debug_bounds("grammar").is_none());
+    cx.simulate_keystrokes("cmd-1");
+    assert_eq!(backend.request_count(), 1);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Launcher);
+        assert_eq!(app.settings.actions().len(), 5);
+        assert_eq!(app.settings.custom_actions.len(), 1);
+    });
+}
+
+#[gpui::test]
+fn builder_say_hi_opens_chat_without_selection_or_clipboard(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    seed(&app, cx, action("Existing", None));
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        app.update(cx, |app, _| app.selection.text = None);
+    });
+    create(cx, "Say hi", "say hi");
+    let id = cx.read_entity(&app, |app, _| {
+        app.settings.custom_actions.last().unwrap().id
+    });
+    click(cx, &format!("custom-{id}"));
+    let (_, messages, chat) = backend.request(0);
+    assert!(chat);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].role, "user");
+    assert_eq!(messages[1].content, "say hi");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Chat);
+        assert_eq!(app.messages[0].content, "say hi");
+    });
+    backend.finish(0, Ok("Hi!".into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.messages.last().unwrap().content, "Hi!");
+    });
+}
+
+#[gpui::test]
+fn literal_action_ignores_unreferenced_selection_and_clipboard(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    let mut custom = action("Literal", None);
+    custom.instructions = "say hi {unknown}".into();
+    let id = custom.id;
+    seed(&app, cx, custom);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("Private clipboard".into()));
+        app.update(cx, |app, _| app.selection.text = Some("x".repeat(100_001)));
+    });
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request(0).1[1].content, "say hi {unknown}");
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some("Private clipboard")
+        );
+    });
+}
+
+#[gpui::test]
+fn action_chat_followups_keep_model_and_expanded_sources_until_new_chat(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    let mut custom = action("Explain", Some("test/override"));
+    custom.instructions = "Explain {clipboard}".into();
+    let id = custom.id;
+    seed(&app, cx, custom);
+    cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("Original source".into())));
+    click(cx, &format!("custom-{id}"));
+    backend.finish(0, Ok("Explanation".into()));
+    receive_results(&app, cx);
+    cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
+    cx.simulate_input("More detail");
+    cx.simulate_keystrokes("enter");
+    let (model, messages, chat) = backend.request(1);
+    assert!(chat);
+    assert_eq!(model, "test/override");
+    assert_eq!(messages[1].content, "Explain Original source");
+    assert_eq!(messages[2].content, "Explanation");
+    assert_eq!(messages[3].content, "More detail");
+    backend.finish(1, Ok("Details".into()));
+    receive_results(&app, cx);
+    click(cx, "new-chat");
+    cx.simulate_input("Hello");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(backend.request(2).0, "test/chat-model");
+    assert_eq!(backend.request(2).1.len(), 2);
+}
+
+#[gpui::test]
+fn edited_builtin_without_placeholders_does_not_require_selection(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    let id = QuickAction::FixSpelling.persistent_id();
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("edit-{id}"));
+    fill(cx, "Greeting", "say hi");
+    click(cx, "action-save");
+    click(cx, "back");
+    click(cx, "grammar");
+    assert_eq!(backend.request(0).1[1].content, "say hi");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Writing);
+        assert!(app.selection.writing_source.is_empty());
+    });
+}
+
+#[gpui::test]
+fn clipboard_only_action_runs_without_selection_and_preserves_literal_source_tokens(
+    cx: &mut TestAppContext,
+) {
+    let (app, backend, cx) = setup(cx);
+    let mut custom = action("Clipboard action", None);
+    custom.instructions = "Explain:\n{clipboard}".into();
+    let id = custom.id;
+    seed(&app, cx, custom);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("Copied {selection}".into()));
+        app.update(cx, |app, cx| {
+            app.selection.text = None;
+            cx.notify();
+        });
+    });
+    click(cx, &format!("custom-{id}"));
+    let (_, messages, _) = backend.request(0);
+    assert_eq!(messages[1].content, "Explain:\nCopied {selection}");
+    cx.read_entity(&app, |app, _| {
+        assert!(app.selection.writing_source.is_empty())
+    });
+}
+
+#[gpui::test]
+fn selection_and_clipboard_variables_are_combined_and_missing_sources_send_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (app, backend, cx) = setup(cx);
+    let mut custom = action("Compare", None);
+    custom.instructions = "Compare {selection} with {clipboard}.".into();
+    let id = custom.id;
+    seed(&app, cx, custom);
+    cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 0);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("Copied text".into()));
+        app.update(cx, |app, cx| {
+            app.selection.text = None;
+            cx.notify();
+        });
+    });
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 0);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.selection.text = Some("Selected text".into());
+            cx.notify();
+        })
+    });
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(
+        backend.request(0).1[1].content,
+        "Compare Selected text with Copied text."
+    );
+}
+
+#[gpui::test]
+fn edited_builtin_chat_keeps_conversation_mode_and_honors_instructions(cx: &mut TestAppContext) {
+    let (_app, backend, cx) = setup(cx);
+    let id = QuickAction::Chat.persistent_id();
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("edit-{id}"));
+    fill(cx, "My chat", "Answer in short sentences.");
+    click(cx, "action-save");
+    click(cx, "back");
+    click(cx, "chat");
+    cx.simulate_input("Hello");
+    cx.simulate_keystrokes("enter");
+    let (_, messages, chat) = backend.request(0);
+    assert!(chat);
+    assert_eq!(messages[0].content, "Answer in short sentences.");
+    assert_eq!(messages[1].content, "Hello");
+}
+
+#[gpui::test]
+fn create_icon_model_multiline_and_edit_preserve_uuid(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
     cx.update(|_, cx| {
         app.update(cx, |app, cx| {
             app.model_picker.update(cx, |picker, cx| {
@@ -76,7 +329,7 @@ fn create_icon_model_multiline_and_edit_preserve_uuid_and_home_draft(cx: &mut Te
     click(cx, "model-select");
     click(cx, "model-option-2");
     cx.simulate_keystrokes("cmd-enter");
-    let id = cx.read_entity(&app, |app, cx| {
+    let id = cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Launcher);
         assert_eq!(app.settings.custom_actions.len(), 1);
         let action = &app.settings.custom_actions[0];
@@ -84,14 +337,10 @@ fn create_icon_model_multiline_and_edit_preserve_uuid_and_home_draft(cx: &mut Te
         assert_eq!(action.icon, "lightbulb");
         assert_eq!(action.instructions, "First line\nSecond line");
         assert_eq!(action.model_override.as_deref(), Some("test/override"));
-        assert_eq!(
-            app.launcher_input.read(cx).content.as_ref(),
-            "retained Home draft"
-        );
         action.id
     });
     assert_eq!(backend.request_count(), 0);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("edit-{id}"));
     fill(cx, "Renamed", "Updated instructions");
     click(cx, "model-select");
@@ -104,14 +353,7 @@ fn create_icon_model_multiline_and_edit_preserve_uuid_and_home_draft(cx: &mut Te
         assert!(app.settings.custom_actions[0].model_override.is_none());
     });
     cx.simulate_keystrokes("escape");
-    cx.update(|window, cx| {
-        assert!(
-            app.read(cx)
-                .launcher_input
-                .focus_handle(cx)
-                .is_focused(window)
-        )
-    });
+    cx.update(|window, cx| assert!(app.read(cx).focus.is_focused(window)));
 }
 
 #[gpui::test]
@@ -171,7 +413,7 @@ fn delete_cancel_confirm_and_failed_update_delete_are_transactional(cx: &mut Tes
     let original = action("Original", None);
     let id = original.id;
     seed(&app, cx, original.clone());
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("delete-{id}"));
     click(cx, "dialog-cancel");
     cx.read_entity(&app, |app, _| {
@@ -254,7 +496,7 @@ fn dirty_escape_back_cancel_and_popup_precedence_preserve_draft(cx: &mut TestApp
 #[gpui::test]
 fn manager_new_cancel_and_settings_cover_restore_nested_editor(cx: &mut TestAppContext) {
     let (app, _, cx) = setup(cx);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, "new-action");
     click(cx, "action-cancel");
     cx.read_entity(&app, |app, _| {
@@ -262,7 +504,7 @@ fn manager_new_cancel_and_settings_cover_restore_nested_editor(cx: &mut TestAppC
     });
     click(cx, "new-action");
     fill(cx, "Nested", "Draft");
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.read_entity(&app, |app, _| assert_eq!(app.navigation.depth(), 4));
     click(cx, "back");
     cx.read_entity(&app, |app, cx| {
@@ -290,7 +532,7 @@ fn manager_new_cancel_and_settings_cover_restore_nested_editor(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn custom_dispatch_uses_exact_model_instructions_selection_and_stale_guards(
+fn custom_dispatch_opens_chat_with_expanded_instructions_model_and_stale_guards(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
@@ -300,21 +542,28 @@ fn custom_dispatch_uses_exact_model_instructions_selection_and_stale_guards(
     click(cx, &format!("custom-{id}"));
     let (model, messages, chat) = backend.request(0);
     assert_eq!(model, "test/override");
-    assert!(!chat);
+    assert!(chat);
     assert_eq!(messages[0].role, "system");
-    assert_eq!(messages[0].content, custom.instructions);
+    assert!(!messages[0].content.contains("Selected source text"));
     assert_eq!(messages[1].role, "user");
-    assert_eq!(messages[1].content, "Selected source text");
+    assert_eq!(
+        messages[1].content,
+        "Exact custom instructions\n with whitespace \nSelected source text"
+    );
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.settings.model, "test/chat-model");
-        assert_eq!(app.selection.writing_source, "Selected source text");
+        assert_eq!(app.current_screen(), Screen::Chat);
+        assert!(app.selection.writing_source.is_empty());
     });
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     backend.finish(0, Ok("Finished custom result".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.result, "Finished custom result");
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Finished custom result"
+        );
     });
     click(cx, "back");
     click(cx, "back");
@@ -383,7 +632,7 @@ fn read_only_settings_block_create_delete_without_fake_success(cx: &mut TestAppC
             cx.notify();
         })
     });
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("delete-{id}"));
     cx.read_entity(&app, |app, _| assert!(app.actions.dialog.is_none()));
     cx.read_entity(&app, |app, _| {
@@ -463,7 +712,7 @@ fn rendered_crud_round_trips_disposable_settings_without_user_files(cx: &mut Tes
     create(cx, "Persisted", "Original instructions");
     let saved = settings::load_from(&path).unwrap();
     let id = saved.custom_actions[0].id;
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("edit-{id}"));
     fill(cx, "Updated", "  Kept exactly\nnext line  ");
     click(cx, "action-save");
@@ -516,7 +765,7 @@ fn dirty_hotkey_root_and_existing_settings_multi_pop_are_atomic_until_confirmed(
     cx: &mut TestAppContext,
 ) {
     let (app, _, cx) = setup(cx);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, "new-action");
     fill(cx, "Retain me", "Draft");
     cx.update(|window, cx| app.update(cx, |app, cx| app.activate_from_hotkey(window, cx)));
@@ -535,7 +784,7 @@ fn dirty_hotkey_root_and_existing_settings_multi_pop_are_atomic_until_confirmed(
         })
     });
     cx.run_until_parked();
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Settings)
     });
@@ -553,18 +802,18 @@ fn dirty_hotkey_root_and_existing_settings_multi_pop_are_atomic_until_confirmed(
     });
     // Settings below a newly mounted dirty editor: revealing it must guard all
     // entries before the first pop.
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.update(|window, cx| app.update(cx, |app, cx| app.open_action_editor(None, window, cx)));
     cx.run_until_parked();
     fill(cx, "Nested", "Draft");
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::ActionEditor);
         assert_eq!(app.navigation.depth(), 3);
         assert!(app.actions.dialog.is_some());
     });
     click(cx, "dialog-cancel");
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     click(cx, "dialog-confirm");
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Settings);
@@ -585,7 +834,7 @@ fn busy_inference_allows_builder_editing_without_duplicate_or_route_resurrection
     click(cx, "back");
     click(cx, &format!("custom-{id}"));
     assert_eq!(backend.request_count(), 1);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("edit-{id}"));
     fill(cx, "Edited during request", "Updated for next run");
     click(cx, "action-save");
@@ -594,8 +843,11 @@ fn busy_inference_allows_builder_editing_without_duplicate_or_route_resurrection
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::ActionManager);
         assert_eq!(app.settings.custom_actions[0].name, "Edited during request");
-        assert_eq!(app.result, "Older completed result");
-        assert_eq!(app.selection.writing_source, "Selected source text");
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Older completed result"
+        );
+        assert!(app.selection.writing_source.is_empty());
         assert!(!app.busy);
     });
 }
@@ -645,7 +897,138 @@ fn inference_auth_selection_and_size_gates_send_nothing(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn home_overflow_preserves_three_column_cards_fixed_footer_and_reachable_create(
+fn home_header_sits_above_three_rows_of_square_pads(cx: &mut TestAppContext) {
+    let (_, _, cx) = setup(cx);
+    let header = cx.debug_bounds("header").unwrap();
+    let first = cx.debug_bounds("grammar").unwrap();
+    let second = cx.debug_bounds("improve").unwrap();
+    let third = cx.debug_bounds("chat").unwrap();
+    let fourth = cx.debug_bounds("summarize").unwrap();
+    let fifth = cx.debug_bounds("explain").unwrap();
+    let empty = cx.debug_bounds("home-empty-5").unwrap();
+    let seventh = cx.debug_bounds("home-empty-6").unwrap();
+    let eighth = cx.debug_bounds("home-empty-7").unwrap();
+    let add = cx.debug_bounds("add-action").unwrap();
+    for card in [
+        first, second, third, fourth, fifth, empty, seventh, eighth, add,
+    ] {
+        assert_eq!(card.size.width, card.size.height);
+        assert_eq!(card.size, first.size);
+    }
+    assert_eq!(first.top(), second.top());
+    assert_eq!(second.top(), third.top());
+    assert_eq!(fourth.top(), fifth.top());
+    assert_eq!(fifth.top(), empty.top());
+    assert_eq!(seventh.top(), eighth.top());
+    assert_eq!(eighth.top(), add.top());
+    assert_eq!(third.left(), add.left());
+    assert_eq!(first.left(), fourth.left());
+    assert_eq!(fourth.left(), seventh.left());
+    let viewport = cx.debug_bounds("quick-actions-scroll").unwrap();
+    assert!(first.top() >= viewport.top());
+    assert!(add.bottom() <= viewport.bottom());
+    // Status lives in the header; nothing but pads sits between it and the grid.
+    let status = cx.debug_bounds("status").unwrap();
+    assert!(status.bottom() <= header.bottom());
+    assert!(header.bottom() <= first.top());
+    assert!(cx.debug_bounds("toolbar").is_none());
+    assert!(cx.debug_bounds("notifications-footer").is_none());
+    // The design's 486×573 window: 134pt pads, 16pt gutters, 26pt side margins.
+    assert_eq!(header.size.height, px(HEADER_HEIGHT));
+    assert!(((first.size.width - px(134.)) / px(1.)).abs() < 1.);
+    assert!(((first.left() - px(26.)) / px(1.)).abs() < 1.);
+    assert!(((second.left() - first.right() - px(16.)) / px(1.)).abs() < 1.);
+}
+
+#[gpui::test]
+fn number_keys_press_the_pad_printed_with_that_number(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    cx.simulate_keystrokes("3");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Chat)
+    });
+    cx.simulate_keystrokes("escape 6");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            app.current_screen(),
+            Screen::Launcher,
+            "empty slot is inert"
+        )
+    });
+    cx.simulate_keystrokes("9");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            app.current_screen(),
+            Screen::ActionEditor,
+            "9 is Add action"
+        )
+    });
+}
+
+#[gpui::test]
+fn menu_commands_reveal_singleton_settings_and_quick_actions(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    menu(cx, AdjustQuickActions);
+    menu(cx, OpenSettings);
+    menu(cx, AdjustQuickActions);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::ActionManager);
+        assert_eq!(
+            app.navigation.depth(),
+            2,
+            "quick actions are revealed, not stacked"
+        );
+    });
+    menu(cx, NewQuickAction);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::ActionEditor)
+    });
+    assert!(cx.debug_bounds("toolbar").is_some());
+    click(cx, "back");
+    click(cx, "back");
+    menu(cx, NewChat);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Chat)
+    });
+}
+
+#[gpui::test]
+fn home_grid_stays_square_and_fits_three_rows_when_resized(cx: &mut TestAppContext) {
+    let (_, _, cx) = setup(cx);
+    for size in [size(px(540.), px(720.)), size(px(800.), px(900.))] {
+        cx.simulate_resize(size);
+        let first = cx.debug_bounds("grammar").unwrap();
+        let add = cx.debug_bounds("add-action").unwrap();
+        let viewport = cx.debug_bounds("quick-actions-scroll").unwrap();
+        assert_eq!(first.size.width, first.size.height);
+        assert_eq!(add.size, first.size);
+        assert!(add.bottom() <= viewport.bottom());
+        assert!(add.right() <= viewport.right());
+    }
+}
+
+#[gpui::test]
+fn custom_actions_fill_reserved_home_slots_before_the_bottom_right_add_card(
+    cx: &mut TestAppContext,
+) {
+    let (app, _, cx) = setup(cx);
+    for name in ["First custom", "Second custom", "Third custom"] {
+        seed(&app, cx, action(name, None));
+    }
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("home-empty-5").is_none());
+    assert!(cx.debug_bounds("home-empty-6").is_none());
+    assert!(cx.debug_bounds("home-empty-7").is_none());
+    let slots = cx.read_entity(&app, |app, _| app.home_action_slots());
+    assert_eq!(slots.len(), 9);
+    assert!(slots.iter().all(Option::is_some));
+    let third = cx.debug_bounds("chat").unwrap();
+    let add = cx.debug_bounds("add-action").unwrap();
+    assert_eq!(third.left(), add.left());
+}
+
+#[gpui::test]
+fn home_overflow_preserves_three_column_pads_fixed_header_status_and_reachable_create(
     cx: &mut TestAppContext,
 ) {
     let (app, _, cx) = setup(cx);
@@ -658,26 +1041,23 @@ fn home_overflow_preserves_three_column_cards_fixed_footer_and_reachable_create(
         })
     });
     cx.run_until_parked();
-    let footer = cx.debug_bounds("notifications-footer").unwrap();
-    assert_eq!(footer.size.height, px(48.));
-    assert_eq!(footer.bottom(), px(449.));
+    let status = cx.debug_bounds("status").unwrap();
+    assert_eq!(status.size.height, px(28.));
+    assert!(status.bottom() <= cx.debug_bounds("header").unwrap().bottom());
     let first = cx.debug_bounds("grammar").unwrap();
     let second = cx.debug_bounds("improve").unwrap();
     let third = cx.debug_bounds("chat").unwrap();
     assert!(((first.size.width - second.size.width) / px(1.)).abs() <= 1.);
     assert!(((second.size.width - third.size.width) / px(1.)).abs() <= 1.);
     assert!(first.left() < second.left() && second.left() < third.left());
-    click(cx, "home-new-action");
+    menu(cx, NewQuickAction);
     fill(cx, "Accessible overflow add", "Instructions");
     click(cx, "action-save");
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.settings.custom_actions.len(), 17)
     });
-    click(cx, "manage-actions");
-    assert_eq!(
-        cx.debug_bounds("notifications-footer").unwrap().size.height,
-        px(48.)
-    );
+    menu(cx, AdjustQuickActions);
+    assert_eq!(cx.debug_bounds("status").unwrap().size.height, px(28.));
     click(cx, "new-action");
     click(cx, "action-cancel");
     cx.read_entity(&app, |app, _| {
@@ -686,19 +1066,14 @@ fn home_overflow_preserves_three_column_cards_fixed_footer_and_reachable_create(
 }
 
 #[gpui::test]
-fn repeated_save_shortcut_cannot_send_retained_home_draft(cx: &mut TestAppContext) {
+fn repeated_save_shortcut_saves_once_and_sends_nothing_from_home(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
-    cx.simulate_input("Private Home draft");
     click(cx, "add-action");
     fill(cx, "Once", "Instructions");
     cx.simulate_keystrokes("cmd-enter cmd-enter cmd-enter");
-    cx.read_entity(&app, |app, cx| {
+    cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Launcher);
         assert_eq!(app.settings.custom_actions.len(), 1);
-        assert_eq!(
-            app.launcher_input.read(cx).content.as_ref(),
-            "Private Home draft"
-        );
     });
     assert_eq!(backend.request_count(), 0);
 }
@@ -706,7 +1081,7 @@ fn repeated_save_shortcut_cannot_send_retained_home_draft(cx: &mut TestAppContex
 #[gpui::test]
 fn login_shortcut_cannot_bypass_dirty_editor_or_confirmation_focus(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.update(|window, cx| app.update(cx, |app, cx| app.open_action_editor(None, window, cx)));
     cx.run_until_parked();
     fill(cx, "Private draft", "Instructions");
@@ -777,10 +1152,12 @@ fn retained_home_manager_new_and_edit_focus_reactivate_with_enter_after_pop(
     let custom = action("Saved", None);
     let id = custom.id;
     seed(&app, cx, custom);
-    tab_to(&app, cx, "manage-actions");
-    cx.simulate_keystrokes("enter escape");
-    assert!(control_focused(&app, cx, "manage-actions"));
-    cx.simulate_keystrokes("enter");
+    // The menu command preserves the focused Home pad in its pop lifecycle.
+    tab_to(&app, cx, "summarize");
+    menu(cx, AdjustQuickActions);
+    cx.simulate_keystrokes("escape");
+    assert!(control_focused(&app, cx, "summarize"));
+    menu(cx, AdjustQuickActions);
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::ActionManager)
     });
@@ -811,7 +1188,7 @@ fn delete_cancel_failure_and_success_restore_only_mounted_controls(cx: &mut Test
     let custom = action("Delete target", None);
     let id = custom.id;
     seed(&app, cx, custom);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     tab_to(&app, cx, &format!("delete-{id}"));
     cx.simulate_keystrokes("enter escape");
     assert!(control_focused(&app, cx, &format!("delete-{id}")));
@@ -1018,7 +1395,7 @@ fn injected_paste_action_preserves_multiline_prompt_without_clipboard_reads(
     cx.run_until_parked();
     click(cx, &format!("custom-{id}"));
     assert_eq!(
-        backend.request(0).1[0].content,
+        backend.request(0).1[1].content,
         "First rule\nSecond rule\nThird"
     );
 }
@@ -1029,7 +1406,7 @@ fn held_model_activation_does_not_reopen_or_reset_selected_override(cx: &mut Tes
     let original = action("Override", Some("test/override"));
     let id = original.id;
     seed(&app, cx, original);
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("edit-{id}"));
     click(cx, "model-select");
     cx.simulate_keystrokes("down");
@@ -1060,7 +1437,7 @@ fn scoped_catalog_result_refreshes_retained_editor_without_request(cx: &mut Test
     let (app, backend, cx) = setup(cx);
     click(cx, "add-action");
     fill(cx, "Retained", "Instructions");
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     cx.update(|_, cx| {
         app.update(cx, |app, _| {
             app.tx
@@ -1118,7 +1495,7 @@ fn home_and_manager_scroll_restore_and_tab_reveals_trailing_controls(cx: &mut Te
     wheel(cx, "quick-actions-scroll", -160.);
     let home_offset = cx.read_entity(&app, |app, _| app.actions.home_scroll.offset());
     assert!(home_offset.y < px(0.));
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     wheel(cx, "action-manager-scroll", -180.);
     let manager_offset = cx.read_entity(&app, |app, _| app.actions.manager_scroll.offset());
     assert!(manager_offset.y < px(0.));
@@ -1150,7 +1527,7 @@ fn home_and_manager_scroll_restore_and_tab_reveals_trailing_controls(cx: &mut Te
         lower_home
     );
     cx.simulate_keystrokes("enter escape");
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     tab_to(&app, cx, &format!("delete-{last}"));
     let delete = cx
         .debug_bounds(Box::leak(format!("delete-{last}").into_boxed_str()))
@@ -1181,6 +1558,9 @@ fn editor_outer_scroll_survives_settings_cover_and_tab_reveals_instructions(
     cx: &mut TestAppContext,
 ) {
     let (app, _, cx) = setup(cx);
+    // The window fits the whole editor; shorten it so the editor overflows
+    // by more than the wheel distance even after the model popup closes.
+    cx.simulate_resize(size(px(486.), px(370.)));
     click(cx, "add-action");
     click(cx, "model-select");
     wheel(cx, "action-editor-scroll", -110.);
@@ -1188,7 +1568,7 @@ fn editor_outer_scroll_survives_settings_cover_and_tab_reveals_instructions(
         app.actions.editor.as_ref().unwrap().scroll.offset()
     });
     assert!(offset.y < px(0.));
-    click(cx, "settings");
+    menu(cx, OpenSettings);
     click(cx, "back");
     assert_eq!(
         cx.read_entity(&app, |app, _| app
@@ -1200,7 +1580,9 @@ fn editor_outer_scroll_survives_settings_cover_and_tab_reveals_instructions(
             .offset()),
         offset
     );
-    cx.simulate_keystrokes("escape");
+    // The Settings menu command closes the open popup before covering the editor;
+    // focus is restored to the retained model trigger.
+    assert!(cx.debug_bounds("model-option-0").is_none());
     // Tab out of the retained model trigger to the instructions field.
     cx.simulate_keystrokes("tab");
     cx.update(|window, cx| {
@@ -1215,6 +1597,7 @@ fn editor_outer_scroll_survives_settings_cover_and_tab_reveals_instructions(
                 .is_focused(window)
         )
     });
+    cx.run_until_parked();
     let field = cx.debug_bounds("action-instructions").unwrap();
     let viewport = cx.debug_bounds("action-editor-scroll").unwrap();
     assert!(field.top() >= viewport.top() && field.bottom() <= viewport.bottom());
@@ -1336,36 +1719,25 @@ fn successful_delete_redirects_saved_home_card_restore_to_mounted_launcher(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
-    cx.simulate_input("Retained Home draft");
     let original = action("Delete from Home", None);
     let id = original.id;
     seed(&app, cx, original);
     tab_to(&app, cx, &format!("custom-{id}"));
     assert!(control_focused(&app, cx, &format!("custom-{id}")));
     // Mouse Manage deliberately preserves the card focus in its pop lifecycle.
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("delete-{id}"));
     click(cx, "dialog-confirm");
     click(cx, "back");
-    cx.update(|window, cx| {
-        assert!(
-            app.read(cx)
-                .launcher_input
-                .focus_handle(cx)
-                .is_focused(window)
-        );
-    });
-    cx.read_entity(&app, |app, cx| {
+    cx.update(|window, cx| assert!(app.read(cx).focus.is_focused(window)));
+    cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Launcher);
         assert!(app.settings.custom_actions.is_empty());
-        assert_eq!(
-            app.launcher_input.read(cx).content.as_ref(),
-            "Retained Home draft"
-        );
     });
-    tab_to(&app, cx, "manage-actions");
-    cx.simulate_keystrokes("enter escape");
-    assert!(control_focused(&app, cx, "manage-actions"));
+    tab_to(&app, cx, "grammar");
+    menu(cx, AdjustQuickActions);
+    cx.simulate_keystrokes("escape");
+    assert!(control_focused(&app, cx, "grammar"));
     cx.simulate_keystrokes("escape");
     cx.read_entity(&app, |app, _| assert_eq!(app.recorded_hides, Some(1)));
     assert_eq!(backend.request_count(), 0);
@@ -1380,12 +1752,12 @@ fn canceled_or_failed_delete_preserves_saved_home_card_restore_and_activation(
     let id = original.id;
     seed(&app, cx, original);
     tab_to(&app, cx, &format!("custom-{id}"));
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     click(cx, &format!("delete-{id}"));
     click(cx, "dialog-cancel");
     click(cx, "back");
     assert!(control_focused(&app, cx, &format!("custom-{id}")));
-    click(cx, "manage-actions");
+    menu(cx, AdjustQuickActions);
     cx.update(|_, cx| {
         app.update(cx, |app, _| {
             app.actions.persist = Some(Box::new(|_| Err(settings::SettingsError::Write)));
@@ -1398,7 +1770,7 @@ fn canceled_or_failed_delete_preserves_saved_home_card_restore_and_activation(
     cx.simulate_keystrokes("enter");
     assert_eq!(backend.request_count(), 1);
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Writing);
+        assert_eq!(app.current_screen(), Screen::Chat);
         assert_eq!(app.settings.custom_actions[0].id, id);
     });
     backend.finish(0, Ok("Controlled result".into()));

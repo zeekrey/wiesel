@@ -61,6 +61,7 @@ impl<T, L> Navigation<T, L> {
     }
 
     /// Number of mounted entries, including the permanent root.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn depth(&self) -> usize {
         self.children.len() + 1
     }

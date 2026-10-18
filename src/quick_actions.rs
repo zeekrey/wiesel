@@ -22,7 +22,7 @@ pub struct CustomActionFields {
     pub instructions: String,
 }
 
-/// Persisted user action. Built-in QuickAction values remain separate.
+/// Persisted editable action, including built-ins with stable reserved IDs.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomQuickAction {
     pub id: Uuid,
@@ -249,6 +249,42 @@ pub const QUICK_ACTIONS: [QuickAction; 6] = [
 ];
 
 impl QuickAction {
+    /// Reserved identities distinguish editable built-ins from user-created actions.
+    pub fn persistent_id(self) -> Uuid {
+        let index = match self {
+            Self::FixSpelling => 0,
+            Self::Rewrite => 1,
+            Self::Chat => 2,
+            Self::Summarize => 3,
+            Self::Explain => 4,
+            Self::Add => 5,
+        };
+        Uuid::from_u128(0x7769_6573_656c_4000_8000_0000_0000_0000 + index)
+    }
+
+    pub fn from_persistent_id(id: Uuid) -> Option<Self> {
+        QUICK_ACTIONS
+            .into_iter()
+            .find(|action| *action != Self::Add && action.persistent_id() == id)
+    }
+
+    pub fn editable(self, settings: &Settings) -> CustomQuickAction {
+        let instructions = match self.prompt(settings) {
+            Some(prompt) if !has_prompt_variables(prompt) => format!("{prompt}\n\n{{selection}}"),
+            Some(prompt) => prompt.to_owned(),
+            None => "You are a helpful, clear and concise assistant.".into(),
+        };
+        CustomQuickAction::from_fields(
+            self.persistent_id(),
+            CustomActionFields {
+                name: self.title().into(),
+                icon: self.icon().into(),
+                model_override: None,
+                instructions,
+            },
+        )
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::FixSpelling => "grammar",
@@ -308,11 +344,84 @@ impl QuickAction {
     }
 }
 
+pub fn has_prompt_variables(instructions: &str) -> bool {
+    instructions.contains("{selection}") || instructions.contains("{clipboard}")
+}
+
+/// Substitute only tokens in the template, never tokens in inserted source text.
+/// Returns None when the expanded prompt exceeds the 100 KB action input limit.
+pub fn expand_prompt(instructions: &str, selection: &str, clipboard: &str) -> Option<String> {
+    let mut expanded = String::with_capacity(instructions.len());
+    let mut remaining = instructions;
+    while let Some(index) = remaining.find('{') {
+        let prefix = &remaining[..index];
+        remaining = &remaining[index..];
+        let (replacement, rest) = if let Some(rest) = remaining.strip_prefix("{selection}") {
+            (selection, rest)
+        } else if let Some(rest) = remaining.strip_prefix("{clipboard}") {
+            (clipboard, rest)
+        } else {
+            ("{", &remaining[1..])
+        };
+        if prefix.len() + replacement.len() > 100_000 - expanded.len() {
+            return None;
+        }
+        expanded.push_str(prefix);
+        expanded.push_str(replacement);
+        remaining = rest;
+    }
+    if remaining.len() > 100_000 - expanded.len() {
+        return None;
+    }
+    expanded.push_str(remaining);
+    Some(expanded)
+}
+
 #[cfg(test)]
 mod custom_action_tests {
     use super::*;
     use crate::theme::Assets;
     use gpui::AssetSource;
+
+    #[test]
+    fn prompt_variables_replace_repeated_tokens_without_recursing_into_source_text() {
+        assert_eq!(
+            expand_prompt(
+                "Fix:\n{selection}\n{clipboard}\n{selection} {unknown}",
+                "café {clipboard}",
+                "copied {selection}"
+            ),
+            Some("Fix:\ncafé {clipboard}\ncopied {selection}\ncafé {clipboard} {unknown}".into())
+        );
+    }
+
+    #[test]
+    fn prompt_expansion_bounds_the_total_size_including_repeated_variables() {
+        let source = "x".repeat(50_000);
+        assert_eq!(
+            expand_prompt("{selection}{selection}", &source, "")
+                .unwrap()
+                .len(),
+            100_000
+        );
+        assert!(expand_prompt("{selection}{selection}!", &source, "").is_none());
+        assert!(expand_prompt("{clipboard}", "", &"x".repeat(100_001)).is_none());
+    }
+
+    #[test]
+    fn builtin_actions_have_stable_unique_editable_identities_and_selection_templates() {
+        let settings = Settings::default();
+        let actions = settings.actions();
+        validate_custom_actions(&actions).unwrap();
+        assert_eq!(actions.len(), 5);
+        for action in actions {
+            let builtin = QuickAction::from_persistent_id(action.id).unwrap();
+            assert_eq!(action.id, builtin.editable(&settings).id);
+            if builtin != QuickAction::Chat {
+                assert!(action.instructions.contains("{selection}"));
+            }
+        }
+    }
 
     fn fields() -> CustomActionFields {
         CustomActionFields {
