@@ -7,6 +7,8 @@ pub struct ModelPicker {
     pub models: Vec<String>,
     pub loading: bool,
     open: bool,
+    include_default: bool,
+    mouse_dismissed: bool,
     highlighted: usize,
     search: Entity<TextInput>,
     focus: FocusHandle,
@@ -35,11 +37,30 @@ impl ModelPicker {
             models: vec![],
             loading: false,
             open: false,
+            include_default: false,
+            mouse_dismissed: false,
             highlighted: 0,
             search,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
         }
+    }
+    pub fn with_default(mut self) -> Self {
+        self.include_default = true;
+        self.focus = self.focus.tab_stop(true);
+        self
+    }
+    pub fn take_mouse_dismissal(&mut self) -> bool {
+        std::mem::take(&mut self.mouse_dismissed)
+    }
+    pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let was_open = self.open;
+        self.open = false;
+        if was_open {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+        was_open
     }
     pub fn begin_load(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
@@ -56,10 +77,20 @@ impl ModelPicker {
     }
     fn filtered(&self, cx: &App) -> Vec<String> {
         let query = &self.search.read(cx).content;
-        self.models
-            .iter()
-            .filter(|model| matches_query(model, query))
-            .cloned()
+        std::iter::once("")
+            .filter(|_| self.include_default)
+            .chain(self.models.iter().map(String::as_str))
+            .filter(|model| {
+                matches_query(
+                    if model.is_empty() {
+                        "Default model"
+                    } else {
+                        model
+                    },
+                    query,
+                )
+            })
+            .map(str::to_owned)
             .collect()
     }
     fn select(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -69,6 +100,16 @@ impl ModelPicker {
         cx.notify();
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+        {
+            return;
+        }
+        if event.is_held && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+            cx.stop_propagation();
+            return;
+        }
         if !self.open {
             if matches!(event.keystroke.key.as_str(), "enter" | "space" | "down") {
                 self.open = true;
@@ -112,11 +153,8 @@ impl Render for ModelPicker {
         let selected = self.selected.clone();
         div()
             .id("model-picker")
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                if this.open {
-                    this.open = false;
-                    cx.notify();
-                }
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.mouse_dismissed = this.close(window, cx);
             }))
             .w_full()
             .flex_shrink_0()
@@ -128,6 +166,11 @@ impl Render for ModelPicker {
             .child(
                 div()
                     .id("model-select")
+                    .debug_selector(|| "model-select".into())
+                    .role(Role::Button)
+                    .aria_label("Choose model")
+                    .aria_expanded(self.open)
+                    .accessibility_id("wiesel.model.select")
                     .w_full()
                     .min_h(px(40.))
                     .flex_shrink_0()
@@ -138,18 +181,27 @@ impl Render for ModelPicker {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgba(theme::INPUT_BORDER))
-                    .bg(rgb(theme::CARD))
+                    .border_color(rgba(theme::p().input_border))
+                    .bg(rgb(theme::p().card))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::ACCENT)))
+                    .hover(|s| s.bg(rgb(theme::p().accent)))
                     .child(if selected.is_empty() {
-                        "Select a model…".to_owned()
+                        if self.include_default {
+                            "Default model · follows app setting"
+                        } else {
+                            "Select a model…"
+                        }
+                        .to_owned()
                     } else {
                         selected
                     })
                     .child(if self.open { "▴" } else { "▾" })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open = !this.open;
+                        this.mouse_dismissed = false;
+                        if !this.open {
+                            window.focus(&this.focus, cx);
+                        }
                         if this.open {
                             this.highlighted = 0;
                             this.search.update(cx, |input, cx| input.set("", cx));
@@ -169,8 +221,8 @@ impl Render for ModelPicker {
                         .p_2()
                         .rounded_md()
                         .border_1()
-                        .border_color(rgba(theme::INPUT_BORDER))
-                        .bg(rgb(theme::CARD))
+                        .border_color(rgba(theme::p().input_border))
+                        .bg(rgb(theme::p().card))
                         .child(self.search.clone())
                         .child(
                             div()
@@ -189,6 +241,14 @@ impl Render for ModelPicker {
                                     let model = model.clone();
                                     div()
                                         .id(("model-option", index))
+                                        .debug_selector(move || format!("model-option-{index}"))
+                                        .role(Role::Button)
+                                        .aria_selected(model == self.selected)
+                                        .aria_label(if model.is_empty() {
+                                            "Default model".to_owned()
+                                        } else {
+                                            model.clone()
+                                        })
                                         .min_h(px(34.))
                                         .flex_shrink_0()
                                         .px_3()
@@ -197,15 +257,19 @@ impl Render for ModelPicker {
                                         .cursor_pointer()
                                         .rounded_sm()
                                         .bg(rgb(if index == self.highlighted {
-                                            theme::ACCENT
+                                            theme::p().accent
                                         } else {
-                                            theme::CARD
+                                            theme::p().card
                                         }))
-                                        .hover(|s| s.bg(rgb(theme::ACCENT)))
+                                        .hover(|s| s.bg(rgb(theme::p().accent)))
                                         .child(format!(
                                             "{}{}",
                                             if model == self.selected { "✓ " } else { "" },
-                                            model
+                                            if model.is_empty() {
+                                                "Default model · follows app setting"
+                                            } else {
+                                                &model
+                                            }
                                         ))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.select(model.clone(), window, cx)
@@ -215,7 +279,7 @@ impl Render for ModelPicker {
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(rgb(theme::p().muted))
                                 .child(format!(
                                     "{} of {} models · ↑↓ navigate · Enter selects · Esc closes",
                                     options.len(),
@@ -224,6 +288,11 @@ impl Render for ModelPicker {
                         ),
                 )
             })
+    }
+}
+impl Focusable for ModelPicker {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 #[cfg(test)]
