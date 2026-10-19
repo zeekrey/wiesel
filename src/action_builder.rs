@@ -45,7 +45,7 @@ impl ActionBuilder {
 pub(super) struct Editor {
     pub name: Entity<TextInput>,
     pub(super) instructions: Entity<TextInput>,
-    pub(super) model: Entity<model_picker::ModelPicker>,
+    pub(super) model: Entity<tier_picker::TierPicker>,
     icon: &'static str,
     icon_open: bool,
     initial: CustomActionFields,
@@ -56,11 +56,14 @@ pub(super) struct Editor {
 }
 impl Editor {
     fn fields(&self, cx: &App) -> CustomActionFields {
+        // Sharp is the default, so choosing it keeps following the default.
         let selected = &self.model.read(cx).selected;
         CustomActionFields {
             name: self.name.read(cx).content.to_string(),
             icon: self.icon.into(),
-            model_override: (!selected.is_empty()).then(|| selected.clone()),
+            model_override: selected
+                .clone()
+                .filter(|model| *model != ActionModel::Tier(Tier::Sharp)),
             instructions: self.instructions.read(cx).content.to_string(),
         }
     }
@@ -179,16 +182,19 @@ impl Wiesel {
         if self.busy {
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        let model = action.effective_model(&self.settings);
+        let local = model.local();
+        if !local && !self.signed_in() {
+            self.show_account_tab(cx);
             self.push_settings(false, window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
             return;
         }
-        let model = action.effective_model(&self.settings).to_owned();
         let picker = self.model_picker.read(cx);
-        if (QuickAction::from_persistent_id(action.id).is_none() || action.model_override.is_some())
-            && (picker.loading || !picker.models.contains(&model))
+        if !local
+            && (QuickAction::from_persistent_id(action.id).is_none() || action.pins_model())
+            && (picker.loading || !picker.models.contains(&model.id))
         {
             self.notifications.warning("This action's model is unavailable. Edit the action to pick another; no request was sent.");
             cx.notify();
@@ -197,7 +203,7 @@ impl Wiesel {
         let Some(messages) = self.action_messages(&action.instructions, false, cx) else {
             return;
         };
-        if self.valid_credential(cx).is_none() {
+        if !local && self.valid_credential(cx).is_none() {
             return;
         }
         if QuickAction::from_persistent_id(action.id).is_none() {
@@ -497,12 +503,25 @@ impl Wiesel {
                 .with_tab_stop()
         });
         instructions.update(cx, |input, cx| input.set(initial.instructions.clone(), cx));
+        let selected = initial
+            .model_override
+            .clone()
+            .unwrap_or(ActionModel::Tier(Tier::Sharp));
+        // Catalogs are shared with Settings and kept current by update_catalogs.
+        let (ollama, wiesel) = {
+            let settings = self.tier_pickers[0].read(cx);
+            (settings.ollama.clone(), settings.wiesel.clone())
+        };
         let model = cx.new(|cx| {
-            model_picker::ModelPicker::new(initial.model_override.clone().unwrap_or_default(), cx)
-                .with_default()
+            let mut picker = tier_picker::TierPicker::new("model", Some(selected), cx).with_tiers();
+            picker.ollama = ollama;
+            picker.wiesel = wiesel;
+            picker
         });
-        let catalog = self.model_picker.read(cx).models.clone();
-        model.update(cx, |picker, cx| picker.finish_load(Ok(catalog), cx));
+        cx.subscribe(&model, |this, _, notification: &Notification, cx| {
+            this.input_notification(notification, cx)
+        })
+        .detach();
         for input in [&name, &instructions] {
             cx.subscribe(input, |this, _, notification: &Notification, cx| {
                 this.input_notification(notification, cx)
@@ -524,13 +543,6 @@ impl Wiesel {
         });
         self.actions.error = None;
         self.push_screen(Screen::ActionEditor, false, window, cx);
-    }
-    pub(super) fn update_action_catalog(&mut self, models: Vec<String>, cx: &mut Context<Self>) {
-        if let Some(editor) = &self.actions.editor {
-            editor
-                .model
-                .update(cx, |picker, cx| picker.finish_load(Ok(models), cx));
-        }
     }
     fn persist_actions(
         &mut self,
@@ -847,7 +859,7 @@ impl Wiesel {
                 div().id(gpui::SharedString::from(format!("action-row-{id}"))).flex().items_center().gap_3().min_h(px(52.)).flex_shrink_0().py_2().rounded(px(8.))
                     .child(theme::icon(action.icon_name().unwrap_or("wand"), 20.))
                     .child(self.builder_button(&format!("edit-{id}"), &action.name, Command::Edit(id), cx).flex_1().min_w_0().whitespace_nowrap().text_ellipsis().overflow_hidden())
-                    .child(Self::label(action.model_override.as_deref().unwrap_or("Default model")).w(px(156.)).min_w_0().text_ellipsis().whitespace_nowrap().overflow_hidden())
+                    .child(Self::label(action.model_override.as_ref().map_or("Sharp", ActionModel::label)).w(px(156.)).min_w_0().text_ellipsis().whitespace_nowrap().overflow_hidden())
                     .child(self.builder_button(&format!("delete-{id}"), "Delete", Command::Delete(id), cx).when(self.actions.read_only, |d| d.opacity(0.5).aria_description("Deletion disabled until the settings file is repaired and Wiesel relaunched")))
             }))
     }

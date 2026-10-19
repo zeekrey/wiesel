@@ -1,9 +1,15 @@
-use crate::{EventScope, ResultEvent, ResultPayload, auth::DeviceCredential, gateway};
+use crate::{EventScope, ResultEvent, ResultPayload, auth::DeviceCredential, gateway, ollama};
 use anyhow::Context as _;
 use std::sync::{Arc, mpsc};
 
+/// Where one request is sent. Ollama needs no credential and stays on this Mac.
+pub(super) enum Route {
+    Gateway(Arc<DeviceCredential>),
+    Ollama { thinking: bool },
+}
+
 pub(super) struct CompletionRequest {
-    pub credential: Arc<DeviceCredential>,
+    pub route: Route,
     pub model: String,
     pub messages: Vec<gateway::Message>,
     pub chat: bool,
@@ -24,39 +30,53 @@ impl CompletionBackend {
         match self {
             Self::Gateway => {
                 std::thread::spawn(move || {
-                    let result = request
-                        .credential
-                        .ensure_valid()
-                        .map_err(|error| {
-                            if let Some(action) = &request.diagnostic_action {
-                                action.credential_rejected();
-                            }
-                            anyhow::Error::from(error)
+                    let delta = |delta: &str| {
+                        tx.send(ResultEvent {
+                            scope: request.scope,
+                            result: ResultPayload::ChatDelta(delta.to_owned()),
                         })
-                        .and_then(|()| {
+                        .context("Chat window closed")
+                    };
+                    let result = match &request.route {
+                        Route::Gateway(credential) => credential
+                            .ensure_valid()
+                            .map_err(|error| {
+                                if let Some(action) = &request.diagnostic_action {
+                                    action.credential_rejected();
+                                }
+                                anyhow::Error::from(error)
+                            })
+                            .and_then(|()| {
+                                if request.chat {
+                                    gateway::complete_stream(
+                                        credential.access_token(),
+                                        &request.model,
+                                        &request.messages,
+                                        request.diagnostic_action.as_ref(),
+                                        delta,
+                                    )
+                                } else {
+                                    gateway::complete(
+                                        credential.access_token(),
+                                        &request.model,
+                                        &request.messages,
+                                        request.diagnostic_action.as_ref(),
+                                    )
+                                }
+                            }),
+                        Route::Ollama { thinking } => {
                             if request.chat {
-                                gateway::complete_stream(
-                                    request.credential.access_token(),
+                                ollama::complete_stream(
                                     &request.model,
                                     &request.messages,
-                                    request.diagnostic_action.as_ref(),
-                                    |delta| {
-                                        tx.send(ResultEvent {
-                                            scope: request.scope,
-                                            result: ResultPayload::ChatDelta(delta.to_owned()),
-                                        })
-                                        .context("Chat window closed")
-                                    },
+                                    *thinking,
+                                    delta,
                                 )
                             } else {
-                                gateway::complete(
-                                    request.credential.access_token(),
-                                    &request.model,
-                                    &request.messages,
-                                    request.diagnostic_action.as_ref(),
-                                )
+                                ollama::complete(&request.model, &request.messages, *thinking)
                             }
-                        });
+                        }
+                    };
                     let _ = tx.send(ResultEvent {
                         scope: request.scope,
                         result: ResultPayload::Completion(result, request.chat),
@@ -76,6 +96,7 @@ pub(super) struct ControlledBackend(std::rc::Rc<std::cell::RefCell<Vec<RecordedR
 #[cfg(test)]
 struct RecordedRequest {
     model: String,
+    local: bool,
     messages: Vec<gateway::Message>,
     chat: bool,
     scope: EventScope,
@@ -87,9 +108,12 @@ struct RecordedRequest {
 impl ControlledBackend {
     fn start(&self, request: CompletionRequest, tx: mpsc::Sender<ResultEvent>) {
         // Test credentials are ephemeral but still pass the normal validity checks.
-        request.credential.ensure_valid().unwrap();
+        if let Route::Gateway(credential) = &request.route {
+            credential.ensure_valid().unwrap();
+        }
         self.0.borrow_mut().push(RecordedRequest {
             model: request.model,
+            local: matches!(request.route, Route::Ollama { .. }),
             messages: request.messages,
             chat: request.chat,
             scope: request.scope,
@@ -110,6 +134,11 @@ impl ControlledBackend {
             request.messages.clone(),
             request.chat,
         )
+    }
+
+    /// Whether the request was routed to the local Ollama backend.
+    pub fn local(&self, index: usize) -> bool {
+        self.0.borrow()[index].local
     }
 
     pub fn delta(&self, index: usize, delta: &str) {

@@ -1,4 +1,7 @@
-use crate::{diagnostics::ModelId, settings::Settings};
+use crate::{
+    diagnostics::ModelId,
+    settings::{ActionModel, ModelChoice, Settings},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -17,8 +20,8 @@ pub const MAX_CUSTOM_ACTION_INSTRUCTION_BYTES: usize = 16 * 1024;
 pub struct CustomActionFields {
     pub name: String,
     pub icon: String,
-    /// None follows the current app default, including subsequent default changes.
-    pub model_override: Option<String>,
+    /// None follows the current default (Sharp), including subsequent changes.
+    pub model_override: Option<ActionModel>,
     pub instructions: String,
 }
 
@@ -29,7 +32,7 @@ pub struct CustomQuickAction {
     pub name: String,
     pub icon: String,
     #[serde(default)]
-    pub model_override: Option<String>,
+    pub model_override: Option<ActionModel>,
     pub instructions: String,
 }
 
@@ -78,7 +81,7 @@ impl CustomActionFields {
         validate_custom_fields(
             &self.name,
             &self.icon,
-            self.model_override.as_deref(),
+            self.model_override.as_ref(),
             &self.instructions,
         )
     }
@@ -112,14 +115,23 @@ impl CustomQuickAction {
         validate_custom_fields(
             &self.name,
             &self.icon,
-            self.model_override.as_deref(),
+            self.model_override.as_ref(),
             &self.instructions,
         )
     }
 
-    /// Resolve at dispatch time; None always follows the current app default.
-    pub fn effective_model<'a>(&'a self, settings: &'a Settings) -> &'a str {
-        self.model_override.as_deref().unwrap_or(&settings.model)
+    /// Resolve at dispatch time; None always follows the current default tier.
+    pub fn effective_model(&self, settings: &Settings) -> ModelChoice {
+        match &self.model_override {
+            None => settings.default_model(),
+            Some(ActionModel::Tier(tier)) => settings.tier_model(*tier),
+            Some(ActionModel::Model(choice)) => choice.clone(),
+        }
+    }
+
+    /// Pinned to one model, rather than following a tier from Settings.
+    pub fn pins_model(&self) -> bool {
+        matches!(self.model_override, Some(ActionModel::Model(_)))
     }
 
     /// Convert a validated embedded icon key to the static key used by theme::icon.
@@ -135,7 +147,7 @@ impl CustomQuickAction {
 fn validate_custom_fields(
     name: &str,
     icon: &str,
-    model_override: Option<&str>,
+    model_override: Option<&ActionModel>,
     instructions: &str,
 ) -> Result<(), CustomActionError> {
     if name.trim().is_empty() {
@@ -155,7 +167,10 @@ fn validate_custom_fields(
     if !CUSTOM_ACTION_ICONS.contains(&icon) {
         return Err(CustomActionError::UnsupportedIcon);
     }
-    if model_override.is_some_and(|model| ModelId::parse(model).is_none()) {
+    if model_override
+        .and_then(ActionModel::choice)
+        .is_some_and(|choice| ModelId::parse(&choice.id).is_none())
+    {
         return Err(CustomActionError::InvalidModel);
     }
     if instructions.trim().is_empty() {
@@ -451,9 +466,14 @@ mod custom_action_tests {
     fn default_model_follows_subsequent_settings_changes() {
         let mut settings = Settings::default();
         let action = action(1);
-        assert_eq!(action.effective_model(&settings), "openai/gpt-4o-mini");
+        assert_eq!(action.effective_model(&settings).id, "openai/gpt-4o-mini");
         settings.model = "test/new-default".into();
-        assert_eq!(action.effective_model(&settings), "test/new-default");
+        assert_eq!(action.effective_model(&settings).id, "test/new-default");
+        settings.models.sharp = Some(ModelChoice::ollama("llama3:8b"));
+        assert_eq!(
+            action.effective_model(&settings),
+            ModelChoice::ollama("llama3:8b")
+        );
     }
 
     #[test]
@@ -462,7 +482,10 @@ mod custom_action_tests {
         let mut fields = fields();
         fields.model_override = Some("anthropic/claude:latest".into());
         let action = CustomQuickAction::new(fields).unwrap();
-        assert_eq!(action.effective_model(&settings), "anthropic/claude:latest");
+        assert_eq!(
+            action.effective_model(&settings),
+            ModelChoice::wiesel("anthropic/claude:latest")
+        );
         assert_eq!(settings.model, "openai/gpt-4o-mini");
     }
 
@@ -609,11 +632,11 @@ mod custom_action_tests {
             "模型".into(),
         ] {
             let mut input = fields();
-            input.model_override = Some(model);
+            input.model_override = Some(model.into());
             assert_eq!(input.validate(), Err(CustomActionError::InvalidModel));
         }
         let mut input = fields();
-        input.model_override = Some("a".repeat(128));
+        input.model_override = Some("a".repeat(128).into());
         assert!(input.validate().is_ok());
     }
 

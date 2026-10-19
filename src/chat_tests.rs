@@ -27,6 +27,10 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         active_request: None,
         recorded_hides: Some(0),
         model_picker: cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx)),
+        tier_pickers: Wiesel::new_tier_pickers(&settings, cx),
+        provider_tab: Wiesel::initial_provider_tab(&settings),
+        ollama_status: None,
+        ollama_checking: false,
         settings,
         actions: action_builder::ActionBuilder::fixture(),
         diagnostics: None,
@@ -486,12 +490,27 @@ fn setup_settings(cx: &mut TestAppContext) -> (Entity<Wiesel>, &mut VisualTestCo
 #[gpui::test]
 fn settings_tab_and_shift_tab_reach_both_diagnostic_controls(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
+    let tier_focused = |index: usize, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            let picker = app.read(cx).tier_pickers[index].clone();
+            assert!(picker.focus_handle(cx).is_focused(window));
+        })
+    };
+    // Account, then the three tier pickers, then diagnostics.
+    for index in 0..3 {
+        cx.simulate_keystrokes("tab");
+        tier_focused(index, cx);
+    }
     cx.simulate_keystrokes("tab");
     cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
     cx.simulate_keystrokes("tab");
     cx.update(|window, cx| assert!(app.read(cx).diagnostics_clear_focus.is_focused(window)));
     cx.simulate_keystrokes("shift-tab");
     cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
+    for index in (0..3).rev() {
+        cx.simulate_keystrokes("shift-tab");
+        tier_focused(index, cx);
+    }
     cx.simulate_keystrokes("shift-tab");
     cx.update(|window, cx| assert!(app.read(cx).login_focus.is_focused(window)));
 }
@@ -1293,4 +1312,187 @@ fn navigation_stale_failure_settles_ended_sessions_exact_physical_slot_without_d
         assert!(app.composer.read(cx).content.is_empty());
     });
     assert_eq!(backend.request_count(), 1);
+}
+
+fn use_sharp(app: &mut Wiesel, model: ModelChoice) {
+    app.settings.models.sharp = Some(model);
+}
+
+#[gpui::test]
+fn ollama_sharp_tier_serves_chat_without_sign_in(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        app.authenticated = false;
+        app.session.credential = None;
+        app.settings.onboarded = false;
+        use_sharp(app, ModelChoice::ollama("qwen3.5:0.8b"));
+    });
+    open_chat(&app, cx);
+    cx.simulate_input("Hello local");
+    click(cx, "send");
+    assert_eq!(backend.request_count(), 1);
+    assert!(backend.local(0));
+    assert_eq!(backend.request(0).0, "qwen3.5:0.8b");
+    backend.delta(0, "Hi");
+    backend.finish(0, Ok("Hi there".into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            history(&app.messages),
+            vec![("user", "Hello local"), ("assistant", "Hi there")]
+        );
+        assert!(!app.busy);
+    });
+}
+
+#[gpui::test]
+fn each_model_routes_to_its_own_provider(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, cx| {
+        use_sharp(app, ModelChoice::ollama("llama3:8b"));
+        app.model_picker.update(cx, |picker, cx| {
+            picker.finish_load(Ok(vec!["test/pinned".into()]), cx)
+        });
+    });
+    // Built-in actions follow the Sharp tier, here a local model.
+    open_chat(&app, cx);
+    cx.simulate_input("Local");
+    click(cx, "send");
+    assert!(backend.local(0));
+    assert_eq!(backend.request(0).0, "llama3:8b");
+    backend.finish(0, Ok("Done".into()));
+    receive_results(&app, cx);
+
+    // A custom action pinned to a Wiesel model still uses the gateway.
+    let action = quick_actions::CustomQuickAction::new(quick_actions::CustomActionFields {
+        name: "Pinned".into(),
+        icon: "wand".into(),
+        model_override: Some("test/pinned".into()),
+        instructions: "Answer briefly.".into(),
+    })
+    .unwrap();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.run_custom_action(action, window, cx));
+    });
+    assert!(!backend.local(1));
+    assert_eq!(backend.request(1).0, "test/pinned");
+    backend.finish(1, Ok("Done".into()));
+    receive_results(&app, cx);
+
+    // Clearing the tier returns the default to the Wiesel catalog model.
+    app.update(cx, |app, cx| {
+        app.assign_tier(Tier::Sharp, None, cx);
+        app.new_chat(cx);
+    });
+    cx.read_entity(&app, |app, _| assert!(app.settings.models.sharp.is_none()));
+    cx.simulate_input("Cloud");
+    click(cx, "send");
+    assert!(!backend.local(2));
+    assert_eq!(backend.request(2).0, "test/chat-model");
+}
+
+#[gpui::test]
+fn wiesel_tier_requires_sign_in(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    open_chat(&app, cx);
+    app.update(cx, |app, _| {
+        app.authenticated = false;
+        use_sharp(app, ModelChoice::wiesel("test/chat-model"));
+    });
+    cx.simulate_input("Hello");
+    click(cx, "send");
+    assert_eq!(backend.request_count(), 0);
+    cx.read_entity(&app, |app, cx| {
+        assert_eq!(app.composer.read(cx).content.as_ref(), "Hello");
+    });
+}
+
+#[gpui::test]
+fn ollama_failures_use_local_copy(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, _| use_sharp(app, ModelChoice::ollama("m")));
+    open_chat(&app, cx);
+    cx.simulate_input("Hello");
+    click(cx, "send");
+    backend.finish(0, Err(ollama::OllamaError("Ollama is not running.").into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, cx| {
+        assert!(app.messages.is_empty());
+        assert_eq!(app.composer.read(cx).content.as_ref(), "Hello");
+        // The failure triggers a re-probe so Settings reflects the new state.
+        assert!(app.ollama_checking);
+    });
+}
+
+#[gpui::test]
+fn catalogs_fill_every_tier_picker_and_picks_persist(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    app.update(cx, |app, cx| {
+        app.observe_tier_pickers(cx);
+        app.refresh_ollama(cx);
+        assert!(app.ollama_checking);
+        let scope = app.session.scope();
+        for result in [
+            ResultPayload::Ollama(ollama::Status::Running {
+                version: "0.40.6".into(),
+                models: vec![ollama::LocalModel {
+                    name: "qwen3.5:0.8b".into(),
+                    thinking: true,
+                }],
+            }),
+            ResultPayload::Models(Ok(vec!["test/sage".into()])),
+        ] {
+            app.tx.send(ResultEvent { scope, result }).unwrap();
+        }
+    });
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, cx| {
+        assert!(!app.ollama_checking);
+        for picker in &app.tier_pickers {
+            assert_eq!(picker.read(cx).ollama.models, ["qwen3.5:0.8b"]);
+            assert_eq!(picker.read(cx).wiesel.models, ["test/sage"]);
+        }
+    });
+    // Choosing in Settings persists the tier.
+    cx.simulate_resize(size(px(800.), px(2400.)));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.push_settings(false, window, cx);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    click(cx, "tier-sage-select");
+    // Option 0 is "Not set", 1 the Ollama model, 2 the Wiesel model.
+    click(cx, "tier-sage-option-2");
+    click(cx, "tier-swift-select");
+    click(cx, "tier-swift-option-1");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            app.settings.models.sage,
+            Some(ModelChoice::wiesel("test/sage"))
+        );
+        assert_eq!(
+            app.settings.models.swift,
+            Some(ModelChoice::ollama("qwen3.5:0.8b"))
+        );
+        assert!(app.ollama_status.as_ref().unwrap().thinking("qwen3.5:0.8b"));
+    });
+}
+
+#[gpui::test]
+fn settings_switches_between_provider_tabs(cx: &mut TestAppContext) {
+    let (app, cx) = setup_settings(cx);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.provider_tab, Provider::Wiesel)
+    });
+    click(cx, "provider-tab-ollama");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.provider_tab, Provider::Ollama)
+    });
+    // Sign-in entry points reveal the account tab again.
+    cx.update(|window, cx| app.update(cx, |app, cx| app.start_login(window, cx)));
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.provider_tab, Provider::Wiesel)
+    });
 }

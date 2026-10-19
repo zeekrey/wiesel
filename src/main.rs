@@ -15,11 +15,13 @@ mod input;
 mod model_picker;
 mod navigation;
 mod notifications;
+mod ollama;
 mod quick_actions;
 mod selection;
 mod settings;
 mod settings_view;
 mod theme;
+mod tier_picker;
 
 use auth::{AuthError, DesktopClient, DeviceCredential};
 use diagnostics::{
@@ -37,7 +39,7 @@ use input::TextInput;
 use navigation::{EntryId, Navigation};
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::QuickAction;
-use settings::Settings;
+use settings::{ActionModel, ModelChoice, Provider, Settings, Tier};
 use std::{
     str::FromStr,
     sync::{Arc, mpsc},
@@ -509,6 +511,7 @@ enum ResultPayload {
     ChatDelta(String),
     Completion(anyhow::Result<String>, bool),
     SignOut(Result<(), AuthError>),
+    Ollama(ollama::Status),
 }
 #[derive(Clone, Copy)]
 enum DiagnosticControl {
@@ -606,6 +609,12 @@ struct Wiesel {
     device_status: Option<auth::DeviceStatus>,
     recovery: CredentialRecovery,
     model_picker: Entity<model_picker::ModelPicker>,
+    /// One picker per `Tier::ALL` entry.
+    tier_pickers: Vec<Entity<tier_picker::TierPicker>>,
+    /// Provider shown in the Settings switch.
+    provider_tab: Provider,
+    ollama_status: Option<ollama::Status>,
+    ollama_checking: bool,
     composer: Entity<TextInput>,
     focus: FocusHandle,
     recording: bool,
@@ -622,7 +631,7 @@ struct Wiesel {
     writing_title: String,
     messages: Vec<Message>,
     // User-created actions start chats with a fixed model and expanded first turn.
-    chat_action_model: Option<String>,
+    chat_action_model: Option<ModelChoice>,
     tx: mpsc::Sender<ResultEvent>,
     rx: mpsc::Receiver<ResultEvent>,
     chat_scroll: ScrollHandle,
@@ -639,7 +648,8 @@ impl Wiesel {
         match self.current_screen() {
             Screen::Launcher => self.focus.clone(),
             Screen::Chat => self.composer.focus_handle(cx),
-            Screen::Settings => self.login_focus.clone(),
+            Screen::Settings if self.provider_tab == Provider::Wiesel => self.login_focus.clone(),
+            Screen::Settings => self.focus.clone(),
             Screen::Writing | Screen::ActionManager => self.focus.clone(),
             Screen::ActionEditor => self
                 .actions
@@ -856,6 +866,8 @@ impl Wiesel {
             }
         };
         let model_picker = cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx));
+        let tier_pickers = Self::new_tier_pickers(&settings, cx);
+        let provider_tab = Self::initial_provider_tab(&settings);
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             navigation: Navigation::new(Screen::Launcher),
@@ -879,6 +891,10 @@ impl Wiesel {
             manager,
             hotkey: None,
             model_picker,
+            tier_pickers,
+            provider_tab,
+            ollama_status: None,
+            ollama_checking: false,
             session: DesktopSession {
                 credential,
                 ..Default::default()
@@ -928,6 +944,7 @@ impl Wiesel {
             },
         )
         .detach();
+        app.observe_tier_pickers(cx);
         // The shortcut also works before browser login and onboarding are complete.
         if let Err(e) = app.register(&app.settings.hotkey.clone()) {
             app.notifications.report(
@@ -951,6 +968,11 @@ impl Wiesel {
         app.poll_diagnostics(cx);
         app.sync_permission_issue();
         app.refresh_status(true, cx);
+        app.refresh_ollama(cx);
+        // A local model needs no sign-in, so startup can go straight to the launcher.
+        if app.settings.default_model().local() {
+            app.finish_startup_navigation(true, window, cx);
+        }
         app
     }
     // Called only by the production entry point, never by in-process UI fixtures.
@@ -1232,7 +1254,7 @@ impl Wiesel {
         }
     }
     fn idle_notification(&self) -> Notification {
-        if !self.authenticated {
+        if !self.can_request() {
             Notification::new(Severity::Warning, "Log in to Wiesel in Settings (⌘⇧L).")
         } else if let Some(text) = &self.selection.text {
             Notification::new(
@@ -1405,6 +1427,10 @@ impl Wiesel {
             {
                 continue;
             }
+            if let ResultPayload::Ollama(status) = event.result {
+                self.finish_ollama(status, cx);
+                continue;
+            }
             if !self.session.accepts(event.scope) {
                 // Discard payloads from ended/replaced sessions. Only the exact
                 // pending physical request's terminal event can release its slot.
@@ -1505,9 +1531,14 @@ impl Wiesel {
                         gateway::failure_message(e),
                     );
                 }
-                if let Ok(models) = &result {
-                    self.update_action_catalog(models.clone(), cx);
-                }
+                let loaded = result.as_ref().ok().cloned();
+                self.update_catalogs(Provider::Wiesel, cx, move |catalog| {
+                    catalog.loading = false;
+                    if let Some(models) = &loaded {
+                        catalog.models = models.clone();
+                        catalog.note = None;
+                    }
+                });
                 self.model_picker
                     .update(cx, |picker, cx| picker.finish_load(result, cx));
             }
@@ -1543,11 +1574,16 @@ impl Wiesel {
                             self.clear_session("Device login rejected. Log in again.", cx);
                             return;
                         }
+                        let local = ollama::failure_message(&e);
                         self.notifications.issue(
                             Source::Request,
                             Severity::Error,
-                            gateway::failure_message(&e),
+                            local.unwrap_or_else(|| gateway::failure_message(&e)),
                         );
+                        // A local failure may mean Ollama stopped or lost the model.
+                        if local.is_some() {
+                            self.refresh_ollama(cx);
+                        }
                         if chat && let Some(message) = self.messages.pop() {
                             let (draft, failed) = recover_failed_draft(
                                 &self.composer.read(cx).content,
@@ -1574,6 +1610,7 @@ impl Wiesel {
                         .success("Signed out this device. Its saved credential was removed.");
                 }
             }
+            ResultPayload::Ollama(status) => self.finish_ollama(status, cx),
         }
     }
     fn login_ready(&mut self, show_launcher: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1627,7 +1664,7 @@ impl Wiesel {
             return;
         }
         if show_launcher
-            && self.authenticated
+            && self.can_request()
             && self.hotkey.is_some()
             && self.settings.onboarded
             && self.current_screen() == Screen::Settings
@@ -1645,6 +1682,7 @@ impl Wiesel {
         if self.actions.dialog.is_some() {
             return;
         }
+        self.show_account_tab(cx);
         self.push_settings(false, window, cx);
         // Revealing lower Settings may need dirty-editor confirmation. Never
         // start browser login or focus an unmounted control before that decision.
@@ -1726,6 +1764,7 @@ impl Wiesel {
                 .warning("Login link did not match. Continue in your browser or reopen login."),
         }
         if !self.authenticated {
+            self.show_account_tab(cx);
             self.push_settings(false, window, cx);
             if self.current_screen() == Screen::Settings && self.actions.dialog.is_none() {
                 window.focus(&self.login_focus, cx);
@@ -1758,9 +1797,11 @@ impl Wiesel {
         self.composer.update(cx, |input, cx| input.set("", cx));
         self.selection = selection::Capture::default();
         self.capture_scope = None;
-        self.update_action_catalog(vec![], cx);
         self.model_picker
             .update(cx, |picker, cx| picker.finish_load(Ok(vec![]), cx));
+        self.update_catalogs(Provider::Wiesel, cx, |catalog| {
+            *catalog = Self::signed_out_catalog();
+        });
         self.notifications.clear(Source::Selection);
         self.notifications.clear(Source::Models);
         self.notifications.clear(Source::Request);
@@ -1875,6 +1916,7 @@ impl Wiesel {
         };
         self.model_picker
             .update(cx, |picker, cx| picker.begin_load(cx));
+        self.update_catalogs(Provider::Wiesel, cx, |catalog| catalog.loading = true);
         self.notifications
             .working(Source::Models, "Loading model catalog…");
         let tx = self.tx.clone();
@@ -1899,28 +1941,222 @@ impl Wiesel {
             });
         });
     }
-    fn request(&mut self, messages: Vec<Message>, chat: bool, cx: &mut Context<Self>) {
-        self.request_with_model(messages, chat, self.settings.model.clone(), cx);
+    /// A local default model replaces sign-in; otherwise a verified login is required.
+    fn can_request(&self) -> bool {
+        self.settings.default_model().local() || self.signed_in()
+    }
+    fn signed_in(&self) -> bool {
+        self.authenticated && self.settings.onboarded
+    }
+    fn initial_provider_tab(settings: &Settings) -> Provider {
+        if settings.default_model().local() {
+            Provider::Ollama
+        } else {
+            Provider::Wiesel
+        }
+    }
+    /// Reveal the account controls before focusing or starting sign-in.
+    fn show_account_tab(&mut self, cx: &mut Context<Self>) {
+        if self.provider_tab != Provider::Wiesel {
+            self.provider_tab = Provider::Wiesel;
+            cx.notify();
+        }
+    }
+    fn signed_out_catalog() -> tier_picker::Catalog {
+        tier_picker::Catalog {
+            note: Some("Sign in to use Wiesel models."),
+            ..Default::default()
+        }
+    }
+    fn new_tier_pickers(
+        settings: &Settings,
+        cx: &mut Context<Self>,
+    ) -> Vec<Entity<tier_picker::TierPicker>> {
+        Tier::ALL
+            .into_iter()
+            .map(|tier| {
+                let selected = settings.models.get(tier).cloned().map(ActionModel::Model);
+                cx.new(|cx| {
+                    let mut picker = tier_picker::TierPicker::new(
+                        format!("tier-{}", tier.name().to_lowercase()),
+                        selected,
+                        cx,
+                    );
+                    picker.wiesel = Self::signed_out_catalog();
+                    picker
+                })
+            })
+            .collect()
+    }
+    fn observe_tier_pickers(&mut self, cx: &mut Context<Self>) {
+        for (tier, picker) in Tier::ALL.into_iter().zip(self.tier_pickers.clone()) {
+            cx.subscribe(&picker, |this, _, notification: &Notification, cx| {
+                this.input_notification(notification, cx);
+            })
+            .detach();
+            cx.subscribe(&picker, move |this, _, picked: &tier_picker::Picked, cx| {
+                let choice = picked.0.as_ref().and_then(ActionModel::choice).cloned();
+                this.assign_tier(tier, choice, cx);
+            })
+            .detach();
+        }
+    }
+    fn tier_picker(&self, tier: Tier) -> &Entity<tier_picker::TierPicker> {
+        let index = Tier::ALL
+            .iter()
+            .position(|t| *t == tier)
+            .unwrap_or_default();
+        &self.tier_pickers[index]
+    }
+    fn update_catalogs(
+        &self,
+        provider: Provider,
+        cx: &mut Context<Self>,
+        update: impl Fn(&mut tier_picker::Catalog),
+    ) {
+        let editor = self.actions.editor.as_ref().map(|editor| &editor.model);
+        for picker in self.tier_pickers.iter().chain(editor) {
+            picker.update(cx, |picker, cx| {
+                update(picker.catalog_mut(provider));
+                cx.notify();
+            });
+        }
+    }
+    fn refresh_ollama(&mut self, cx: &mut Context<Self>) {
+        if self.ollama_checking {
+            return;
+        }
+        self.ollama_checking = true;
+        self.update_catalogs(Provider::Ollama, cx, |catalog| catalog.loading = true);
+        // In-process fixtures never touch the network; they release status explicitly.
+        #[cfg(not(test))]
+        {
+            let tx = self.tx.clone();
+            let scope = self.session.scope();
+            std::thread::spawn(move || {
+                let _ = tx.send(ResultEvent {
+                    scope,
+                    result: ResultPayload::Ollama(ollama::status()),
+                });
+            });
+        }
+        cx.notify();
+    }
+    fn finish_ollama(&mut self, status: ollama::Status, cx: &mut Context<Self>) {
+        self.ollama_checking = false;
+        let names: Vec<String> = status
+            .models()
+            .iter()
+            .map(|model| model.name.clone())
+            .collect();
+        let note = match &status {
+            ollama::Status::NotInstalled => Some("Ollama isn't installed."),
+            ollama::Status::NotRunning => Some("Ollama isn't running."),
+            ollama::Status::Running { .. } => None,
+        };
+        self.update_catalogs(Provider::Ollama, cx, |catalog| {
+            catalog.loading = false;
+            catalog.models = names.clone();
+            catalog.note = note;
+        });
+        if self.settings.models.uses_ollama() && !matches!(status, ollama::Status::Running { .. }) {
+            self.notifications
+                .warning("Ollama is not running. Start it, or pick other models in Settings.");
+        }
+        self.ollama_status = Some(status);
+        cx.notify();
+    }
+    fn assign_tier(&mut self, tier: Tier, choice: Option<ModelChoice>, cx: &mut Context<Self>) {
+        let mut next = self.settings.clone();
+        next.models.set(tier, choice);
+        let saved = if self.actions.read_only {
+            Err(anyhow::anyhow!("Settings are read-only"))
+        } else {
+            self.persist_settings(&next)
+        };
+        match saved {
+            Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
+                self.notifications.clear(Source::Settings);
+                self.notifications.success(match next.models.get(tier) {
+                    Some(choice) if choice.local() => {
+                        format!("{} uses {} on this Mac.", tier.name(), choice.id)
+                    }
+                    Some(choice) => format!("{} uses {} via Wiesel.", tier.name(), choice.id),
+                    None => format!("{} has no model.", tier.name()),
+                });
+                self.settings = next;
+                if self.settings.default_model().local() {
+                    self.complete_onboarding();
+                }
+            }
+            Err(e) => {
+                let previous = self
+                    .settings
+                    .models
+                    .get(tier)
+                    .cloned()
+                    .map(ActionModel::Model);
+                self.tier_picker(tier)
+                    .update(cx, |picker, _| picker.selected = previous);
+                if self.actions.read_only {
+                    self.notifications
+                        .warning("Saving is disabled. Repair the settings file and relaunch.");
+                } else {
+                    self.record_diagnostic(Event::failure(
+                        Category::Settings,
+                        FailureCode::Storage,
+                    ));
+                    self.notifications.report(
+                        Source::Settings,
+                        "Could not save the model. Try again.",
+                        &e,
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+    fn persist_settings(&mut self, next: &Settings) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(persist) = &mut self.actions.persist {
+            return persist(next).map_err(Into::into);
+        }
+        settings::save(next)
     }
     fn request_with_model(
         &mut self,
         messages: Vec<Message>,
         chat: bool,
-        model: String,
+        model: ModelChoice,
         cx: &mut Context<Self>,
     ) {
         if self.busy {
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        if !model.local() && !self.signed_in() {
             self.notifications
                 .warning("Sign in to Wiesel before sending a request.");
             cx.notify();
             return;
         }
-        let Some(credential) = self.valid_credential(cx) else {
-            return;
+        // Each model goes to its own provider; Ollama needs no credential.
+        let route = match model.provider {
+            Provider::Ollama => completion_backend::Route::Ollama {
+                thinking: self
+                    .ollama_status
+                    .as_ref()
+                    .is_some_and(|status| status.thinking(&model.id)),
+            },
+            Provider::Wiesel => {
+                let Some(credential) = self.valid_credential(cx) else {
+                    return;
+                };
+                completion_backend::Route::Gateway(credential)
+            }
         };
+        let model = model.id;
+        let local = matches!(route, completion_backend::Route::Ollama { .. });
         self.request_generation += 1;
         let completion = CompletionScope {
             entry: self.navigation.current().id,
@@ -1940,14 +2176,14 @@ impl Wiesel {
         }
         self.completion_backend.start(
             completion_backend::CompletionRequest {
-                credential,
+                route,
                 model,
                 messages,
                 chat,
                 scope,
-                diagnostic_action: self.diagnostics.as_ref().map(|diagnostics| {
-                    gateway::DiagnosticAction::new(diagnostics, Category::Request)
-                }),
+                diagnostic_action: self.diagnostics.as_ref().filter(|_| !local).map(
+                    |diagnostics| gateway::DiagnosticAction::new(diagnostics, Category::Request),
+                ),
             },
             tx,
         );
@@ -1963,7 +2199,8 @@ impl Wiesel {
             self.open_action_editor(None, window, cx);
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        if !self.can_request() {
+            self.show_account_tab(cx);
             self.push_settings(false, window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
@@ -2033,24 +2270,20 @@ impl Wiesel {
         let Some(mut messages) = self.action_messages(instructions, true, cx) else {
             return;
         };
-        let model = self
-            .chat_action_model
-            .as_deref()
-            .unwrap_or_else(|| {
-                configured
+        let model = self.chat_action_model.clone().unwrap_or_else(|| {
+            configured.as_ref().map_or_else(
+                || self.settings.default_model(),
+                |action| action.effective_model(&self.settings),
+            )
+        });
+        if !model.local()
+            && (self.chat_action_model.is_some()
+                || configured
                     .as_ref()
-                    .map_or(self.settings.model.as_str(), |action| {
-                        action.effective_model(&self.settings)
-                    })
-            })
-            .to_owned();
-        if self.chat_action_model.is_some()
-            || configured
-                .as_ref()
-                .is_some_and(|action| action.model_override.is_some())
+                    .is_some_and(quick_actions::CustomQuickAction::pins_model))
         {
             let picker = self.model_picker.read(cx);
-            if picker.loading || !picker.models.contains(&model) {
+            if picker.loading || !picker.models.contains(&model.id) {
                 self.notifications.warning("This action's model is unavailable. Edit the action to pick another; no request was sent.");
                 cx.notify();
                 return;
@@ -2059,11 +2292,7 @@ impl Wiesel {
         // request validates the device session before the draft is cleared.
         self.messages.push(Message::new("user", text));
         messages.extend(self.messages.clone());
-        if model == self.settings.model {
-            self.request(messages, true, cx);
-        } else {
-            self.request_with_model(messages, true, model, cx);
-        }
+        self.request_with_model(messages, true, model, cx);
         if self.busy {
             self.follow_chat_bottom();
             self.composer.update(cx, |i, cx| i.set("", cx));

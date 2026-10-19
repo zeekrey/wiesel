@@ -7,14 +7,12 @@ pub struct ModelPicker {
     pub models: Vec<String>,
     pub loading: bool,
     open: bool,
-    include_default: bool,
-    mouse_dismissed: bool,
     highlighted: usize,
     search: Entity<TextInput>,
     focus: FocusHandle,
     scroll: ScrollHandle,
 }
-fn matches_query(model: &str, query: &str) -> bool {
+pub(crate) fn matches_query(model: &str, query: &str) -> bool {
     model.to_lowercase().contains(&query.trim().to_lowercase())
 }
 impl EventEmitter<Notification> for ModelPicker {}
@@ -37,21 +35,11 @@ impl ModelPicker {
             models: vec![],
             loading: false,
             open: false,
-            include_default: false,
-            mouse_dismissed: false,
             highlighted: 0,
             search,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
         }
-    }
-    pub fn with_default(mut self) -> Self {
-        self.include_default = true;
-        self.focus = self.focus.tab_stop(true);
-        self
-    }
-    pub fn take_mouse_dismissal(&mut self) -> bool {
-        std::mem::take(&mut self.mouse_dismissed)
     }
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let was_open = self.open;
@@ -77,20 +65,10 @@ impl ModelPicker {
     }
     fn filtered(&self, cx: &App) -> Vec<String> {
         let query = &self.search.read(cx).content;
-        std::iter::once("")
-            .filter(|_| self.include_default)
-            .chain(self.models.iter().map(String::as_str))
-            .filter(|model| {
-                matches_query(
-                    if model.is_empty() {
-                        "Default model"
-                    } else {
-                        model
-                    },
-                    query,
-                )
-            })
-            .map(str::to_owned)
+        self.models
+            .iter()
+            .filter(|model| matches_query(model, query))
+            .cloned()
             .collect()
     }
     fn select(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -154,7 +132,7 @@ impl Render for ModelPicker {
         div()
             .id("model-picker")
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.mouse_dismissed = this.close(window, cx);
+                this.close(window, cx);
             }))
             .w_full()
             .flex_shrink_0()
@@ -186,19 +164,13 @@ impl Render for ModelPicker {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::p().accent)))
                     .child(if selected.is_empty() {
-                        if self.include_default {
-                            "Default model · follows app setting"
-                        } else {
-                            "Select a model…"
-                        }
-                        .to_owned()
+                        "Select a model…".to_owned()
                     } else {
                         selected
                     })
                     .child(if self.open { "▴" } else { "▾" })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open = !this.open;
-                        this.mouse_dismissed = false;
                         if !this.open {
                             window.focus(&this.focus, cx);
                         }
@@ -244,11 +216,7 @@ impl Render for ModelPicker {
                                         .debug_selector(move || format!("model-option-{index}"))
                                         .role(Role::Button)
                                         .aria_selected(model == self.selected)
-                                        .aria_label(if model.is_empty() {
-                                            "Default model".to_owned()
-                                        } else {
-                                            model.clone()
-                                        })
+                                        .aria_label(model.clone())
                                         .min_h(px(34.))
                                         .flex_shrink_0()
                                         .px_3()
@@ -265,11 +233,7 @@ impl Render for ModelPicker {
                                         .child(format!(
                                             "{}{}",
                                             if model == self.selected { "✓ " } else { "" },
-                                            if model.is_empty() {
-                                                "Default model · follows app setting"
-                                            } else {
-                                                &model
-                                            }
+                                            model
                                         ))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.select(model.clone(), window, cx)

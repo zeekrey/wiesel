@@ -1,7 +1,7 @@
 //! Settings screen: grouped cards of "label ↔ control" rows. Copy is deliberately
 //! minimal; transient detail belongs in the status bar, not on the page.
 use super::*;
-use gpui::SharedString;
+use gpui::{AnyElement, SharedString};
 
 const ROW_GAP: f32 = 8.;
 const CONTROL_HEIGHT: f32 = 28.;
@@ -181,7 +181,8 @@ impl Wiesel {
                             "Settings file unreadable. Changes are not saved until it is repaired.",
                         ))
                     })
-                    .child(section("Account", self.account_rows(cx)))
+                    .child(section("Providers", self.provider_rows(cx)))
+                    .child(section("Models", self.model_rows(cx)))
                     .child(section("General", vec![self.shortcut_row(cx)]))
                     .child(section("Permissions", vec![self.accessibility_row()]))
                     .child(section("Diagnostics", vec![self.diagnostics_row(cx)])),
@@ -397,6 +398,166 @@ impl Wiesel {
                 .child(record)
                 .children(reset),
         )
+    }
+
+    /// Provider switch on top; the selected provider's rows below it.
+    fn provider_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let palette = theme::p();
+        let ollama_led = match &self.ollama_status {
+            Some(ollama::Status::Running { .. }) => Some(theme::LED_GREEN),
+            Some(_) => Some(theme::LED_AMBER),
+            None => None,
+        };
+        let wiesel_led = self.authenticated.then_some(theme::LED_GREEN);
+        let tab = |provider: Provider, title: &'static str, led: Option<u32>| {
+            let active = self.provider_tab == provider;
+            div()
+                .id(title)
+                .debug_selector(move || format!("provider-tab-{}", title.to_lowercase()))
+                .role(Role::Tab)
+                .aria_label(title)
+                .aria_selected(active)
+                .flex_1()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .rounded(px(3.))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .map(|d| {
+                    if active {
+                        d.bg(rgb(palette.card))
+                            .border_1()
+                            .border_color(rgba(palette.border))
+                            .shadow(vec![
+                                theme::shadow(0., 1., 2., 0., 0x0000001f),
+                                theme::shadow(0., 1., 0., 0., palette.edge_highlight),
+                            ])
+                    } else {
+                        d.text_color(rgb(palette.muted))
+                            .hover(|s| s.text_color(rgb(theme::p().foreground)))
+                    }
+                })
+                .children(led.map(theme::led))
+                .child(title)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.provider_tab = provider;
+                    cx.notify();
+                }))
+        };
+        let switch = div().id("provider-tabs").mx(px(14.)).py(px(10.)).child(
+            div()
+                .id("provider-tab-list")
+                .role(Role::TabList)
+                .aria_label("Providers")
+                .flex()
+                .p(px(2.))
+                .gap(px(2.))
+                .rounded(px(5.))
+                .bg(rgb(palette.field))
+                .border_1()
+                .border_color(rgba(palette.input_border))
+                .child(tab(Provider::Ollama, "Ollama", ollama_led))
+                .child(tab(Provider::Wiesel, "Wiesel", wiesel_led)),
+        );
+        let mut rows = vec![switch];
+        rows.extend(match self.provider_tab {
+            Provider::Ollama => self.ollama_rows(cx),
+            Provider::Wiesel => self.account_rows(cx),
+        });
+        rows
+    }
+
+    /// One searchable picker per tier, offering both providers' models.
+    fn model_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let palette = theme::p();
+        Tier::ALL
+            .into_iter()
+            .map(|tier| {
+                let picker = self.tier_picker(tier);
+                let missing = picker.read(cx).missing();
+                div()
+                    .id(SharedString::from(format!(
+                        "settings-row-tier-{}",
+                        tier.name()
+                    )))
+                    .mx(px(14.))
+                    .py(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child(tier.name()))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(if missing {
+                                        theme::LED_AMBER
+                                    } else {
+                                        palette.muted
+                                    }))
+                                    .child(if missing {
+                                        "This model is no longer available. Choose another."
+                                    } else {
+                                        tier.hint()
+                                    }),
+                            ),
+                    )
+                    .child(picker.clone())
+            })
+            .collect()
+    }
+
+    fn ollama_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let check = Self::button("ollama-check", "Check")
+            .aria_label("Check for Ollama again")
+            .when(self.ollama_checking, |d| d.opacity(0.5))
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_ollama(cx)));
+        let (hint, control): (SharedString, AnyElement) = match &self.ollama_status {
+            _ if self.ollama_checking => ("Checking for Ollama…".into(), check.into_any_element()),
+            None => (
+                "Run AI models locally on this Mac.".into(),
+                check.into_any_element(),
+            ),
+            Some(ollama::Status::NotInstalled) => (
+                "Not installed. Run AI models locally on this Mac.".into(),
+                div()
+                    .flex()
+                    .gap(px(ROW_GAP))
+                    .child(check)
+                    .child(
+                        Self::button("ollama-download", "Get Ollama ↗")
+                            .aria_label("Download Ollama in browser")
+                            .on_click(|_, _, cx| cx.open_url("https://ollama.com/download")),
+                    )
+                    .into_any_element(),
+            ),
+            Some(ollama::Status::NotRunning) => (
+                "Installed but not running. Open Ollama, then check again.".into(),
+                check.into_any_element(),
+            ),
+            Some(ollama::Status::Running { version, models }) => (
+                match models.len() {
+                    0 => "Running · no models yet. Pull one with `ollama pull`.".into(),
+                    1 => format!("Running v{version} · 1 model").into(),
+                    count => format!("Running v{version} · {count} models").into(),
+                },
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(ROW_GAP))
+                    .child(indicator(theme::LED_GREEN, "Available"))
+                    .child(check)
+                    .into_any_element(),
+            ),
+        };
+        vec![row("Ollama", Some(hint), control)]
     }
 
     fn accessibility_row(&self) -> Stateful<Div> {
