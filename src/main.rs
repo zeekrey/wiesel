@@ -39,7 +39,7 @@ use input::TextInput;
 use navigation::{EntryId, Navigation};
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::QuickAction;
-use settings::{ModelChoice, Provider, Settings, Tier};
+use settings::{ActionModel, ModelChoice, Provider, Settings, Tier};
 use std::{
     str::FromStr,
     sync::{Arc, mpsc},
@@ -1531,9 +1531,6 @@ impl Wiesel {
                         gateway::failure_message(e),
                     );
                 }
-                if let Ok(models) = &result {
-                    self.update_action_catalog(models.clone(), cx);
-                }
                 let loaded = result.as_ref().ok().cloned();
                 self.update_catalogs(Provider::Wiesel, cx, move |catalog| {
                     catalog.loading = false;
@@ -1800,7 +1797,6 @@ impl Wiesel {
         self.composer.update(cx, |input, cx| input.set("", cx));
         self.selection = selection::Capture::default();
         self.capture_scope = None;
-        self.update_action_catalog(vec![], cx);
         self.model_picker
             .update(cx, |picker, cx| picker.finish_load(Ok(vec![]), cx));
         self.update_catalogs(Provider::Wiesel, cx, |catalog| {
@@ -1979,7 +1975,7 @@ impl Wiesel {
         Tier::ALL
             .into_iter()
             .map(|tier| {
-                let selected = settings.models.get(tier).cloned();
+                let selected = settings.models.get(tier).cloned().map(ActionModel::Model);
                 cx.new(|cx| {
                     let mut picker = tier_picker::TierPicker::new(
                         format!("tier-{}", tier.name().to_lowercase()),
@@ -1999,7 +1995,8 @@ impl Wiesel {
             })
             .detach();
             cx.subscribe(&picker, move |this, _, picked: &tier_picker::Picked, cx| {
-                this.assign_tier(tier, picked.0.clone(), cx);
+                let choice = picked.0.as_ref().and_then(ActionModel::choice).cloned();
+                this.assign_tier(tier, choice, cx);
             })
             .detach();
         }
@@ -2017,7 +2014,8 @@ impl Wiesel {
         cx: &mut Context<Self>,
         update: impl Fn(&mut tier_picker::Catalog),
     ) {
-        for picker in &self.tier_pickers {
+        let editor = self.actions.editor.as_ref().map(|editor| &editor.model);
+        for picker in self.tier_pickers.iter().chain(editor) {
             picker.update(cx, |picker, cx| {
                 update(picker.catalog_mut(provider));
                 cx.notify();
@@ -2093,7 +2091,12 @@ impl Wiesel {
                 }
             }
             Err(e) => {
-                let previous = self.settings.models.get(tier).cloned();
+                let previous = self
+                    .settings
+                    .models
+                    .get(tier)
+                    .cloned()
+                    .map(ActionModel::Model);
                 self.tier_picker(tier)
                     .update(cx, |picker, _| picker.selected = previous);
                 if self.actions.read_only {
@@ -2277,7 +2280,7 @@ impl Wiesel {
             && (self.chat_action_model.is_some()
                 || configured
                     .as_ref()
-                    .is_some_and(|action| action.model_override.is_some()))
+                    .is_some_and(quick_actions::CustomQuickAction::pins_model))
         {
             let picker = self.model_picker.read(cx);
             if picker.loading || !picker.models.contains(&model.id) {

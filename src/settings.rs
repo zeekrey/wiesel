@@ -64,7 +64,8 @@ impl ModelChoice {
 }
 
 /// Speed/intelligence trade-off a model is assigned to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tier {
     Swift,
     Sharp,
@@ -84,6 +85,64 @@ impl Tier {
             Tier::Swift => "Fast and clever. Quick fixes and short replies.",
             Tier::Sharp => "Balanced and intelligent. Used by default.",
             Tier::Sage => "Slow and super intelligent. For the hard problems.",
+        }
+    }
+}
+
+/// What an action runs on: a tier that follows Settings, or one pinned model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredActionModel", into = "StoredActionModel")]
+pub enum ActionModel {
+    Tier(Tier),
+    Model(ModelChoice),
+}
+impl ActionModel {
+    pub fn label(&self) -> &str {
+        match self {
+            ActionModel::Tier(tier) => tier.name(),
+            ActionModel::Model(choice) => &choice.id,
+        }
+    }
+    /// The concrete model, or None for a tier.
+    pub fn choice(&self) -> Option<&ModelChoice> {
+        match self {
+            ActionModel::Tier(_) => None,
+            ActionModel::Model(choice) => Some(choice),
+        }
+    }
+}
+/// Bare strings are Wiesel model ids from before tiers and providers existed.
+impl From<&str> for ActionModel {
+    fn from(id: &str) -> Self {
+        ActionModel::Model(ModelChoice::wiesel(id))
+    }
+}
+impl From<String> for ActionModel {
+    fn from(id: String) -> Self {
+        ActionModel::Model(ModelChoice::wiesel(id))
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredActionModel {
+    Tier { tier: Tier },
+    Model(ModelChoice),
+    Legacy(String),
+}
+impl From<StoredActionModel> for ActionModel {
+    fn from(stored: StoredActionModel) -> Self {
+        match stored {
+            StoredActionModel::Tier { tier } => ActionModel::Tier(tier),
+            StoredActionModel::Model(choice) => ActionModel::Model(choice),
+            StoredActionModel::Legacy(id) => id.into(),
+        }
+    }
+}
+impl From<ActionModel> for StoredActionModel {
+    fn from(model: ActionModel) -> Self {
+        match model {
+            ActionModel::Tier(tier) => StoredActionModel::Tier { tier },
+            ActionModel::Model(choice) => StoredActionModel::Model(choice),
         }
     }
 }
@@ -140,6 +199,13 @@ impl Settings {
             .into_iter()
             .find_map(|tier| self.models.get(tier).cloned())
             .unwrap_or_else(|| ModelChoice::wiesel(self.model.clone()))
+    }
+    /// An unassigned tier follows the default, so Sharp always equals the default.
+    pub fn tier_model(&self, tier: Tier) -> ModelChoice {
+        self.models
+            .get(tier)
+            .cloned()
+            .unwrap_or_else(|| self.default_model())
     }
     /// Moves the pre-tier global Ollama model into Sharp.
     fn migrate(mut self) -> Self {
@@ -399,6 +465,46 @@ mod tests {
         let saved = serde_json::to_value(&loaded).unwrap();
         assert!(saved.get("ollama_model").is_none());
         assert_eq!(saved["models"]["sharp"]["provider"], "ollama");
+    }
+
+    #[test]
+    fn action_models_round_trip_and_accept_legacy_ids() {
+        for (model, json) in [
+            (
+                ActionModel::Tier(Tier::Swift),
+                serde_json::json!({"tier": "swift"}),
+            ),
+            (
+                ActionModel::Model(ModelChoice::ollama("qwen3.5:0.8b")),
+                serde_json::json!({"provider": "ollama", "id": "qwen3.5:0.8b"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&model).unwrap(), json);
+            assert_eq!(serde_json::from_value::<ActionModel>(json).unwrap(), model);
+        }
+        assert_eq!(
+            serde_json::from_value::<ActionModel>("openai/gpt-4o".into()).unwrap(),
+            ActionModel::Model(ModelChoice::wiesel("openai/gpt-4o"))
+        );
+    }
+
+    #[test]
+    fn unassigned_tiers_follow_the_default() {
+        let mut settings = Settings::default();
+        settings
+            .models
+            .set(Tier::Sharp, Some(ModelChoice::ollama("qwen")));
+        assert_eq!(
+            settings.tier_model(Tier::Swift),
+            ModelChoice::ollama("qwen")
+        );
+        settings
+            .models
+            .set(Tier::Swift, Some(ModelChoice::wiesel("a/fast")));
+        assert_eq!(
+            settings.tier_model(Tier::Swift),
+            ModelChoice::wiesel("a/fast")
+        );
     }
 
     #[test]

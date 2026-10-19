@@ -56,21 +56,29 @@ fn action(name: &str, model: Option<&str>) -> CustomQuickAction {
     CustomQuickAction::new(CustomActionFields {
         name: name.into(),
         icon: "wand".into(),
-        model_override: model.map(str::to_owned),
+        model_override: model.map(Into::into),
         instructions: "Exact custom instructions\n with whitespace \n{selection}".into(),
     })
     .unwrap()
+}
+/// Options list the three tiers first, then Ollama (empty here), then Wiesel models.
+fn load_models(app: &mut Wiesel, models: Vec<String>, cx: &mut Context<Wiesel>) {
+    app.update_catalogs(Provider::Wiesel, cx, |catalog| {
+        catalog.models = models.clone();
+        catalog.note = None;
+    });
+    app.model_picker
+        .update(cx, |picker, cx| picker.finish_load(Ok(models), cx));
 }
 fn seed(app: &Entity<Wiesel>, cx: &mut VisualTestContext, action: CustomQuickAction) {
     cx.update(|_, cx| {
         app.update(cx, |app, cx| {
             app.settings.custom_actions.push(action);
-            app.model_picker.update(cx, |picker, cx| {
-                picker.finish_load(
-                    Ok(vec!["test/chat-model".into(), "test/override".into()]),
-                    cx,
-                )
-            });
+            load_models(
+                app,
+                vec!["test/chat-model".into(), "test/override".into()],
+                cx,
+            );
             app.selection.text = Some("Selected source text".into());
             cx.notify();
         })
@@ -99,14 +107,15 @@ fn builtin_manager_edit_dispatch_delete_and_shortcut_follow_saved_customization(
     click(cx, "action-icon");
     click(cx, "icon-lightbulb");
     click(cx, "model-select");
-    click(cx, "model-option-2");
+    cx.simulate_input("override");
+    cx.simulate_keystrokes("enter");
     click(cx, "action-save");
     cx.read_entity(&app, |app, _| {
         let configured = &app.settings.actions()[0];
         assert_eq!(configured.id, id);
         assert_eq!(configured.name, "Fix grammar");
         assert_eq!(configured.icon, "lightbulb");
-        assert_eq!(configured.model_override.as_deref(), Some("test/override"));
+        assert_eq!(configured.model_override, Some("test/override".into()));
     });
     click(cx, "back");
     click(cx, "grammar");
@@ -312,12 +321,11 @@ fn create_icon_model_multiline_and_edit_preserve_uuid(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     cx.update(|_, cx| {
         app.update(cx, |app, cx| {
-            app.model_picker.update(cx, |picker, cx| {
-                picker.finish_load(
-                    Ok(vec!["test/chat-model".into(), "test/override".into()]),
-                    cx,
-                )
-            })
+            load_models(
+                app,
+                vec!["test/chat-model".into(), "test/override".into()],
+                cx,
+            )
         })
     });
     click(cx, "add-action");
@@ -327,7 +335,8 @@ fn create_icon_model_multiline_and_edit_preserve_uuid(cx: &mut TestAppContext) {
     click(cx, "action-icon");
     click(cx, "icon-lightbulb");
     click(cx, "model-select");
-    click(cx, "model-option-2");
+    cx.simulate_input("override");
+    cx.simulate_keystrokes("enter");
     cx.simulate_keystrokes("cmd-enter");
     let id = cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Launcher);
@@ -336,7 +345,7 @@ fn create_icon_model_multiline_and_edit_preserve_uuid(cx: &mut TestAppContext) {
         assert_eq!(action.name, "My action");
         assert_eq!(action.icon, "lightbulb");
         assert_eq!(action.instructions, "First line\nSecond line");
-        assert_eq!(action.model_override.as_deref(), Some("test/override"));
+        assert_eq!(action.model_override, Some("test/override".into()));
         action.id
     });
     assert_eq!(backend.request_count(), 0);
@@ -344,7 +353,8 @@ fn create_icon_model_multiline_and_edit_preserve_uuid(cx: &mut TestAppContext) {
     click(cx, &format!("edit-{id}"));
     fill(cx, "Renamed", "Updated instructions");
     click(cx, "model-select");
-    click(cx, "model-option-0");
+    // Sharp is the default, so it clears the override.
+    click(cx, "model-option-1");
     click(cx, "action-save");
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::ActionManager);
@@ -1386,9 +1396,7 @@ fn injected_paste_action_preserves_multiline_prompt_without_clipboard_reads(
     cx.update(|_, cx| {
         app.update(cx, |app, cx| {
             app.selection.text = Some("Source".into());
-            app.model_picker.update(cx, |picker, cx| {
-                picker.finish_load(Ok(vec!["test/chat-model".into()]), cx)
-            });
+            load_models(app, vec!["test/chat-model".into()], cx);
             cx.notify();
         })
     });
@@ -1409,7 +1417,7 @@ fn held_model_activation_does_not_reopen_or_reset_selected_override(cx: &mut Tes
     menu(cx, AdjustQuickActions);
     click(cx, &format!("edit-{id}"));
     click(cx, "model-select");
-    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("down down down");
     held_key(cx, "down");
     cx.simulate_event(KeyDownEvent {
         keystroke: gpui::Keystroke::parse("enter").unwrap(),
@@ -1426,8 +1434,8 @@ fn held_model_activation_does_not_reopen_or_reset_selected_override(cx: &mut Tes
     click(cx, "action-save");
     cx.read_entity(&app, |app, _| {
         assert_eq!(
-            app.settings.custom_actions[0].model_override.as_deref(),
-            Some("test/override")
+            app.settings.custom_actions[0].model_override,
+            Some("test/override".into())
         )
     });
 }
@@ -1463,18 +1471,26 @@ fn scoped_catalog_result_refreshes_retained_editor_without_request(cx: &mut Test
             "Retained"
         );
         assert_eq!(
-            app.actions.editor.as_ref().unwrap().model.read(cx).models,
+            app.actions
+                .editor
+                .as_ref()
+                .unwrap()
+                .model
+                .read(cx)
+                .wiesel
+                .models,
             vec!["test/new-catalog"]
         );
     });
     click(cx, "back");
     click(cx, "model-select");
-    click(cx, "model-option-1");
+    cx.simulate_input("new-catalog");
+    cx.simulate_keystrokes("enter");
     click(cx, "action-save");
     cx.read_entity(&app, |app, _| {
         assert_eq!(
-            app.settings.custom_actions[0].model_override.as_deref(),
-            Some("test/new-catalog")
+            app.settings.custom_actions[0].model_override,
+            Some("test/new-catalog".into())
         )
     });
     assert_eq!(backend.request_count(), 0);
@@ -1777,4 +1793,52 @@ fn canceled_or_failed_delete_preserves_saved_home_card_restore_and_activation(
     receive_results(&app, cx);
     cx.simulate_keystrokes("escape");
     assert!(control_focused(&app, cx, &format!("custom-{id}")));
+}
+
+#[gpui::test]
+fn editor_offers_tiers_then_models_from_both_providers(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            load_models(app, vec!["test/chat-model".into()], cx);
+            app.update_catalogs(Provider::Ollama, cx, |catalog| {
+                catalog.models = vec!["qwen3.5:0.8b".into()];
+            });
+            app.settings
+                .models
+                .set(Tier::Swift, Some(ModelChoice::ollama("qwen3.5:0.8b")));
+            app.selection.text = Some("Source".into());
+        })
+    });
+    cx.run_until_parked();
+    click(cx, "add-action");
+    fill(cx, "Quick", "Answer briefly.");
+    click(cx, "model-select");
+    click(cx, "model-option-0");
+    click(cx, "action-save");
+    let id = cx.read_entity(&app, |app, _| {
+        let action = &app.settings.custom_actions[0];
+        assert_eq!(action.model_override, Some(ActionModel::Tier(Tier::Swift)));
+        action.id
+    });
+    // The tier resolves at dispatch time to the model assigned in Settings.
+    click(cx, &format!("custom-{id}"));
+    assert!(backend.local(0));
+    assert_eq!(backend.request(0).0, "qwen3.5:0.8b");
+    backend.finish(0, Ok("Done".into()));
+    receive_results(&app, cx);
+
+    click(cx, "back");
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("edit-{id}"));
+    click(cx, "model-select");
+    cx.simulate_input("qwen");
+    cx.simulate_keystrokes("enter");
+    click(cx, "action-save");
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            app.settings.custom_actions[0].model_override,
+            Some(ActionModel::Model(ModelChoice::ollama("qwen3.5:0.8b")))
+        );
+    });
 }
