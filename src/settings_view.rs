@@ -1,7 +1,7 @@
 //! Settings screen: grouped cards of "label ↔ control" rows. Copy is deliberately
 //! minimal; transient detail belongs in the status bar, not on the page.
 use super::*;
-use gpui::SharedString;
+use gpui::{AnyElement, SharedString};
 
 const ROW_GAP: f32 = 8.;
 const CONTROL_HEIGHT: f32 = 28.;
@@ -183,6 +183,7 @@ impl Wiesel {
                     })
                     .child(section("Account", self.account_rows(cx)))
                     .child(section("General", vec![self.shortcut_row(cx)]))
+                    .child(section("Ollama", self.ollama_rows(cx)))
                     .child(section("Permissions", vec![self.accessibility_row()]))
                     .child(section("Diagnostics", vec![self.diagnostics_row(cx)])),
             )
@@ -397,6 +398,92 @@ impl Wiesel {
                 .child(record)
                 .children(reset),
         )
+    }
+
+    fn ollama_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let check = Self::button("ollama-check", "Check")
+            .aria_label("Check for Ollama again")
+            .when(self.ollama_checking, |d| d.opacity(0.5))
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_ollama(cx)));
+        let (hint, control): (SharedString, AnyElement) = match &self.ollama_status {
+            _ if self.ollama_checking => ("Checking for Ollama…".into(), check.into_any_element()),
+            None => (
+                "Run AI models locally on this Mac.".into(),
+                check.into_any_element(),
+            ),
+            Some(ollama::Status::NotInstalled) => (
+                "Not installed. Run AI models locally on this Mac.".into(),
+                div()
+                    .flex()
+                    .gap(px(ROW_GAP))
+                    .child(check)
+                    .child(
+                        Self::button("ollama-download", "Get Ollama ↗")
+                            .aria_label("Download Ollama in browser")
+                            .on_click(|_, _, cx| cx.open_url("https://ollama.com/download")),
+                    )
+                    .into_any_element(),
+            ),
+            Some(ollama::Status::NotRunning) => (
+                "Installed but not running. Open Ollama, then check again.".into(),
+                check.into_any_element(),
+            ),
+            Some(ollama::Status::Running { version, models }) => (
+                match models.len() {
+                    0 => "Running · no models yet. Pull one with `ollama pull`.".into(),
+                    1 => format!("Running v{version} · 1 model").into(),
+                    count => format!("Running v{version} · {count} models").into(),
+                },
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(ROW_GAP))
+                    .child(indicator(theme::LED_GREEN, "Available"))
+                    .child(check)
+                    .into_any_element(),
+            ),
+        };
+        let mut rows = vec![row("Ollama", Some(hint), control)];
+        let available = !self.ollama_picker.read(cx).models.is_empty();
+        if available || self.settings.ollama_model.is_some() {
+            let missing = self.settings.ollama_model.as_ref().is_some_and(|model| {
+                matches!(self.ollama_status, Some(ollama::Status::Running { .. }))
+                    && !self.ollama_picker.read(cx).models.contains(model)
+            });
+            let palette = theme::p();
+            rows.push(
+                div()
+                    .id("settings-row-ollama-model")
+                    .mx(px(14.))
+                    .py(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Model"))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(if missing {
+                                        theme::LED_AMBER
+                                    } else {
+                                        palette.muted
+                                    }))
+                                    .child(if missing {
+                                        "This model is no longer in Ollama. Choose another."
+                                    } else {
+                                        "When selected, every action uses it instead of your Wiesel account."
+                                    }),
+                            ),
+                    )
+                    .child(self.ollama_picker.clone()),
+            );
+        }
+        rows
     }
 
     fn accessibility_row(&self) -> Stateful<Div> {

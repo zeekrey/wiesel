@@ -15,6 +15,7 @@ mod input;
 mod model_picker;
 mod navigation;
 mod notifications;
+mod ollama;
 mod quick_actions;
 mod selection;
 mod settings;
@@ -509,6 +510,7 @@ enum ResultPayload {
     ChatDelta(String),
     Completion(anyhow::Result<String>, bool),
     SignOut(Result<(), AuthError>),
+    Ollama(ollama::Status),
 }
 #[derive(Clone, Copy)]
 enum DiagnosticControl {
@@ -606,6 +608,9 @@ struct Wiesel {
     device_status: Option<auth::DeviceStatus>,
     recovery: CredentialRecovery,
     model_picker: Entity<model_picker::ModelPicker>,
+    ollama_picker: Entity<model_picker::ModelPicker>,
+    ollama_status: Option<ollama::Status>,
+    ollama_checking: bool,
     composer: Entity<TextInput>,
     focus: FocusHandle,
     recording: bool,
@@ -856,6 +861,7 @@ impl Wiesel {
             }
         };
         let model_picker = cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx));
+        let ollama_picker = Self::new_ollama_picker(&settings, cx);
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             navigation: Navigation::new(Screen::Launcher),
@@ -879,6 +885,9 @@ impl Wiesel {
             manager,
             hotkey: None,
             model_picker,
+            ollama_picker,
+            ollama_status: None,
+            ollama_checking: false,
             session: DesktopSession {
                 credential,
                 ..Default::default()
@@ -928,6 +937,7 @@ impl Wiesel {
             },
         )
         .detach();
+        app.observe_ollama_picker(cx);
         // The shortcut also works before browser login and onboarding are complete.
         if let Err(e) = app.register(&app.settings.hotkey.clone()) {
             app.notifications.report(
@@ -951,6 +961,11 @@ impl Wiesel {
         app.poll_diagnostics(cx);
         app.sync_permission_issue();
         app.refresh_status(true, cx);
+        app.refresh_ollama(cx);
+        // A local model needs no sign-in, so startup can go straight to the launcher.
+        if app.settings.ollama_model.is_some() {
+            app.finish_startup_navigation(true, window, cx);
+        }
         app
     }
     // Called only by the production entry point, never by in-process UI fixtures.
@@ -1232,7 +1247,7 @@ impl Wiesel {
         }
     }
     fn idle_notification(&self) -> Notification {
-        if !self.authenticated {
+        if !self.can_request() {
             Notification::new(Severity::Warning, "Log in to Wiesel in Settings (⌘⇧L).")
         } else if let Some(text) = &self.selection.text {
             Notification::new(
@@ -1405,6 +1420,10 @@ impl Wiesel {
             {
                 continue;
             }
+            if let ResultPayload::Ollama(status) = event.result {
+                self.finish_ollama(status, cx);
+                continue;
+            }
             if !self.session.accepts(event.scope) {
                 // Discard payloads from ended/replaced sessions. Only the exact
                 // pending physical request's terminal event can release its slot.
@@ -1543,11 +1562,16 @@ impl Wiesel {
                             self.clear_session("Device login rejected. Log in again.", cx);
                             return;
                         }
+                        let local = ollama::failure_message(&e);
                         self.notifications.issue(
                             Source::Request,
                             Severity::Error,
-                            gateway::failure_message(&e),
+                            local.unwrap_or_else(|| gateway::failure_message(&e)),
                         );
+                        // A local failure may mean Ollama stopped or lost the model.
+                        if local.is_some() {
+                            self.refresh_ollama(cx);
+                        }
                         if chat && let Some(message) = self.messages.pop() {
                             let (draft, failed) = recover_failed_draft(
                                 &self.composer.read(cx).content,
@@ -1574,6 +1598,7 @@ impl Wiesel {
                         .success("Signed out this device. Its saved credential was removed.");
                 }
             }
+            ResultPayload::Ollama(status) => self.finish_ollama(status, cx),
         }
     }
     fn login_ready(&mut self, show_launcher: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1627,7 +1652,7 @@ impl Wiesel {
             return;
         }
         if show_launcher
-            && self.authenticated
+            && self.can_request()
             && self.hotkey.is_some()
             && self.settings.onboarded
             && self.current_screen() == Screen::Settings
@@ -1899,6 +1924,125 @@ impl Wiesel {
             });
         });
     }
+    /// A selected local model replaces sign-in; otherwise a verified login is required.
+    fn can_request(&self) -> bool {
+        self.settings.ollama_model.is_some() || (self.authenticated && self.settings.onboarded)
+    }
+    fn new_ollama_picker(
+        settings: &Settings,
+        cx: &mut Context<Self>,
+    ) -> Entity<model_picker::ModelPicker> {
+        let selected = settings.ollama_model.clone().unwrap_or_default();
+        cx.new(|cx| {
+            model_picker::ModelPicker::new(selected, cx)
+                .with_default_label("Off · use Wiesel account")
+        })
+    }
+    fn observe_ollama_picker(&mut self, cx: &mut Context<Self>) {
+        cx.subscribe(
+            &self.ollama_picker,
+            |this, _, notification: &Notification, cx| {
+                this.input_notification(notification, cx);
+            },
+        )
+        .detach();
+        cx.observe(&self.ollama_picker, |this, picker, cx| {
+            let selected = picker.read(cx).selected.clone();
+            let selected = (!selected.is_empty()).then_some(selected);
+            if selected != this.settings.ollama_model {
+                this.select_ollama_model(selected, cx);
+            }
+        })
+        .detach();
+    }
+    fn refresh_ollama(&mut self, cx: &mut Context<Self>) {
+        if self.ollama_checking {
+            return;
+        }
+        self.ollama_checking = true;
+        self.ollama_picker
+            .update(cx, |picker, cx| picker.begin_load(cx));
+        // In-process fixtures never touch the network; they release status explicitly.
+        #[cfg(not(test))]
+        {
+            let tx = self.tx.clone();
+            let scope = self.session.scope();
+            std::thread::spawn(move || {
+                let _ = tx.send(ResultEvent {
+                    scope,
+                    result: ResultPayload::Ollama(ollama::status()),
+                });
+            });
+        }
+        cx.notify();
+    }
+    fn finish_ollama(&mut self, status: ollama::Status, cx: &mut Context<Self>) {
+        self.ollama_checking = false;
+        let names = status
+            .models()
+            .iter()
+            .map(|model| model.name.clone())
+            .collect();
+        self.ollama_picker
+            .update(cx, |picker, cx| picker.finish_load(Ok(names), cx));
+        if self.settings.ollama_model.is_some() && !matches!(status, ollama::Status::Running { .. })
+        {
+            self.notifications
+                .warning("Ollama is not running. Start it, or turn it off in Settings.");
+        }
+        self.ollama_status = Some(status);
+        cx.notify();
+    }
+    fn select_ollama_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        let mut next = self.settings.clone();
+        next.ollama_model = model;
+        let saved = if self.actions.read_only {
+            Err(anyhow::anyhow!("Settings are read-only"))
+        } else {
+            self.persist_settings(&next)
+        };
+        match saved {
+            Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
+                self.notifications.clear(Source::Settings);
+                self.notifications.success(match &next.ollama_model {
+                    Some(_) => "Using Ollama for all actions. Requests stay on this Mac.",
+                    None => "Ollama off. Requests use your Wiesel account.",
+                });
+                self.settings = next;
+                if self.settings.ollama_model.is_some() {
+                    self.complete_onboarding();
+                }
+            }
+            Err(e) => {
+                let previous = self.settings.ollama_model.clone().unwrap_or_default();
+                self.ollama_picker
+                    .update(cx, |picker, _| picker.selected = previous);
+                if self.actions.read_only {
+                    self.notifications
+                        .warning("Saving is disabled. Repair the settings file and relaunch.");
+                } else {
+                    self.record_diagnostic(Event::failure(
+                        Category::Settings,
+                        FailureCode::Storage,
+                    ));
+                    self.notifications.report(
+                        Source::Settings,
+                        "Could not save the Ollama model. Try again.",
+                        &e,
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+    fn persist_settings(&mut self, next: &Settings) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(persist) = &mut self.actions.persist {
+            return persist(next).map_err(Into::into);
+        }
+        settings::save(next)
+    }
     fn request(&mut self, messages: Vec<Message>, chat: bool, cx: &mut Context<Self>) {
         self.request_with_model(messages, chat, self.settings.model.clone(), cx);
     }
@@ -1912,15 +2056,31 @@ impl Wiesel {
         if self.busy {
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        if !self.can_request() {
             self.notifications
                 .warning("Sign in to Wiesel before sending a request.");
             cx.notify();
             return;
         }
-        let Some(credential) = self.valid_credential(cx) else {
-            return;
+        // A selected local model handles every action, whatever its own model.
+        let (route, model) = match self.settings.ollama_model.clone() {
+            Some(local) => (
+                completion_backend::Route::Ollama {
+                    thinking: self
+                        .ollama_status
+                        .as_ref()
+                        .is_some_and(|status| status.thinking(&local)),
+                },
+                local,
+            ),
+            None => {
+                let Some(credential) = self.valid_credential(cx) else {
+                    return;
+                };
+                (completion_backend::Route::Gateway(credential), model)
+            }
         };
+        let local = matches!(route, completion_backend::Route::Ollama { .. });
         self.request_generation += 1;
         let completion = CompletionScope {
             entry: self.navigation.current().id,
@@ -1940,14 +2100,14 @@ impl Wiesel {
         }
         self.completion_backend.start(
             completion_backend::CompletionRequest {
-                credential,
+                route,
                 model,
                 messages,
                 chat,
                 scope,
-                diagnostic_action: self.diagnostics.as_ref().map(|diagnostics| {
-                    gateway::DiagnosticAction::new(diagnostics, Category::Request)
-                }),
+                diagnostic_action: self.diagnostics.as_ref().filter(|_| !local).map(
+                    |diagnostics| gateway::DiagnosticAction::new(diagnostics, Category::Request),
+                ),
             },
             tx,
         );
@@ -1963,7 +2123,7 @@ impl Wiesel {
             self.open_action_editor(None, window, cx);
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        if !self.can_request() {
             self.push_settings(false, window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
@@ -2044,10 +2204,11 @@ impl Wiesel {
                     })
             })
             .to_owned();
-        if self.chat_action_model.is_some()
-            || configured
-                .as_ref()
-                .is_some_and(|action| action.model_override.is_some())
+        if self.settings.ollama_model.is_none()
+            && (self.chat_action_model.is_some()
+                || configured
+                    .as_ref()
+                    .is_some_and(|action| action.model_override.is_some()))
         {
             let picker = self.model_picker.read(cx);
             if picker.loading || !picker.models.contains(&model) {
@@ -2059,7 +2220,7 @@ impl Wiesel {
         // request validates the device session before the draft is cleared.
         self.messages.push(Message::new("user", text));
         messages.extend(self.messages.clone());
-        if model == self.settings.model {
+        if model == self.settings.model || self.settings.ollama_model.is_some() {
             self.request(messages, true, cx);
         } else {
             self.request_with_model(messages, true, model, cx);

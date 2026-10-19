@@ -179,15 +179,18 @@ impl Wiesel {
         if self.busy {
             return;
         }
-        if !self.authenticated || !self.settings.onboarded {
+        if !self.can_request() {
             self.push_settings(false, window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
             return;
         }
+        let local = self.settings.ollama_model.is_some();
         let model = action.effective_model(&self.settings).to_owned();
         let picker = self.model_picker.read(cx);
-        if (QuickAction::from_persistent_id(action.id).is_none() || action.model_override.is_some())
+        if !local
+            && (QuickAction::from_persistent_id(action.id).is_none()
+                || action.model_override.is_some())
             && (picker.loading || !picker.models.contains(&model))
         {
             self.notifications.warning("This action's model is unavailable. Edit the action to pick another; no request was sent.");
@@ -197,7 +200,7 @@ impl Wiesel {
         let Some(messages) = self.action_messages(&action.instructions, false, cx) else {
             return;
         };
-        if self.valid_credential(cx).is_none() {
+        if !local && self.valid_credential(cx).is_none() {
             return;
         }
         if QuickAction::from_persistent_id(action.id).is_none() {

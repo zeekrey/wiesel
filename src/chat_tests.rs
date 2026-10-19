@@ -27,6 +27,9 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         active_request: None,
         recorded_hides: Some(0),
         model_picker: cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx)),
+        ollama_picker: Wiesel::new_ollama_picker(&settings, cx),
+        ollama_status: None,
+        ollama_checking: false,
         settings,
         actions: action_builder::ActionBuilder::fixture(),
         diagnostics: None,
@@ -1293,4 +1296,123 @@ fn navigation_stale_failure_settles_ended_sessions_exact_physical_slot_without_d
         assert!(app.composer.read(cx).content.is_empty());
     });
     assert_eq!(backend.request_count(), 1);
+}
+
+#[gpui::test]
+fn ollama_model_serves_chat_without_sign_in(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        app.authenticated = false;
+        app.session.credential = None;
+        app.settings.onboarded = false;
+        app.settings.ollama_model = Some("qwen3.5:0.8b".into());
+    });
+    open_chat(&app, cx);
+    cx.simulate_input("Hello local");
+    click(cx, "send");
+    assert_eq!(backend.request_count(), 1);
+    assert!(backend.local(0));
+    assert_eq!(backend.request(0).0, "qwen3.5:0.8b");
+    backend.delta(0, "Hi");
+    backend.finish(0, Ok("Hi there".into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(
+            history(&app.messages),
+            vec![("user", "Hello local"), ("assistant", "Hi there")]
+        );
+        assert!(!app.busy);
+    });
+}
+
+#[gpui::test]
+fn ollama_model_overrides_action_models_and_gateway(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, _| {
+        app.settings.ollama_model = Some("llama3:8b".into());
+    });
+    // A custom action pinned to an unloaded catalog model still runs locally.
+    let action = quick_actions::CustomQuickAction::new(quick_actions::CustomActionFields {
+        name: "Local".into(),
+        icon: "wand".into(),
+        model_override: Some("test/unloaded".into()),
+        instructions: "Answer briefly.".into(),
+    })
+    .unwrap();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.run_custom_action(action, window, cx));
+    });
+    assert_eq!(backend.request_count(), 1);
+    assert!(backend.local(0));
+    assert_eq!(backend.request(0).0, "llama3:8b");
+
+    // Turning Ollama off returns to the signed-in Wiesel route.
+    backend.finish(0, Ok("Done".into()));
+    receive_results(&app, cx);
+    app.update(cx, |app, cx| {
+        app.select_ollama_model(None, cx);
+        app.new_chat(cx);
+    });
+    cx.read_entity(&app, |app, _| assert!(app.settings.ollama_model.is_none()));
+    cx.simulate_input("Cloud");
+    click(cx, "send");
+    assert!(!backend.local(1));
+    assert_eq!(backend.request(1).0, "test/chat-model");
+}
+
+#[gpui::test]
+fn ollama_failures_use_local_copy(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    app.update(cx, |app, _| app.settings.ollama_model = Some("m".into()));
+    open_chat(&app, cx);
+    cx.simulate_input("Hello");
+    click(cx, "send");
+    backend.finish(0, Err(ollama::OllamaError("Ollama is not running.").into()));
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, cx| {
+        assert!(app.messages.is_empty());
+        assert_eq!(app.composer.read(cx).content.as_ref(), "Hello");
+        // The failure triggers a re-probe so Settings reflects the new state.
+        assert!(app.ollama_checking);
+    });
+}
+
+#[gpui::test]
+fn ollama_status_fills_the_local_model_picker(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    app.update(cx, |app, cx| {
+        app.observe_ollama_picker(cx);
+        app.refresh_ollama(cx);
+        assert!(app.ollama_checking);
+        let scope = app.session.scope();
+        app.tx
+            .send(ResultEvent {
+                scope,
+                result: ResultPayload::Ollama(ollama::Status::Running {
+                    version: "0.40.6".into(),
+                    models: vec![ollama::LocalModel {
+                        name: "qwen3.5:0.8b".into(),
+                        thinking: true,
+                    }],
+                }),
+            })
+            .unwrap();
+    });
+    receive_results(&app, cx);
+    cx.read_entity(&app, |app, cx| {
+        assert!(!app.ollama_checking);
+        assert_eq!(app.ollama_picker.read(cx).models, ["qwen3.5:0.8b"]);
+    });
+    // Picking a model in Settings persists it and routes requests locally.
+    app.update(cx, |app, cx| {
+        app.ollama_picker.update(cx, |picker, cx| {
+            picker.selected = "qwen3.5:0.8b".into();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.settings.ollama_model.as_deref(), Some("qwen3.5:0.8b"));
+        assert!(app.ollama_status.as_ref().unwrap().thinking("qwen3.5:0.8b"));
+    });
 }
