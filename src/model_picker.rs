@@ -15,7 +15,7 @@ pub struct ModelPicker {
     focus: FocusHandle,
     scroll: ScrollHandle,
 }
-fn matches_query(model: &str, query: &str) -> bool {
+pub(crate) fn matches_query(model: &str, query: &str) -> bool {
     model.to_lowercase().contains(&query.trim().to_lowercase())
 }
 impl EventEmitter<Notification> for ModelPicker {}

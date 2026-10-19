@@ -1,4 +1,7 @@
-use crate::{diagnostics::ModelId, settings::Settings};
+use crate::{
+    diagnostics::ModelId,
+    settings::{ModelChoice, Settings},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -117,9 +120,11 @@ impl CustomQuickAction {
         )
     }
 
-    /// Resolve at dispatch time; None always follows the current app default.
-    pub fn effective_model<'a>(&'a self, settings: &'a Settings) -> &'a str {
-        self.model_override.as_deref().unwrap_or(&settings.model)
+    /// Resolve at dispatch time; None always follows the current default tier.
+    pub fn effective_model(&self, settings: &Settings) -> ModelChoice {
+        self.model_override
+            .clone()
+            .map_or_else(|| settings.default_model(), ModelChoice::wiesel)
     }
 
     /// Convert a validated embedded icon key to the static key used by theme::icon.
@@ -451,9 +456,14 @@ mod custom_action_tests {
     fn default_model_follows_subsequent_settings_changes() {
         let mut settings = Settings::default();
         let action = action(1);
-        assert_eq!(action.effective_model(&settings), "openai/gpt-4o-mini");
+        assert_eq!(action.effective_model(&settings).id, "openai/gpt-4o-mini");
         settings.model = "test/new-default".into();
-        assert_eq!(action.effective_model(&settings), "test/new-default");
+        assert_eq!(action.effective_model(&settings).id, "test/new-default");
+        settings.models.sharp = Some(ModelChoice::ollama("llama3:8b"));
+        assert_eq!(
+            action.effective_model(&settings),
+            ModelChoice::ollama("llama3:8b")
+        );
     }
 
     #[test]
@@ -462,7 +472,10 @@ mod custom_action_tests {
         let mut fields = fields();
         fields.model_override = Some("anthropic/claude:latest".into());
         let action = CustomQuickAction::new(fields).unwrap();
-        assert_eq!(action.effective_model(&settings), "anthropic/claude:latest");
+        assert_eq!(
+            action.effective_model(&settings),
+            ModelChoice::wiesel("anthropic/claude:latest")
+        );
         assert_eq!(settings.model, "openai/gpt-4o-mini");
     }
 
