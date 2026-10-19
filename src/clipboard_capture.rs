@@ -1,4 +1,5 @@
-//! Simulated Copy capture. Polled on the UI thread before Wiesel activates.
+//! Simulated Copy capture and Paste-back. Polled on the UI thread; both restore the
+//! user's clipboard afterwards unless a newer write has replaced it.
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -8,14 +9,19 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardItem, NSPasteboardTypeString,
-    NSPasteboardWriting, NSWorkspace,
+    NSApplicationActivationOptions, NSPasteboard, NSPasteboardAccessBehavior, NSPasteboardItem,
+    NSPasteboardTypeString, NSPasteboardWriting, NSRunningApplication, NSWorkspace,
 };
-use objc2_foundation::NSArray;
+use objc2_foundation::{NSArray, NSString};
 
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 const COPY_TIMEOUT: Duration = Duration::from_millis(1200);
 const SETTLE_TIME: Duration = Duration::from_millis(80);
+const ACTIVATE_TIMEOUT: Duration = Duration::from_millis(1500);
+// The source app must stay frontmost briefly so its key window receives Paste.
+const ACTIVE_SETTLE: Duration = Duration::from_millis(120);
+// Time for the target app to read the pasteboard before the old clipboard returns.
+const PASTE_SETTLE: Duration = Duration::from_millis(600);
 
 trait Pasteboard {
     type Saved;
@@ -23,11 +29,17 @@ trait Pasteboard {
     fn snapshot(&self) -> Result<Self::Saved>;
     fn text(&self) -> Result<String>;
     fn restore(&self, saved: &Self::Saved, expected: isize) -> Result<()>;
+    /// Replace the clipboard with plain text, returning the resulting change count.
+    fn write_text(&self, text: &str) -> Result<isize>;
 }
 trait CopyHost {
     fn is_active(&self) -> bool;
     fn keys_released(&self) -> bool;
     fn post_copy(&self) -> Result<()>;
+}
+trait PasteHost: CopyHost {
+    fn activate(&self) -> Result<()>;
+    fn post_paste(&self) -> Result<()>;
 }
 
 enum Phase {
@@ -257,6 +269,20 @@ impl Pasteboard for NativePasteboard {
         );
         Ok(())
     }
+    fn write_text(&self, text: &str) -> Result<isize> {
+        let cleared = self.0.clearContents();
+        ensure!(
+            self.0
+                .setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }),
+            "macOS rejected the result on the clipboard"
+        );
+        let written = self.change_count();
+        ensure!(
+            written == cleared,
+            "Another app changed the clipboard while Wiesel wrote the result"
+        );
+        Ok(written)
+    }
 }
 
 struct NativeHost {
@@ -297,9 +323,30 @@ impl CopyHost for NativeHost {
         unsafe { CGEventSourceFlagsState(1) & MODIFIERS == 0 && !CGEventSourceKeyState(1, 8) }
     }
     fn post_copy(&self) -> Result<()> {
+        self.post_command(8, "Copy")
+    }
+}
+impl PasteHost for NativeHost {
+    fn activate(&self) -> Result<()> {
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid)
+            .filter(|app| !app.isTerminated())
+            .context("The source app has quit")?;
+        ensure!(
+            app.activateWithOptions(NSApplicationActivationOptions::empty()),
+            "macOS refused to reactivate the source app"
+        );
+        Ok(())
+    }
+    fn post_paste(&self) -> Result<()> {
+        self.post_command(9, "Paste")
+    }
+}
+impl NativeHost {
+    /// Post Command plus one virtual key code to the source app only.
+    fn post_command(&self, key: u16, name: &str) -> Result<()> {
         ensure!(
             unsafe { CGPreflightPostEventAccess() },
-            "macOS denied simulated Copy. Recheck Wiesel's Accessibility permission and relaunch."
+            "macOS denied simulated {name}. Recheck Wiesel's Accessibility permission and relaunch."
         );
         let source = Event(unsafe { CGEventSourceCreate(-1) });
         ensure!(
@@ -310,18 +357,21 @@ impl CopyHost for NativeHost {
         // Allocate every event first so allocation failure cannot leave Command down.
         for (key, down, flags) in [
             (55, true, 1 << 20),
-            (8, true, 1 << 20),
-            (8, false, 1 << 20),
+            (key, true, 1 << 20),
+            (key, false, 1 << 20),
             (55, false, 0),
         ] {
             let event = Event(unsafe { CGEventCreateKeyboardEvent(source.0, key, down) });
-            ensure!(!event.0.is_null(), "Could not create Copy keyboard events");
+            ensure!(
+                !event.0.is_null(),
+                "Could not create {name} keyboard events"
+            );
             unsafe { CGEventSetFlags(event.0, flags) };
             events.push(event);
         }
         ensure!(
             self.is_active() && self.keys_released(),
-            "Source app or keyboard state changed; Copy was not sent"
+            "Source app or keyboard state changed; {name} was not sent"
         );
         for event in events {
             unsafe { CGEventPostToPid(self.pid, event.0) };
@@ -340,6 +390,156 @@ impl CopyCapture {
         ))
     }
     pub fn poll(&mut self) -> Option<Result<String>> {
+        self.0.poll(Instant::now())
+    }
+    pub fn pid(&self) -> i32 {
+        self.0.host.pid
+    }
+}
+
+/// Why a paste-back ended without a clean result.
+#[derive(Debug)]
+pub enum PasteError {
+    /// Nothing reached the source app; the clipboard is unchanged.
+    NotPasted(anyhow::Error),
+    /// Paste was sent, but the previous clipboard could not be put back.
+    Restore(anyhow::Error),
+}
+
+enum PastePhase {
+    Activate {
+        started: Instant,
+        active_since: Option<Instant>,
+    },
+    Settle {
+        written: isize,
+        sent: Instant,
+    },
+    Done,
+}
+struct PasteSession<B: Pasteboard, H: PasteHost> {
+    board: B,
+    host: H,
+    text: zeroize::Zeroizing<String>,
+    saved: Option<B::Saved>,
+    phase: PastePhase,
+}
+impl<B: Pasteboard, H: PasteHost> PasteSession<B, H> {
+    fn new(board: B, host: H, text: String, now: Instant) -> Self {
+        // A refused activation still has the timeout below to come to the front.
+        let _ = host.activate();
+        Self {
+            board,
+            host,
+            text: zeroize::Zeroizing::new(text),
+            saved: None,
+            phase: PastePhase::Activate {
+                started: now,
+                active_since: None,
+            },
+        }
+    }
+    fn poll(&mut self, now: Instant) -> Option<Result<(), PasteError>> {
+        let result = self.advance(now);
+        if !matches!(result, Ok(false)) {
+            self.phase = PastePhase::Done;
+        }
+        match result {
+            Ok(false) => None,
+            Ok(true) => Some(Ok(())),
+            Err(error) => Some(Err(error)),
+        }
+    }
+    fn advance(&mut self, now: Instant) -> Result<bool, PasteError> {
+        match &mut self.phase {
+            PastePhase::Done => Ok(false),
+            PastePhase::Activate {
+                started,
+                active_since,
+            } => {
+                if !(self.host.is_active() && self.host.keys_released()) {
+                    *active_since = None;
+                    if now.duration_since(*started) >= ACTIVATE_TIMEOUT {
+                        return Err(PasteError::NotPasted(anyhow::anyhow!(
+                            "Could not return to the source app. Nothing was pasted."
+                        )));
+                    }
+                    return Ok(false);
+                }
+                let since = *active_since.get_or_insert(now);
+                if now.duration_since(since) < ACTIVE_SETTLE {
+                    return Ok(false);
+                }
+                let not_pasted = PasteError::NotPasted;
+                let baseline = self.board.change_count();
+                let saved = self
+                    .board
+                    .snapshot()
+                    .context("Could not safely save the clipboard; nothing was pasted")
+                    .map_err(not_pasted)?;
+                if self.board.change_count() != baseline {
+                    return Err(not_pasted(anyhow::anyhow!(
+                        "The clipboard changed while saving it. Nothing was pasted."
+                    )));
+                }
+                let written = self.board.write_text(&self.text).map_err(not_pasted)?;
+                // From here on the clipboard holds the result and must be restored.
+                self.saved = Some(saved);
+                if let Err(error) = self.host.post_paste() {
+                    return Err(match self.restore(written) {
+                        Ok(()) => not_pasted(error),
+                        Err(restore) => PasteError::Restore(restore),
+                    });
+                }
+                self.phase = PastePhase::Settle { written, sent: now };
+                Ok(false)
+            }
+            PastePhase::Settle { written, sent } => {
+                if now.duration_since(*sent) < PASTE_SETTLE {
+                    return Ok(false);
+                }
+                let written = *written;
+                self.restore(written).map_err(PasteError::Restore)?;
+                Ok(true)
+            }
+        }
+    }
+    /// Put the saved clipboard back unless something newer than our write is there.
+    fn restore(&mut self, written: isize) -> Result<()> {
+        let Some(saved) = self.saved.take() else {
+            return Ok(());
+        };
+        if self.board.change_count() != written {
+            // The user or the target app copied something; keep the newer content.
+            return Ok(());
+        }
+        self.board
+            .restore(&saved, written)
+            .context("Could not restore the previous clipboard after pasting")
+    }
+}
+impl<B: Pasteboard, H: PasteHost> Drop for PasteSession<B, H> {
+    fn drop(&mut self) {
+        if let PastePhase::Settle { written, .. } = self.phase
+            && let Err(error) = self.restore(written)
+        {
+            eprintln!("Wiesel cancelled paste cleanup: {error:#}");
+        }
+    }
+}
+
+/// Return to the source app, paste `text` over its selection, then restore the clipboard.
+pub struct PasteBack(PasteSession<NativePasteboard, NativeHost>);
+impl PasteBack {
+    pub fn new(pid: i32, text: String) -> Self {
+        Self(PasteSession::new(
+            NativePasteboard(NSPasteboard::generalPasteboard()),
+            NativeHost { pid },
+            text,
+            Instant::now(),
+        ))
+    }
+    pub fn poll(&mut self) -> Option<Result<(), PasteError>> {
         self.0.poll(Instant::now())
     }
 }
@@ -383,11 +583,18 @@ mod tests {
             self.restores.set(self.restores.get() + 1);
             Ok(())
         }
+        fn write_text(&self, text: &str) -> Result<isize> {
+            self.version.set(self.version.get() + 1);
+            *self.items.borrow_mut() = vec![vec![("text".into(), text.as_bytes().to_vec())]];
+            *self.text.borrow_mut() = Some(text.into());
+            Ok(self.version.get())
+        }
     }
     struct FakeHost {
         active: Cell<bool>,
         released: Cell<bool>,
         copies: Cell<usize>,
+        pastes: Cell<usize>,
     }
     impl CopyHost for Rc<FakeHost> {
         fn is_active(&self) -> bool {
@@ -398,6 +605,15 @@ mod tests {
         }
         fn post_copy(&self) -> Result<()> {
             self.copies.set(self.copies.get() + 1);
+            Ok(())
+        }
+    }
+    impl PasteHost for Rc<FakeHost> {
+        fn activate(&self) -> Result<()> {
+            Ok(())
+        }
+        fn post_paste(&self) -> Result<()> {
+            self.pastes.set(self.pastes.get() + 1);
             Ok(())
         }
     }
@@ -415,6 +631,7 @@ mod tests {
                 active: Cell::new(true),
                 released: Cell::new(true),
                 copies: Cell::new(0),
+                pastes: Cell::new(0),
             }),
         )
     }
@@ -646,5 +863,97 @@ mod tests {
         session.poll(now + Duration::from_millis(40));
         drop(session);
         assert_eq!(board.restores.get(), 1);
+    }
+
+    fn original() -> Items {
+        vec![vec![("public.png".into(), vec![1, 2, 3])]]
+    }
+    fn paste(
+        board: &Rc<FakeBoard>,
+        host: &Rc<FakeHost>,
+        now: Instant,
+    ) -> PasteSession<Rc<FakeBoard>, Rc<FakeHost>> {
+        PasteSession::new(board.clone(), host.clone(), "Result".into(), now)
+    }
+    #[test]
+    fn paste_waits_for_the_source_then_restores_the_previous_clipboard() {
+        let (board, host) = fixture(original());
+        host.active.set(false);
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        assert!(session.poll(now).is_none());
+        host.active.set(true);
+        assert!(session.poll(now + Duration::from_millis(10)).is_none());
+        assert_eq!(host.pastes.get(), 0, "source must settle before Paste");
+        assert!(session.poll(now + Duration::from_millis(200)).is_none());
+        assert_eq!(host.pastes.get(), 1);
+        assert_eq!(board.text.borrow().as_deref(), Some("Result"));
+        assert!(session.poll(now + Duration::from_millis(400)).is_none());
+        assert!(matches!(
+            session.poll(now + Duration::from_millis(900)),
+            Some(Ok(()))
+        ));
+        assert_eq!(*board.items.borrow(), original());
+        assert!(session.poll(now + Duration::from_secs(2)).is_none());
+    }
+    #[test]
+    fn paste_is_abandoned_when_the_source_never_returns() {
+        let (board, host) = fixture(original());
+        host.active.set(false);
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        assert!(matches!(
+            session.poll(now + ACTIVATE_TIMEOUT),
+            Some(Err(PasteError::NotPasted(_)))
+        ));
+        assert_eq!(host.pastes.get(), 0);
+        assert_eq!(board.version.get(), 10, "clipboard untouched");
+    }
+    #[test]
+    fn held_shortcut_keys_delay_paste() {
+        let (board, host) = fixture(original());
+        host.released.set(false);
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        assert!(session.poll(now + Duration::from_millis(500)).is_none());
+        assert_eq!(host.pastes.get(), 0);
+    }
+    #[test]
+    fn unreadable_clipboard_is_never_replaced_by_the_result() {
+        let (board, host) = fixture(original());
+        board.fail_snapshot.set(true);
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        session.poll(now);
+        assert!(matches!(
+            session.poll(now + ACTIVE_SETTLE),
+            Some(Err(PasteError::NotPasted(_)))
+        ));
+        assert_eq!(host.pastes.get(), 0);
+        assert_eq!(*board.items.borrow(), original());
+    }
+    #[test]
+    fn newer_clipboard_after_paste_is_preserved() {
+        let (board, host) = fixture(original());
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        session.poll(now);
+        session.poll(now + ACTIVE_SETTLE);
+        board.version.set(board.version.get() + 1);
+        assert!(matches!(
+            session.poll(now + ACTIVE_SETTLE + PASTE_SETTLE),
+            Some(Ok(()))
+        ));
+        assert_eq!(board.restores.get(), 0);
+    }
+    #[test]
+    fn dropped_paste_still_restores_the_clipboard() {
+        let (board, host) = fixture(original());
+        let now = Instant::now();
+        let mut session = paste(&board, &host, now);
+        session.poll(now);
+        session.poll(now + ACTIVE_SETTLE);
+        drop(session);
+        assert_eq!(*board.items.borrow(), original());
     }
 }
