@@ -39,7 +39,7 @@ use input::TextInput;
 use navigation::{EntryId, Navigation};
 use notifications::{Notification, Notifications, Severity, Source};
 use quick_actions::QuickAction;
-use settings::{ActionModel, ModelChoice, Provider, Settings, Tier};
+use settings::{ActionModel, Appearance, ModelChoice, Provider, Settings, Tier};
 use std::{
     str::FromStr,
     sync::{Arc, mpsc},
@@ -2148,6 +2148,35 @@ impl Wiesel {
         }
         cx.notify();
     }
+    fn apply_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        if self.settings.appearance == appearance {
+            return;
+        }
+        if self.actions.read_only {
+            self.notifications
+                .warning("Saving is disabled. Repair the settings file and relaunch.");
+            cx.notify();
+            return;
+        }
+        let mut next = self.settings.clone();
+        next.appearance = appearance;
+        match self.persist_settings(&next) {
+            Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
+                self.notifications.clear(Source::Settings);
+                self.settings = next;
+            }
+            Err(e) => {
+                self.record_diagnostic(Event::failure(Category::Settings, FailureCode::Storage));
+                self.notifications.report(
+                    Source::Settings,
+                    "Could not save the theme. Try again.",
+                    &e,
+                );
+            }
+        }
+        cx.notify();
+    }
     fn persist_settings(&mut self, next: &Settings) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(persist) = &mut self.actions.persist {
@@ -3200,7 +3229,7 @@ enum MenuCommand {
 }
 impl Render for Wiesel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        theme::set_appearance(window.appearance());
+        theme::set_appearance(self.settings.appearance, window.appearance());
         let palette = theme::p();
         self.notifications
             .update(Instant::now(), self.idle_notification());

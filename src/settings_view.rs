@@ -142,6 +142,56 @@ fn row(
         )
 }
 
+/// One option of a segmented control; the active one is a raised card.
+fn segment(id: &'static str, title: &'static str, active: bool) -> Stateful<Div> {
+    let palette = theme::p();
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .aria_label(title)
+        .aria_selected(active)
+        .flex_1()
+        .h(px(24.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .rounded(px(3.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .map(|d| {
+            if active {
+                d.bg(rgb(palette.card))
+                    .border_1()
+                    .border_color(rgba(palette.border))
+                    .shadow(vec![
+                        theme::shadow(0., 1., 2., 0., 0x0000001f),
+                        theme::shadow(0., 1., 0., 0., palette.edge_highlight),
+                    ])
+            } else {
+                d.text_color(rgb(palette.muted))
+                    .hover(|s| s.text_color(rgb(theme::p().foreground)))
+            }
+        })
+}
+
+/// Recessed track holding segments.
+fn segmented(id: &'static str, role: Role, label: &'static str) -> Stateful<Div> {
+    let palette = theme::p();
+    div()
+        .id(id)
+        .role(role)
+        .aria_label(label)
+        .flex()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(5.))
+        .bg(rgb(palette.field))
+        .border_1()
+        .border_color(rgba(palette.input_border))
+}
+
 /// Read-only value on the right of a row.
 fn value(text: impl Into<SharedString>) -> Div {
     div()
@@ -183,7 +233,10 @@ impl Wiesel {
                     })
                     .child(section("Providers", self.provider_rows(cx)))
                     .child(section("Models", self.model_rows(cx)))
-                    .child(section("General", vec![self.shortcut_row(cx)]))
+                    .child(section(
+                        "General",
+                        vec![self.shortcut_row(cx), self.appearance_row(cx)],
+                    ))
                     .child(section("Permissions", vec![self.accessibility_row()]))
                     .child(section("Diagnostics", vec![self.diagnostics_row(cx)])),
             )
@@ -400,46 +453,40 @@ impl Wiesel {
         )
     }
 
+    fn appearance_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let options = Appearance::ALL.into_iter().map(|appearance| {
+            let id = match appearance {
+                Appearance::Auto => "appearance-auto",
+                Appearance::Light => "appearance-light",
+                Appearance::Dark => "appearance-dark",
+            };
+            segment(
+                id,
+                appearance.name(),
+                self.settings.appearance == appearance,
+            )
+            .role(Role::RadioButton)
+            .child(appearance.name())
+            .on_click(cx.listener(move |this, _, _, cx| this.apply_appearance(appearance, cx)))
+        });
+        row(
+            "Theme",
+            Some("Auto follows macOS.".into()),
+            segmented("appearance-options", Role::RadioGroup, "Theme").children(options),
+        )
+    }
+
     /// Provider switch on top; the selected provider's rows below it.
     fn provider_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
-        let palette = theme::p();
         let ollama_led = match &self.ollama_status {
             Some(ollama::Status::Running { .. }) => Some(theme::LED_GREEN),
             Some(_) => Some(theme::LED_AMBER),
             None => None,
         };
         let wiesel_led = self.authenticated.then_some(theme::LED_GREEN);
-        let tab = |provider: Provider, title: &'static str, led: Option<u32>| {
-            let active = self.provider_tab == provider;
-            div()
-                .id(title)
-                .debug_selector(move || format!("provider-tab-{}", title.to_lowercase()))
+        let tab = |provider: Provider, title: &'static str, id: &'static str, led: Option<u32>| {
+            segment(id, title, self.provider_tab == provider)
                 .role(Role::Tab)
-                .aria_label(title)
-                .aria_selected(active)
-                .flex_1()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(8.))
-                .rounded(px(3.))
-                .text_size(px(12.))
-                .cursor_pointer()
-                .map(|d| {
-                    if active {
-                        d.bg(rgb(palette.card))
-                            .border_1()
-                            .border_color(rgba(palette.border))
-                            .shadow(vec![
-                                theme::shadow(0., 1., 2., 0., 0x0000001f),
-                                theme::shadow(0., 1., 0., 0., palette.edge_highlight),
-                            ])
-                    } else {
-                        d.text_color(rgb(palette.muted))
-                            .hover(|s| s.text_color(rgb(theme::p().foreground)))
-                    }
-                })
                 .children(led.map(theme::led))
                 .child(title)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -448,19 +495,19 @@ impl Wiesel {
                 }))
         };
         let switch = div().id("provider-tabs").mx(px(14.)).py(px(10.)).child(
-            div()
-                .id("provider-tab-list")
-                .role(Role::TabList)
-                .aria_label("Providers")
-                .flex()
-                .p(px(2.))
-                .gap(px(2.))
-                .rounded(px(5.))
-                .bg(rgb(palette.field))
-                .border_1()
-                .border_color(rgba(palette.input_border))
-                .child(tab(Provider::Ollama, "Ollama", ollama_led))
-                .child(tab(Provider::Wiesel, "Wiesel", wiesel_led)),
+            segmented("provider-tab-list", Role::TabList, "Providers")
+                .child(tab(
+                    Provider::Ollama,
+                    "Ollama",
+                    "provider-tab-ollama",
+                    ollama_led,
+                ))
+                .child(tab(
+                    Provider::Wiesel,
+                    "Wiesel",
+                    "provider-tab-wiesel",
+                    wiesel_led,
+                )),
         );
         let mut rows = vec![switch];
         rows.extend(match self.provider_tab {

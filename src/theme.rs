@@ -1,6 +1,8 @@
 //! Tokens from Paper's "Wiesel MPC · Clean A (light)" and "Clean B (dark)" artboards:
 //! a quiet chassis, a slim header with the wordmark and a status LED, and backlit rubber pads.
-//! The palette follows the macOS appearance; `set_appearance` is called before every frame.
+//! The palette follows the Appearance setting (Auto tracks macOS); `set_appearance` is called
+//! before every frame.
+use crate::settings::Appearance;
 use gpui::{prelude::*, *};
 use std::{
     borrow::Cow,
@@ -116,12 +118,17 @@ pub const DARK: Palette = Palette {
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Follow the window's effective macOS appearance. Returns true when it changed.
-pub fn set_appearance(appearance: WindowAppearance) -> bool {
-    let dark = matches!(
-        appearance,
-        WindowAppearance::Dark | WindowAppearance::VibrantDark
-    );
+/// Apply the user's preference, resolving Auto against the window's effective macOS
+/// appearance. Returns true when it changed.
+pub fn set_appearance(preference: Appearance, system: WindowAppearance) -> bool {
+    let dark = match preference {
+        Appearance::Auto => matches!(
+            system,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ),
+        Appearance::Light => false,
+        Appearance::Dark => true,
+    };
     DARK_MODE.swap(dark, Ordering::Relaxed) != dark
 }
 
@@ -440,6 +447,7 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::{Assets, DARK, LIGHT, icon, p, set_appearance};
+    use crate::settings::Appearance;
     use gpui::{AssetSource, Styled, WindowAppearance, rgb};
 
     #[test]
@@ -458,7 +466,9 @@ mod tests {
         assert_ne!(LIGHT.chassis, DARK.chassis);
         assert_ne!(LIGHT.foreground, DARK.foreground);
         // Only assert the light default: other tests in this process render in Light.
-        set_appearance(WindowAppearance::Light);
+        set_appearance(Appearance::Auto, WindowAppearance::Light);
+        assert!(!p().dark);
+        set_appearance(Appearance::Light, WindowAppearance::Dark);
         assert!(!p().dark);
     }
     #[test]
