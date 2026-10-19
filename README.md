@@ -1,382 +1,138 @@
-# Wiesel 🦫
+<p align="center">
+  <img src="docs/assets/wiesel.png" alt="Wiesel's launcher: a grid of quick actions like Fix spelling, Rewrite, Chat, Summarize and Explain" width="420">
+</p>
 
-A small, Raycast-inspired native writing launcher built with Rust and GPUI. **This first version supports macOS only**; other targets are explicitly rejected until their native selection and persistent credential backends are implemented.
+<h1 align="center">Wiesel</h1>
 
-## Install a release
+<p align="center">
+  <strong>Select text anywhere. Press a shortcut. Let AI do the rest.</strong><br>
+  A tiny, fast, native writing sidekick for macOS.
+</p>
 
-Download a DMG from this repository's GitHub **Releases** page. Choose the latest
-**stable** release for normal use, or a release marked **Pre-release** to test the
-next preview. Preview tags end in `-pre`; stable tags do not. Choose
-`macos-arm64` for Apple Silicon or `macos-x86_64` for Intel. Open it and drag
-**Wiesel.app** to **Applications**. ZIP downloads and SHA-256 checksum files are
-also provided.
+<p align="center">
+  <a href="https://github.com/zeekrey/wiesel/releases/latest"><strong>Download for macOS</strong></a> ·
+  <a href="https://wiesel.run">wiesel.run</a>
+</p>
 
-**These builds are ad-hoc signed, not Apple-notarized.** macOS may block a
-downloaded app. Only if you trust the release, try launching it, then use
-**System Settings → Privacy & Security → Open Anyway** and confirm. Do not
-disable Gatekeeper globally. See Apple's
-[guidance for opening apps safely](https://support.apple.com/en-us/102445).
-Grant Accessibility access during [first launch](#first-launch).
+---
 
-Verify downloaded assets before installing:
+## Why Wiesel?
 
-```sh
-# Download the matching .sha256 file, DMG and ZIP into the same directory:
-shasum -a 256 -c Wiesel-<version>-macos-<arch>.sha256
+You're writing an email, a doc or a Slack message, and the sentence just isn't right. Instead of copy-pasting into a chat window, you highlight it, press **⌘⇧Space**, then hit **1**. Done.
+
+- ✍️ **Fix spelling, rewrite, summarize, explain** with one keystroke
+- 💬 **Chat** about anything you selected
+- 🧩 **Your own quick actions**: up to nine pads, each with its own prompt, icon and model
+- 📋 **Paste result back**: let an action replace your selection directly, no extra clicks
+- 🏠 **Runs locally if you want**: use [Ollama](https://ollama.com) on your Mac, or sign in to Wiesel for cloud models
+- 🪶 **Native and lightweight**: no Electron, follows Light/Dark mode, stays out of your way
+
+## Install
+
+1. Download the latest **`.dmg`** from [Releases](https://github.com/zeekrey/wiesel/releases/latest)
+   - Apple Silicon (M1 and later): `macos-arm64`
+   - Intel Mac: `macos-x86_64`
+2. Open it and drag **Wiesel** into **Applications**.
+3. Launch Wiesel.
+
+> [!NOTE]
+> Wiesel isn't notarized by Apple yet, so macOS may refuse to open it the first time.
+> Go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**.
+
+## Set it up (two minutes, promise)
+
+**1. Pick your shortcut.** The default is **⌘⇧Space**. Press a new combo to record your own.
+
+**2. Allow Accessibility.** Wiesel needs this to copy your selected text.
+Open **System Settings → Privacy & Security → Accessibility** and switch on **Wiesel**.
+Wiesel notices right away, no restart needed.
+
+**3. Choose where the AI lives.** In **Settings**, pick a provider tab:
+
+| | **Wiesel** (cloud) | **Ollama** (local) |
+|---|---|---|
+| Setup | Click **Login / Sign up** and finish in your browser | Install [Ollama](https://ollama.com) and pull a model, e.g. `ollama pull llama3` |
+| Account | An account at [wiesel.run](https://wiesel.run) | None |
+| Your text goes to | Wiesel and its model provider | Nowhere. It stays on your Mac |
+
+**4. Assign your models.** Wiesel has three speed tiers, and you can pick any model for each:
+
+- ⚡ **Swift**: fast and clever, for quick fixes and short replies
+- 🎯 **Sharp**: balanced, used by default
+- 🧠 **Sage**: slow and super smart, for the hard problems
+
+That's it. Go select some text. 🎉
+
+## Use it
+
+| Do this | To get this |
+|---|---|
+| Select text, press **⌘⇧Space** | Wiesel opens with your text ready |
+| **1** – **9** | Run the matching quick action |
+| **⌘N** | New chat |
+| **⌘,** | Settings |
+| **Esc** | Go back, or hide Wiesel |
+| **⌘Q** | Quit |
+
+Results show up in Wiesel so you can review and **Copy** them. Turn on **Paste result back** for an action and Wiesel pastes over your selection instead.
+
+### Make your own quick actions
+
+Click the **+** pad (or **File → New Quick Action…**), give it a name and an icon, and write instructions. Two placeholders make it useful:
+
+- `{selection}`: the text you selected
+- `{clipboard}`: whatever's on your clipboard
+
+```text
+Translate the following into friendly, casual German:
+
+{selection}
 ```
 
-Wiesel uses manually triggered **preview → stable release trains**. `main` runs
-CI without publishing; release branches produce installers. For contribution
-instructions, release commands, and one-time GitHub configuration, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Each action can use a tier (Swift, Sharp, Sage) or a specific model. Edit or remove actions anytime with **Wiesel → Adjust Quick Actions…**. The built-in ones too.
 
-## Run
+## Privacy
 
-```sh
-cargo run --locked
-```
+- Wiesel only sends text **when you run an action or hit Send**.
+- With **Ollama**, nothing leaves your Mac.
+- Chats and results live in memory only. Nothing is saved to disk.
+- Your clipboard is restored after Wiesel grabs your selection.
+- Login tokens are stored in the macOS Keychain.
 
-For a named app bundle (recommended for Accessibility permissions):
+## FAQ
 
-```sh
-bash scripts/build-app.sh
-open dist/Wiesel.app
-# Optional optimized build:
-bash scripts/build-app.sh --release
-```
+<details>
+<summary><strong>Wiesel says it needs Accessibility, but I already allowed it.</strong></summary>
 
-GPUI is pinned to a specific Zed revision. Runtime Metal shader compilation is enabled, so the standalone `metal` build tool/full Xcode installation is not required. Rust and Apple's Command Line Tools are still required. Without signing configuration, `build-app.sh` uses a local ad-hoc signature; rebuilding can require re-granting Accessibility permission. Configure persistent development signing below to avoid that. Distribution signing/notarization is a separate concern.
+Remove Wiesel from the Accessibility list with the **–** button, add it again with **+**, then relaunch Wiesel. This usually happens after an update.
+</details>
 
-## Development builds
+<details>
+<summary><strong>Nothing happens when I press the shortcut.</strong></summary>
 
-### One-time signing setup
+Another app might already use that combo. Pick a different one in **Settings**.
+</details>
 
-macOS checks the app's code-signing identity, not just its bundle ID. Use the **same certificate** for successive builds, keep `com.wiesel.launcher` unchanged, and launch the same `dist/Wiesel.app` path. This should preserve Accessibility authorization across normal rebuilds, but verify it on your macOS version. Replacing/renewing the certificate or moving the app may require authorization again.
+<details>
+<summary><strong>It doesn't work in a certain app.</strong></summary>
 
-Choose one certificate option:
+Wiesel grabs your selection by copying it. Apps that block copying (and password fields) can't be read. Paste the text into **Chat** instead.
+</details>
 
-- **Apple Development:** If you have an Apple Developer team, create an Apple Development certificate using Xcode's **Settings → Accounts → your team → Manage Certificates → + → Apple Development**. It must appear in your Keychain with its private key.
-- **Local development only, no developer account:** Open **Keychain Access → Certificate Assistant → Create a Certificate** (in Keychain Access's application menu). Name it **Wiesel Development**, select **Self Signed Root** as Identity Type and **Code Signing** as Certificate Type. Enable **Let me override defaults** if you want a longer validity period, and complete the assistant, storing the identity in your login keychain. Keep this certificate and its private key rather than recreating them for each build. In its **Get Info → Trust** section, set **Code Signing** to **Always Trust** if needed for it to be recognized as valid; leave unrelated trust purposes at their defaults. macOS may ask for your password to save the trust change. Do not use this certificate for distribution.
+<details>
+<summary><strong>Ollama shows "not running".</strong></summary>
 
-Check that your identity is usable:
+Open the Ollama app, or run `ollama serve`, then click **Check** in Settings.
+</details>
 
-```sh
-security find-identity -v -p codesigning
-```
+<details>
+<summary><strong>Does it work on Windows or Linux?</strong></summary>
 
-It must list a valid identity; a certificate without a private key is insufficient. Configure its **exact name** or, preferably, its listed SHA-1 fingerprint (avoids duplicate-name ambiguity):
+Not yet. Wiesel is macOS-only for now.
+</details>
 
-```sh
-cp .wiesel-dev.env.example .wiesel-dev.env
-# Edit .wiesel-dev.env to use your certificate's name or fingerprint.
-```
+---
 
-`.wiesel-dev.env` is ignored by Git and sourced as trusted local shell configuration. Alternatively, set `WIESEL_SIGNING_IDENTITY` in your shell; a nonempty environment value takes precedence over the file:
-
-```sh
-export WIESEL_SIGNING_IDENTITY='Wiesel Development'
-```
-
-On the first certificate-signed launch, remove the old ad-hoc Wiesel Accessibility entry if necessary, add this repo's `dist/Wiesel.app`, and relaunch. Subsequent builds use the same certificate and macOS-generated designated requirement. You can inspect the requirement with `codesign -d -r- dist/Wiesel.app`; it should remain stable across rebuilds even though the executable's code hash changes. No script creates certificates, changes Keychain trust, or resets/grants permissions.
-
-### Build and restart with one command
-
-```sh
-bash scripts/dev.sh
-# Optional optimized build:
-bash scripts/dev.sh --release
-```
-
-The command validates the signing identity, compiles, then stages/signs/verifies a new bundle **before stopping the current app**. It sends SIGTERM only to processes whose executable path matches this repo's bundle, waits up to five seconds, replaces the bundle at the same path, and launches it. Other installed copies of Wiesel are not stopped. No Automation permission or AppleScript is required.
-
-- Compilation/signing failures leave the old app running and its bundle unchanged.
-- If Wiesel does not exit, the command aborts without force-killing or replacing it. Quit manually with Command-Q and retry.
-- An installation failure attempts to restore the old bundle, but a previously stopped app must be relaunched manually. A launch failure leaves the newly installed bundle available to launch with `open dist/Wiesel.app`.
-- Builds are serialized with `dist/.build-lock`. If a process is killed without cleanup, confirm no build is active before removing that empty directory with `rmdir dist/.build-lock`.
-- **Restart loses in-memory chat/drafts and interrupts requests. SIGTERM is not an application-level graceful quit and can interrupt clipboard restoration. Do not restart during selection capture.**
-
-`build-app.sh` shares the staging/signing logic but does not stop or launch an app. It refuses to replace this bundle while it is running. It uses your configured identity when present, or explicitly warns and uses ad-hoc signing when none is configured. `dev.sh` never falls back to ad-hoc signing. This is manual one-command restart, not a file watcher or Rust hot reload.
-
-## First launch
-
-1. Record a global shortcut or enter one such as `Super+Shift+Space` (`Super` is Command on macOS). Recorded shortcuts activate and save immediately; after typing a shortcut, click **Apply shortcut**. The shortcut works independently of account login, including before onboarding is complete. The default shortcut is registered at launch. Avoid shortcuts already owned by the OS or another app. Registration failures are shown during setup.
-2. Choose **Login / Sign up ↗** to open your external system browser at [wiesel.run](https://wiesel.run). On the login-focused first-run surface, Enter opens login; **Command-Shift-L** opens account settings/login from any screen, including while a request is pending. There is no token-paste field. For a new account, complete website signup and email verification, then **Reopen Login / Sign up ↗** in Wiesel to start a fresh desktop attempt. Keep Wiesel running while finishing browser login.
-3. After login, the authenticated Wiesel model catalog loads automatically. Open **Model**, search by provider or model name, and use ↑/↓ and Enter or click an option. Choose a text/chat model; the catalog may contain other model IDs, but this app sends text/chat requests only. **Refresh models** updates the catalog. The selection is saved with **Save & start**.
-4. Optionally edit the two writing system prompts. Select **Save & start**.
-5. Grant the built **Wiesel.app** access under **System Settings → Privacy & Security → Accessibility** (shown as **Gerätesteuerung und Datenzugriff** on some German macOS versions). Accessibility is required for simulated Copy and protected-field checks; Input Monitoring, Screen Recording, and Automation are not required. On newer macOS versions, allow Wiesel to paste from other apps if asked: Copy capture reads the clipboard to save and restore it. When running with Cargo instead, macOS may associate permission with the terminal or binary.
-
-Every screen has the same **48px bottom status bar**: green for success/ready, yellow for missing input or permissions, red for failures, and muted for work in progress. Status messages stay on one line; the action editor also shows inline validation/save errors. Accessibility is checked for the running process every second using macOS's `AXIsProcessTrusted()`. **Privacy settings** and **Check again** are available in Settings. If Wiesel still requests access after a rebuild despite the macOS toggle being enabled, remove the old entry, add the current `dist/Wiesel.app`, and relaunch. Permission does not guarantee that the target app supports Copy.
-
-### Browser login and device sessions
-
-Wiesel opens `https://wiesel.run/desktop/login` using PKCE S256: fresh independent random state and verifier stay in app memory; only the challenge and state go to the browser. The native `wiesel://auth/callback` route is registered in the app bundle and received through GPUI's macOS URL event handler for running and cold launches. A matching callback is consumed once before exchange. **Cancel login**, Escape while waiting, or reopening login invalidates the old attempt and any pending exchange completion. Attempts expire after ten minutes. If Wiesel quit/restarted, an old callback cannot restore the lost attempt: reopen login for a fresh one. Browser opening/OS routing still needs the signed-bundle manual checks below; `cargo run` alone is not a scheme-registration test.
-
-A successful exchange stores the backend-issued device token, expiry and device ID only in macOS Keychain, service `com.wiesel.desktop.auth`, account `device:<UUID>`; `active-device` stores just the UUID. No browser cookies or provider API keys are used by desktop requests. Existing `com.wiesel.ai-gateway` provider-key entries are deleted without reading or converting them. Saved credentials are checked for expiry on launch, before requests and during polling. Startup also validates the saved device asynchronously. **Check login** retries a failed status check. Expired/rejected (HTTP 401) credentials require a fresh browser login; **there is no refresh token or automatic refresh**.
-
-**Sign out** ends the local session and removes its captured device's Keychain entry independently of the remote sign-out request. Pending results cannot revive the session. Sign-out, expiry, rejected-session cleanup and failed-cleanup retries retain the original device identity: they never delete whichever newer device another app instance has saved. The shared active pointer is removed only if it still identifies that device. All credential load/save/delete operations (including legacy cleanup and rollback) are serialized across participating Wiesel processes by `~/Library/Application Support/Wiesel/desktop-auth.lock`, a nonsecret, empty file. Do not unlink or replace this file while an instance is running; closing the OS lock handle releases it automatically, including after a process exits.
-
-Native removal uses Security.framework's status-checked `SecItemDelete` for both device and legacy entries, restricted to the same User-domain keychain and exact generic-password service/account used by keyring. Only native success or item-not-found is treated as harmless. If deletion fails, the app reports incomplete saved-login recovery, blocks new login, retains its cleanup target and offers **Retry saved login removal**. Do not assume persistent logout until removal succeeds. A startup failure that never safely observed a pointer instead offers **Retry restoring login**, not deletion of a later credential. A captured corrupt pointer can only remove that exact metadata snapshot; it never guesses a device record. Corrupt-pointer recovery may leave an unreachable secure record, rather than risking deletion of another device. Remote sign-out failure is reported separately; verify/revoke the device on the website if needed. Sign-out does not abort an already-sent generation request or promise a refund. Plan and virtual credits are informational projections, not a promise that a model request will be admitted.
-
-## Use
-
-- Leave Wiesel running. Select text in another app, press your shortcut, then release the shortcut keys. Keep the source app active until Wiesel opens; Wiesel uses simulated ⌘C and restores your clipboard before opening.
-- Home displays the remaining built-in actions in their original order as numbered pads in a three-column grid, with custom actions appended, empty slots up to nine, **Add action** in the last slot, and scrolling for overflow. Press `1`–`9` to run the pad printed with that number. **Settings…** (⌘,) and **Adjust Quick Actions…** live in the macOS **Wiesel** menu; **File → New Chat** (⌘N) and **New Quick Action…** are there too.
-- Wiesel follows the macOS Light/Dark appearance and switches live.
-- Choose **Fix spelling** (`1`) or **Rewrite** (`2`) to immediately send the captured selection with your saved instructions to wiesel.run and its model provider. Review the original and result, then **Copy result** and paste it back. Wiesel replaces text only for actions with **Paste result back** turned on.
-- Choose **Chat** (`3`) for a conversation. Enter sends. **New chat** clears the conversation; messages can be copied individually. Chat has a single-line composer in this first version.
-- **Summarize** (`4`) and **Explain** (`5`) send the captured selection with built-in prompts to wiesel.run and its model provider and show the result for review and copying.
-- **Add quick action** opens an editor for a name, embedded icon, optional model override and multiline instructions. **Default model** follows the current app setting; an override applies only to that action's request. Save with **Create action / Save changes** or Command-Enter. **Adjust Quick Actions…** edits or deletes both built-in and custom actions; deletion requires confirmation and persists across relaunches. Back, Escape and Cancel confirm before discarding dirty drafts. Failed validation or saving keeps the editor open to retry. An unavailable model override reports an error without a fallback request.
-- **Paste result back** (off by default; not offered for the built-in Chat) skips the result view: the pressed pad shows a spinner while the captured selection is sent, then Wiesel hides, reactivates the source app, pastes the result over the selection with simulated Paste and restores your previous clipboard. Each capture pastes at most once. If the source app cannot be reactivated, nothing is pasted and the result opens in Wiesel with **Copy result** instead.
-- In instructions, use `{selection}` for the captured selection and `{clipboard}` for the clipboard's current plain text when the action runs. For example: `Fix grammar and spelling for the following text:\n\n{selection}`. Repeated placeholders work, and source text is never expanded recursively. A clipboard-only action does not require selected text. Without either placeholder, only the action's instructions are sent; selection and clipboard text are not included. User-created actions open Chat with the expanded instructions as the first message, and follow-up messages use the action's model. Missing required text or an expanded prompt over 100 KB prevents sending a request. Edited **Chat** instructions and model overrides apply to the conversation.
-- Escape or **Back** closes the top popup/dialog first, then returns one screen; Home is the permanent root. Escape on Home or **Wiesel → Hide Wiesel** (⌘H) hides Wiesel while keeping its global shortcut active. Command-Q quits it. The native titlebar controls are removed; drag the header to move the fixed-size window.
-- **Settings** lets you change your shortcut, model, prompts, or account login, and open or clear local diagnostic logs.
-
-Text capture identifies the frontmost process using `NSWorkspace` before Wiesel takes focus. Accessibility is used only to check permission and reject focused fields identified as protected; selected text is captured exclusively using simulated **⌘C**:
-
-1. Wait up to two seconds for Command/Control/Option/Shift to be released, without activating Wiesel.
-2. Save **every clipboard item and advertised format** in memory, including rich text, images, and file representations. If any format cannot be read, or the clipboard exceeds the 64 MiB preservation limit, abort without sending Copy.
-3. Send Copy keyboard events directly to the original process using a private event source. Wait up to 1.2 seconds for a fresh clipboard write and let it settle for 80 ms. The old clipboard text is never treated as a captured selection.
-4. Read the copied plain text, restore the saved clipboard (including an originally empty clipboard), and only then open Wiesel. Non-text or empty Copy results also restore the clipboard and produce an error.
-
-Capture aborts if the source process changes or a second clipboard version appears during the wait. In those cases the current clipboard is left untouched rather than overwritten with an older snapshot. Restoration also checks the clipboard version immediately before writing; if it detects a newer version, capture is discarded. **macOS has no atomic clipboard transaction or reliable writer identity**, so a concurrent writer can still race the checks or be mistaken for the initial Copy. Avoid copying elsewhere during capture. A crashed/killed app or a very late Copy response can also prevent restoration. Clipboard managers and Universal Clipboard may observe the temporary copied selection; restoring the clipboard does not erase their history.
-
-Copy capture does not use AppleScript, Automation, Input Monitoring, or Screen Recording. Protected fields detected through Accessibility are never passed to Copy capture. Apps that disable Copy or do not put plain text on the clipboard still cannot be captured; paste text into Chat in those cases.
-
-## Privacy and persistence
-
-- Settings: `~/Library/Application Support/Wiesel/settings.json` (shortcut, model, prompts, built-in/custom-action UUIDs and instructions, built-in deletions, and onboarding completion; no credentials). New files are private (0600), and saves replace atomically only after validation. Invalid/unreadable existing settings are not overwritten; repair the file and relaunch to leave the read-only recovery state.
-- Device bearer token, expiry and device ID: device-scoped macOS Keychain entries only (never settings, clipboard or logs). `desktop-auth.lock` alongside settings contains no credentials or state; it coordinates Keychain operations across app processes.
-- Local diagnostic JSONL files: `~/Library/Logs/Wiesel` (folder 0700, files 0600). They contain only version/timestamp, random session ID, session-local diagnostic action ID, closed category/event/failure codes, optional closed operation stage, numeric HTTP status, elapsed action milliseconds, validated request `model_id`, and raw gateway `error_type` (up to 256 UTF-8 bytes). Wiesel does not log request prompts, replies, selected text, clipboard contents, other settings values, credentials, URLs, headers, raw response bodies or raw error chains. **`error_type` is server-controlled and preserved verbatim; it could contain sensitive text. Review logs before sharing them.** Logs stay local; Wiesel does not upload them automatically. They are not conversation history or a settings database.
-- Conversation, selected text, generated results, and temporary clipboard snapshots: memory only in Wiesel; not saved to disk. External clipboard managers may retain the temporary Copy selection.
-- Text is sent to the fixed HTTPS Wiesel backend at `https://wiesel.run/v1` and its model provider **only after a writing action or Send**. Browser login, device status and authenticated model-catalog requests send no selected text. Wiesel receives only the text/chat fields needed for the action; provider routing and allowance enforcement are backend responsibilities.
-- HTTP requests run off the UI thread, with connection/overall timeouts, no automatic retries or redirect following, and no desktop cookie jar. Async results are bound to their login generation and device identity; stale status/catalog/401/stream/exchange results are discarded after cancellation or sign-out. Keychain operations are serialized on the UI thread so stale exchanges cannot persist credentials. Failed chat sends restore the original draft only if the composer is empty; otherwise your new draft is preserved and **Restore failed message** keeps the failed text recoverable (except when the session is cleared).
-- Chat streams text as it arrives; incomplete answers are not committed to conversation history. Network/stream ambiguity may mean the action was charged: do not retry blindly. HTTP 402 means insufficient allowance, 409 means already submitted/do not retry, and 429 means throttling. No local credit projection authorizes admission, and there is no cancellation/refund promise.
-- Capturing a new selection during a request updates the next writing action without changing the in-flight request's original text.
-
-### Local diagnostics controls
-
-In **Settings → Diagnostics**, **Open Logs Folder** opens the containing folder in
-Finder, even before login or the first request. It uses the system `open` executable
-with separate arguments, not a shell. **Clear Logs** waits for coordinated storage
-completion before showing success; later events continue in a fresh file. Clearing
-logs does not clear settings, Keychain entries or in-memory chat. Close other Wiesel
-instances first: active-session protection refuses a clear rather than deleting
-another instance's active file. The empty `.wiesel-diagnostics.lock` stays in the
-folder; unrelated files are left untouched.
-
-Files rotate before crossing 2 MiB. On initialization, logging and flush, inactive
-recognized logs older than seven days are pruned, then the oldest inactive logs are
-removed to fit a 20 MiB app-wide budget. **Retention is lazy, not an idle timer**;
-active files are protected. Protected files or disk/permission errors can prevent
-pruning; writes that cannot safely fit the budget fail instead of growing it.
-Symlinked/replaced log paths are refused, including benign symlinked home ancestors.
-
-Initialization, Finder opening and clear waits run off the UI thread. Logging uses
-a bounded best-effort queue: storage/queue failures never block requests or startup,
-and events may be dropped. A failed initialization gives a nonfatal status warning
-and leaves controls unavailable until relaunch. The app periodically requests a
-flush and attempts a final flush/close on normal quit within GPUI's shutdown window;
-force-quit, crashes, SIGTERM or stalled storage can lose diagnostics. Successful
-clear confirms deletion/reopening, not durable storage of every future event.
-
-Gateway model/chat/writing operations record safe stage/classification and elapsed
-action timing, with HTTP status when a response was received. Chat/writing events
-include the model ID actually passed to that request (ASCII identifier syntax,
-maximum 128 bytes; invalid or credential-prefixed values are omitted). Error
-responses are read up to 64 KiB to extract only `error.type`. String values up to
-256 UTF-8 bytes are preserved exactly, including unknown types; JSON encoding
-escapes control characters so they cannot inject log lines. Larger values are
-omitted, not truncated. Missing/non-string types, malformed or oversized bodies
-omit the field without losing HTTP status. SSE error events use the same rules. Free-form `message`, `param`,
-`code`, and response bodies are never logged. Transport predicates
-classify timeouts/connection/body/decode errors before raw reqwest errors are
-discarded. A generic **outcome unknown** warning can therefore be correlated with
-local events without exposing input or remote error bodies. Elapsed time is cumulative
-from the local action's start, not server execution time. **Diagnostic action IDs are
-local correlation only, not gateway request IDs or billing proof**. Unknown outcomes
-may still have been charged; no automatic retries or refund/cancellation promises
-are added. Share logs manually only if you choose to, after reviewing their contents.
-
-## Notifications (developer API)
-
-`src/notifications.rs` owns notification state, message normalization, severity colors, timing, and the shared renderer. `Wiesel` renders it once, outside all page branches.
-
-```rust
-// In a Wiesel handler (follow with cx.notify()):
-self.notifications.success("Copied.");
-self.notifications.warning("Select text in another app first.");
-self.notifications.working(Source::Request, "Thinking…");
-
-// Persistent errors have an owner and a short, actionable message:
-self.notifications.issue(Source::Request, Severity::Error, gateway::failure_message(&error));
-self.notifications.clear(Source::Request); // recover only this source
-```
-
-- Success, informational feedback, and input warnings last five seconds; timers pause while the window is hidden.
-- Scoped issues remain until that source recovers or retries. Navigation does not clear errors. A new failure replaces stale feedback immediately. Brief feedback takes precedence, then persistent errors, active work, remaining warnings, and idle readiness. Equal-severity issues prefer the latest; older unresolved issues reappear when newer ones recover.
-- Async workers return `ResultEvent`; the UI thread publishes notifications. Do not mutate UI state from a worker.
-- Child components implement `EventEmitter<Notification>`, call `cx.emit(Notification::new(Severity::Warning, "No text available to paste."))`, and their owner forwards the event to `Notifications::push`. Text inputs and model-search input use this path.
-- Messages normalize whitespace and cap at 96 Unicode graphemes. The renderer also enforces no wrapping and width-aware ellipsis. Never put raw errors, remote response bodies, credentials, or selected text in notification copy.
-- Dot/text changes use a restrained 180ms ease-out opacity transition, no looping pulses or layout animation. Repeated identical statuses do not restart it. Keyboard feedback is immediate, and macOS Reduce Motion disables motion.
-- Authentication and inference failures are published as client-safe messages without raw error logging. The HTTP components discard sensitive transport/source chains and remote bodies; never log callback/login URLs, state, verifier, tokens or credential payloads. Local operation owners emit bounded structured JSONL events, including the explicitly retained raw gateway `error_type`; notification reporting does not format raw errors or source chains.
-- Startup window creation failures occur before a bar exists and remain diagnostic-only; expected shutdown channel failures, empty sends, and protected-field Copy/Cut no-ops do not generate notifications.
-
-### Status-bar acceptance checks
-
-- Switch between Home, Chat, Writing, and Settings: the header status must stay at most two lines high and the window keeps its 486×573 size, in both Light and Dark appearance.
-- Copy a chat message/result, save settings, sign out/log in, and capture text: verify concise green feedback.
-- Try missing inputs, shortcut conflicts, unavailable/offline models, revoked permissions, and clipboard races: verify amber/red messages in the header status only.
-- Leave an issue unresolved, trigger an unrelated success, and wait five seconds: the issue must return. Hide during feedback and reopen: it should still be readable.
-- Try a long Unicode message at the minimum window width: it must ellipsize, never wrap or change bar height.
-- Enable macOS Reduce Motion and verify static updates; keyboard validations should also be immediate.
-
-## Validation
-
-```sh
-cargo fmt --check
-cargo check --offline --locked
-cargo test --offline --locked
-# Focused offline native-wrapper tests (the live scenario stays ignored):
-cargo test --offline --locked --test native_chat_smoke
-cargo clippy --offline --all-targets --all-features --locked -- -D warnings
-# Build/restart script tests (Python 3, mocked OS commands):
-python3 scripts/test-app-scripts.py
-# Release metadata and train/PR-note tests (Python 3.11+):
-python3 scripts/release.py version
-python3 scripts/test-release.py
-```
-
-Unit tests cover PKCE/callback grammar, single-use exchanges, fixed-origin authenticated wire contracts, sanitized failures, SSE bounds/fragmentation, mock Keychain lifecycle/native-delete status rejection, cross-process file-lock contention and pointer-mutation races, stale-device cleanup/retry identity, startup recovery, generation/device guards and stale-exchange persistence suppression, plus model search, settings, hotkeys, Unicode/IME, selection and draft preservation. Diagnostic tests cover private JSONL storage, rotation/retention, cross-process clear protection, typed gateway status/stage/timing correlation and privacy, argument-safe Finder command construction, clear completion/recovery and nonfatal UI initialization failure. Diagnostic filesystem tests use only disposable test-owned folders, never the real user log directory. Native clipboard tests use private pasteboards, not your general clipboard. Build/restart scripts use mocked OS commands. **These automated checks are local source/mocked validation, not live backend, website, browser, production Keychain, signed-bundle routing or deployment verification. No deployment or live request is implied.**
-
-### Native chat UI smoke test (macOS, opt-in live request)
-
-The two-layer strategy and complete Cargo/optional Nextest commands are in
-[docs/testing.md](docs/testing.md). Normal `cargo test` runs the native wrapper
-tests offline and ignores `native_chat_completed_reply`; it never launches the bundle
-or invokes the live driver.
-
-`scripts/ui-smoke.sh` compiles a small Swift Accessibility runner at
-`target/ui-smoke/wiesel-ui-smoke`. It launches or activates the **specified bundle**,
-presses the Chat tile, enters a prompt through the native text-field Accessibility
-API, presses Send, and asserts a **committed** assistant reply. No private app IPC,
-HTTP test client, clipboard access, coordinate clicks, or screenshot/OCR is used.
-This MVP exercises the Send button, not the Enter key or global selection hotkey.
-
-Build the current source into the bundle first. Quit Wiesel manually before using
-`build-app.sh`; it refuses to replace a running bundle. Use your usual persistent
-signing identity when configured, or `dev.sh` for your normal signed restart.
-
-```sh
-bash scripts/build-app.sh
-# Compile/check the runner without launching Wiesel or sending requests:
-bash scripts/ui-smoke.sh --self-test
-# One-time authorization (does not grant permission automatically):
-bash scripts/ui-smoke.sh --request-permission
-# Launch and inspect selectors without sending a chat message:
-bash scripts/ui-smoke.sh --preflight
-# Submit ONE potentially billable live chat request and assert its reply:
-bash scripts/ui-smoke.sh --live
-# Optional custom prompt and exact expected answer:
-bash scripts/ui-smoke.sh --live --prompt 'Reply with only: WIESEL_SMOKE_OK' \
-  --expect WIESEL_SMOKE_OK --timeout 150
-# Optional explicit bundle path:
-bash scripts/ui-smoke.sh --preflight --app /absolute/path/to/Wiesel.app
-```
-
-**One-time manual prerequisites:** allow the terminal/runner under System Settings
-→ Privacy & Security → Accessibility (separate from Wiesel's selected-text
-permission). The helper prints its executable path; if needed, use the `+` button
-and Command-Shift-G to add that path. macOS can attribute the helper to its hosting
-terminal. Rebuilding the helper can require reauthorizing it. Complete browser
-login and model setup in Wiesel using an authorized test account. Permission and
-login are never bypassed or configured by the runner.
-
-Start from the launcher or an **empty Chat with an empty composer**, with no request
-pending. The runner refuses existing history/drafts instead of deleting them;
-choose **New chat** and clear any draft manually before another run. Other running
-copies of Wiesel are rejected. Leave the app alone during testing. Wiesel is left
-open afterward; settings, Keychain entries, and the general clipboard are not
-modified by the runner. Normal app startup can perform session/catalog requests
-even in preflight mode.
-
-The default prompt requests a fresh unique marker on each run. Success requires
-that the submitted user message is displayed, a completed assistant message
-matches the marker (ignoring surrounding whitespace), the request is idle, and
-the composer is empty. Streaming previews cannot pass. This is a live-model smoke
-test, not deterministic CI: model noncompliance, network issues, and allowance
-failures can fail it. The reply deadline defaults to 150 seconds (`--timeout`,
-1–600). There is **no automatic retry**, including after timeouts with unknown
-billing outcomes. Inspect the app's status bar before deciding to rerun.
-
-Logs contain phase/selector diagnostics, never prompt/reply contents or tokens.
-No screenshots are captured. Exit codes: `0` success, `1` reply/assertion failure,
-`2` permission/setup/usage failure. `--self-test` validates the runner's parser and
-reply assertions only; it does **not** prove native UI or backend success.
-
-#### Cargo / optional Nextest live entry point
-
-After completing the manual prerequisites above, the ignored Rust integration
-test runs exactly the same live scenario with the default unique-marker prompt:
-
-```sh
-WIESEL_UI_LIVE=1 cargo test --offline --locked --test native_chat_smoke \
-  native_chat_completed_reply -- --ignored --exact --test-threads=1 --nocapture
-# Optional bundle override (otherwise this checkout's dist/Wiesel.app):
-WIESEL_UI_LIVE=1 WIESEL_UI_APP='/absolute/path/to/Wiesel.app' \
-  cargo test --offline --locked --test native_chat_smoke \
-  native_chat_completed_reply -- --ignored --exact --test-threads=1 --nocapture
-# Optional, only if Cargo Nextest is already installed:
-WIESEL_UI_LIVE=1 cargo nextest run --offline --locked --test native_chat_smoke \
-  --run-ignored only -E 'test(=native_chat_completed_reply)' \
-  --test-threads 1 --retries 0
-```
-
-`WIESEL_UI_LIVE=1` is a second explicit gate for the **Rust entry point**:
-selecting the ignored test without it fails before any driver invocation. A
-normal run reports the live scenario as ignored/skipped; once explicitly
-selected, missing prerequisites or a nonzero driver exit are failures, not
-skips. `WIESEL_UI_APP` is passed as a single bundle-path argument, resolving
-relative paths from the repository root. Do not run live commands concurrently.
-The Nextest default-profile override serializes this test and disables retries;
-neither runner should be wrapped in a retry loop.
-
-Cargo/Nextest receive sanitized exit-category diagnostics, never subprocess
-stdout/stderr or message contents. The reply deadline is fixed at 150 seconds;
-the wrapper's total driver deadline is 300 seconds (including compilation and
-startup). On a process timeout it stops/reaps only its driver, never Wiesel,
-and does not reset state or retry. A request may still be pending or charged.
-Investigate setup with `--self-test` or an explicitly chosen manual `--preflight`;
-inspect the app's status bar before considering another billable attempt.
-Offline fake-driver tests and runner self-tests are not live-request evidence.
-
-### Manual launch checklist (required before release)
-
-Use a signed app bundle, test accounts and explicit permission for live requests. Do not record credential-bearing URLs or payloads in logs/screenshots.
-
-- Verify the bundle declares URL name `run.wiesel.auth`, scheme `wiesel`. With the app running (also hidden), finish browser login and verify activation plus a catalog load. Quit, deliver an old callback for a cold launch, and verify it cannot exchange or sign in from that link; restart login instead. Verify the OS routes to the intended installed copy if multiple Wiesel bundles exist.
-- Test **Login / Sign up**, Enter on focused login, and Command-Shift-L while text/model search is focused and while inference is pending. Cancel, reopen, timeout, replay a consumed callback, and deliver a wrong-state/malformed link. None may exchange against another attempt, write Keychain or revive a canceled session. Deliver an old exchange completion after cancel/reopen/sign-out and verify it is ignored.
-- Test the real website with the external system browser: existing login, new signup, email verification followed by a fresh desktop attempt, web session expiry, and browser back/reload. Verify login-page/CSP navigation and scheme-launch permission/confirmation allow the callback without exposing the verifier or bearer.
-- Unlock/lock/deny Keychain and test restore/save/delete failures, device replacement, local sign-out with remote network failure, and retrying local removal. Verify settings contain no tokens; old provider keys are removed, not reused. Test device revocation/401 separately on status, catalog and inference, expiry while idle and before a request, and relaunch after successful cleanup. Older device operations must not clear a new login. With two authorized app instances sharing the same User-domain Keychain and app-support directory, save B while A retains its old session; then sign out/expire/reject A and retry failed A cleanup. B's record and pointer must remain. Test native deletion rejection after a successful read (not merely lookup failure), verify fresh login remains blocked until a status-checked retry succeeds, and verify unreadable/corrupt startup recovery never deletes a later instance's login.
-- Verify plan/virtual credits are informational. Test allowance rejection (402), duplicate submission (409), throttling (429), timeout/offline/server errors, redirects, a stream ending without DONE and a disconnect after partial text. Verify no automatic retry and no admission, cancellation or refund promise; ambiguous actions may have been charged.
-
-Retain the existing local interaction checks:
-
-- Complete onboarding, relaunch, and verify saved settings and a valid device login.
-- Trigger the shortcut from another app; verify activation and fresh selected-text capture.
-- In Brave, test an ordinary page selection (including text across paragraphs), a textarea, and no selection. Release the shortcut keys after pressing them.
-- In Mail, test a received message's body separately from a compose field. Also test Unicode/emoji selections and verify text from another window or a previously selected field is not captured.
-- Before capture, copy an unrelated rich-text snippet, an image, or a Finder file. After Wiesel opens, paste elsewhere and verify the previous clipboard is intact. Repeat with an empty clipboard and no selection; Wiesel must never use the old clipboard text as the selection.
-- Hold the shortcut modifiers; Wiesel should wait, not send a modified Copy shortcut. Switch apps or change the clipboard during the wait; verify capture aborts without overwriting newer content.
-- Turn on **Paste result back** for Fix spelling, select text in TextEdit, press the shortcut and `1`: verify the pad spins, Wiesel hides, the selection is replaced, and a previously copied image or rich-text snippet is still on the clipboard afterwards. Quit the source app while the request runs and verify the result opens in Wiesel instead.
-- Test all four selected-text actions, copy/paste, and a multi-turn chat. Confirm the six-tile grid, shortcuts `1`–`5`, and the bottom-right Add placeholder (which must not send an AI request).
-- Deny Accessibility, select no text, or use an unsupported app; verify no writing request occurs.
-- Test a rejected/revoked device login, unavailable model, offline network, and shortcut conflicts.
-- Hide/close/reopen with the shortcut; Command-Q should stop it.
-
-Known first-version limits: no tray menu/autostart, no request cancellation, no automatic text replacement, no persistent chat history, no native selection/credential integration for Linux or Windows, and app selections require Accessibility permission and standard Copy support.
-
-## Sources
-
-- [GPUI examples](https://github.com/zed-industries/zed/tree/main/crates/gpui/examples). `src/input.rs` adapts the Apache-2.0 GPUI `input.rs` example and adds masking, horizontal scrolling, and Unicode fixes.
-- [Wiesel browser login and backend](https://wiesel.run)
-- [RFC 7636: Proof Key for Code Exchange](https://www.rfc-editor.org/rfc/rfc7636)
+<p align="center">
+  Made with ☕ and Rust. Want to hack on Wiesel? See <a href="CONTRIBUTING.md">CONTRIBUTING.md</a>.
+</p>

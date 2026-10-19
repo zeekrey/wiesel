@@ -67,7 +67,7 @@ WIESEL_UI_LIVE=1 cargo nextest run --offline --locked --test native_chat_smoke \
 ```
 
 Selecting the ignored test without exact `WIESEL_UI_LIVE=1` fails before invoking
-the driver. Complete [manual setup](../README.md#native-chat-ui-smoke-test-macos-opt-in-live-request):
+the driver. Complete [manual setup](development.md#native-chat-ui-smoke-test-macos-opt-in-live-request):
 built bundle, runner Accessibility permission, login/text model, empty chat/draft,
 and no pending request. Optionally set `WIESEL_UI_APP` to a bundle path; relative
 paths resolve from the repository root. Never run live commands concurrently.
