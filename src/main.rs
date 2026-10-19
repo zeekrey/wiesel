@@ -30,10 +30,10 @@ use diagnostics::{
 use gateway::Message;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, FontWeight,
-    KeyBinding, KeyDownEvent, MouseButton, Role, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    Stateful, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*, px, relative,
-    rgb, rgba, size,
+    Animation, AnimationExt, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle,
+    Focusable, FontWeight, KeyBinding, KeyDownEvent, MouseButton, Role, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, Stateful, Transformation, Window, WindowBounds, WindowOptions, actions, div,
+    percentage, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use input::TextInput;
 use navigation::{EntryId, Navigation};
@@ -129,6 +129,13 @@ struct ScreenLifecycle {
 struct CompletionScope {
     entry: EntryId,
     generation: u64,
+}
+
+/// A request whose result replaces the selection in `source` instead of opening a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectPaste {
+    action: uuid::Uuid,
+    source: i32,
 }
 
 struct HeaderTooltip(&'static str);
@@ -587,6 +594,8 @@ struct Wiesel {
     active_request: Option<CompletionScope>,
     #[cfg(test)]
     recorded_hides: Option<usize>,
+    #[cfg(test)]
+    recorded_pastes: Option<Vec<(i32, String)>>,
     settings: Settings,
     actions: action_builder::ActionBuilder,
     diagnostics: Option<Diagnostics>,
@@ -626,6 +635,8 @@ struct Wiesel {
     selection: selection::Capture,
     pending_capture: Option<selection::PendingCapture>,
     capture_scope: Option<EventScope>,
+    direct_paste: Option<DirectPaste>,
+    paste_back: Option<clipboard_capture::PasteBack>,
     failed_chat: std::collections::VecDeque<String>,
     result: String,
     writing_title: String,
@@ -875,6 +886,8 @@ impl Wiesel {
             active_request: None,
             #[cfg(test)]
             recorded_hides: None,
+            #[cfg(test)]
+            recorded_pastes: None,
             settings,
             actions: action_builder::ActionBuilder::new(settings_read_only),
             diagnostics: None,
@@ -921,6 +934,8 @@ impl Wiesel {
             },
             pending_capture: None,
             capture_scope: None,
+            direct_paste: None,
+            paste_back: None,
             failed_chat: std::collections::VecDeque::new(),
             result: String::new(),
             writing_title: String::new(),
@@ -1332,7 +1347,8 @@ impl Wiesel {
                     self.apply_hotkey(self.settings.hotkey.clone(), cx);
                     continue;
                 }
-                if self.pending_capture.is_none() {
+                // Pasting back owns the clipboard until it has been restored.
+                if self.pending_capture.is_none() && self.paste_back.is_none() {
                     // Keep the source active until Copy and clipboard restoration finish.
                     // Ignore repeated shortcut presses while capture is in progress.
                     self.selection.update(Err(anyhow::anyhow!(
@@ -1349,6 +1365,7 @@ impl Wiesel {
             }
         }
         self.poll_capture(window, cx);
+        self.poll_paste_back(window, cx);
         // Callback activation must not steal focus before Copy restoration finishes.
         if self.pending_capture.is_none() {
             self.receive_callbacks(window, cx);
@@ -1374,14 +1391,16 @@ impl Wiesel {
         if let Some(capture) = self.pending_capture.as_mut()
             && let Some(result) = capture.poll()
         {
+            let source = capture.source();
             self.pending_capture = None;
-            self.finish_capture(result, window, cx);
+            self.finish_capture(result, source, window, cx);
         }
     }
 
     fn finish_capture(
         &mut self,
         result: anyhow::Result<String>,
+        source: Option<i32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1409,7 +1428,11 @@ impl Wiesel {
                     .issue(Source::Selection, severity, message);
             }
         }
+        let captured = result.is_ok();
         self.selection.update(result);
+        if captured {
+            self.selection.source = source;
+        }
         self.activate_from_hotkey(window, cx);
         cx.activate(true);
         window.activate_window();
@@ -1437,6 +1460,7 @@ impl Wiesel {
                 if matches!(event.result, ResultPayload::Completion(_, _)) {
                     self.busy = false;
                     self.active_request = None;
+                    self.direct_paste = None;
                     self.streaming_chat = None;
                     cx.notify();
                 }
@@ -1554,6 +1578,13 @@ impl Wiesel {
                 if chat {
                     self.streaming_chat = None;
                 }
+                let result = match (self.direct_paste.take().filter(|_| !chat), result) {
+                    (Some(paste), Ok(text)) => {
+                        self.start_paste_back(paste, text, cx);
+                        return;
+                    }
+                    (_, result) => result,
+                };
                 match result {
                     Ok(text) => {
                         if chat {
@@ -2220,6 +2251,67 @@ impl Wiesel {
             _ => self.writing(action, window, cx),
         }
     }
+    /// Hide Wiesel and hand the result to the source app; the clipboard is restored after.
+    fn start_paste_back(&mut self, paste: DirectPaste, text: String, cx: &mut Context<Self>) {
+        // Retained for the fallback view if the source app cannot be reached.
+        self.result = text.clone();
+        self.notifications.clear(Source::Request);
+        if text.trim().is_empty() {
+            self.notifications
+                .warning("The model returned no text. Nothing was pasted.");
+            return;
+        }
+        // Paste once per capture: afterwards the selection has been replaced.
+        self.selection.source = None;
+        self.hide_window(cx);
+        #[cfg(test)]
+        if let Some(pastes) = &mut self.recorded_pastes {
+            pastes.push((paste.source, text));
+            self.notifications.success("Result pasted.");
+            return;
+        }
+        self.notifications
+            .working(Source::Request, "Pasting result…");
+        self.paste_back = Some(clipboard_capture::PasteBack::new(paste.source, text));
+    }
+    fn poll_paste_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self
+            .paste_back
+            .as_mut()
+            .and_then(clipboard_capture::PasteBack::poll)
+        else {
+            return;
+        };
+        self.paste_back = None;
+        self.notifications.clear(Source::Request);
+        match result {
+            Ok(()) => self.notifications.success("Result pasted."),
+            Err(clipboard_capture::PasteError::Restore(error)) => {
+                eprintln!("Wiesel paste cleanup: {error:#}");
+                self.notifications.issue(
+                    Source::Request,
+                    Severity::Error,
+                    "Result pasted, but the previous clipboard could not be restored.",
+                );
+            }
+            Err(clipboard_capture::PasteError::NotPasted(error)) => {
+                // Never lose a result: show it with a Copy button instead.
+                // Paste errors are fixed copy and never contain clipboard or result text.
+                self.notifications.issue(
+                    Source::Request,
+                    Severity::Warning,
+                    format!(
+                        "{}. Copy the result instead.",
+                        error.to_string().trim_end_matches('.')
+                    ),
+                );
+                self.push_screen(Screen::Writing, false, window, cx);
+                cx.activate(true);
+                window.activate_window();
+            }
+        }
+        cx.notify();
+    }
     fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.push_screen(Screen::Chat, false, window, cx);
         window.focus(&self.composer.focus_handle(cx), cx);
@@ -2551,6 +2643,11 @@ impl Wiesel {
                 .into_any_element();
         };
         let (id, title, icon, _, add) = item.presentation();
+        // A direct-paste action spins on its own pad while the model works.
+        let loading = self.busy
+            && self
+                .direct_paste
+                .is_some_and(|paste| item.action_id() == Some(paste.action));
         let debug_id = id.clone();
         let keyboard_item = item.clone();
         let pad = div()
@@ -2573,6 +2670,9 @@ impl Wiesel {
             }))
             .accessibility_id(format!("wiesel.action.{id}"))
             .aria_label(title.clone())
+            .when(loading, |d| {
+                d.aria_description("Working; the result will be pasted back")
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.run_home_action(item.clone(), window, cx);
             }));
@@ -2590,9 +2690,27 @@ impl Wiesel {
                             .hover(move |s| s.bg(rgb(add_hover)).border_color(rgb(theme::PAD_GLOW)))
                     })
                     .child(if add {
-                        theme::icon(icon, 30.).text_color(rgb(palette.add_icon))
+                        theme::icon(icon, 30.)
+                            .text_color(rgb(palette.add_icon))
+                            .into_any_element()
+                    } else if loading {
+                        theme::icon("loader", 26.)
+                            .debug_selector(move || format!("home-spinner-{slot}"))
+                            .text_color(rgb(theme::PAD_INK))
+                            .with_animation(
+                                "home-spinner",
+                                Animation::new(Duration::from_millis(900)).repeat(),
+                                |icon, delta| {
+                                    icon.with_transformation(Transformation::rotate(percentage(
+                                        delta,
+                                    )))
+                                },
+                            )
+                            .into_any_element()
                     } else {
-                        theme::icon(icon, 26.).text_color(rgb(theme::PAD_INK))
+                        theme::icon(icon, 26.)
+                            .text_color(rgb(theme::PAD_INK))
+                            .into_any_element()
                     }),
             )
             .child(label(Some(title)))

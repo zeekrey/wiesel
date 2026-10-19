@@ -48,6 +48,9 @@ pub(super) struct Editor {
     pub(super) model: Entity<tier_picker::TierPicker>,
     icon: &'static str,
     icon_open: bool,
+    paste_result: bool,
+    // The built-in Chat always opens a conversation.
+    can_paste: bool,
     initial: CustomActionFields,
     // Created once after validation; retained across failed persistence attempts.
     id: Option<uuid::Uuid>,
@@ -65,9 +68,10 @@ impl Editor {
                 .clone()
                 .filter(|model| *model != ActionModel::Tier(Tier::Sharp)),
             instructions: self.instructions.read(cx).content.to_string(),
+            paste_result: self.paste_result && self.can_paste,
         }
     }
-    fn dirty(&self, cx: &App) -> bool {
+    pub(super) fn dirty(&self, cx: &App) -> bool {
         let fields = self.fields(cx);
         fields_changed(&self.initial, &fields)
     }
@@ -77,6 +81,7 @@ fn fields_changed(original: &CustomActionFields, draft: &CustomActionFields) -> 
         || original.icon != draft.icon
         || original.model_override != draft.model_override
         || original.instructions != draft.instructions
+        || original.paste_result != draft.paste_result
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +109,7 @@ pub(super) enum Command {
     Cancel,
     IconToggle,
     Icon(&'static str),
+    PasteToggle,
 }
 #[derive(Clone)]
 pub(super) enum HomeAction {
@@ -112,6 +118,14 @@ pub(super) enum HomeAction {
     Custom(CustomQuickAction),
 }
 impl HomeAction {
+    /// The persisted action this pad runs; None for Add.
+    pub fn action_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Builtin(QuickAction::Add) => None,
+            Self::Builtin(action) => Some(action.persistent_id()),
+            Self::Configured(_, action) | Self::Custom(action) => Some(action.id),
+        }
+    }
     pub fn presentation(&self) -> (String, String, &'static str, &'static str, bool) {
         match self {
             Self::Builtin(action) => (
@@ -179,7 +193,7 @@ impl Wiesel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
+        if self.busy || self.paste_back.is_some() {
             return;
         }
         let model = action.effective_model(&self.settings);
@@ -204,6 +218,33 @@ impl Wiesel {
             return;
         };
         if !local && self.valid_credential(cx).is_none() {
+            return;
+        }
+        if action.paste_result && action.can_paste_result() {
+            // Pasting needs the app the selection came from, not only its text.
+            let Some(source) = self
+                .selection
+                .source
+                .filter(|_| self.selection.text.is_some())
+            else {
+                self.notifications
+                    .warning("Select text in another app and press your shortcut.");
+                cx.notify();
+                return;
+            };
+            // Stay on Home; the pad spins until the result is pasted back.
+            self.selection.snapshot_writing();
+            self.result.clear();
+            self.writing_title = action.name.clone();
+            self.request_with_model(messages, false, model, cx);
+            if self.busy {
+                self.direct_paste = Some(DirectPaste {
+                    action: action.id,
+                    source,
+                });
+                self.notifications
+                    .working(Source::Request, format!("{}…", action.name));
+            }
             return;
         }
         if QuickAction::from_persistent_id(action.id).is_none() {
@@ -457,6 +498,13 @@ impl Wiesel {
                 }
                 window.focus(&self.action_control_focus("action-icon", cx), cx);
             }
+            Command::PasteToggle => {
+                if let Some(editor) = &mut self.actions.editor
+                    && editor.can_paste
+                {
+                    editor.paste_result = !editor.paste_result;
+                }
+            }
         }
         cx.notify();
     }
@@ -480,13 +528,9 @@ impl Wiesel {
                 icon: "wand".into(),
                 model_override: None,
                 instructions: String::new(),
+                paste_result: false,
             },
-            |action| CustomActionFields {
-                name: action.name.clone(),
-                icon: action.icon.clone(),
-                model_override: action.model_override.clone(),
-                instructions: action.instructions.clone(),
-            },
+            CustomQuickAction::fields,
         );
         let icon = original
             .and_then(|action| action.icon_name().ok())
@@ -536,6 +580,8 @@ impl Wiesel {
             model,
             icon,
             icon_open: false,
+            paste_result: initial.paste_result,
+            can_paste: id != Some(QuickAction::Chat.persistent_id()),
             initial,
             id,
             existing: id.is_some(),
@@ -590,6 +636,7 @@ impl Wiesel {
                         icon: fields.icon,
                         model_override: fields.model_override,
                         instructions: fields.instructions,
+                        paste_result: fields.paste_result,
                     }
                 } else {
                     let action = CustomQuickAction::new(fields)?;
@@ -879,11 +926,47 @@ impl Wiesel {
                 .child(div().mt_4().flex().flex_col().gap_2().child(Self::label("Instructions · What should this action do?"))
                     .child(div().debug_selector(|| "action-instructions".into()).child(editor.instructions.clone()))
                     .child(Self::label("Use {selection} or {clipboard} to insert text. Without placeholders, only these instructions are sent.")))
+                .when(editor.can_paste, |d| d.child(self.paste_toggle(editor.paste_result, cx)))
                 .child(self.action_notice()))
             .child(div().flex_shrink_0().min_h(px(48.)).px(px(24.)).py_2().flex().items_center().justify_between().gap_3().border_t_1().border_color(rgba(theme::p().border))
                 .child(Self::label("⌘ Enter to save · Esc to go back"))
                 .child(div().flex().gap_2().child(self.builder_button("action-cancel", "Cancel", Command::Cancel, cx))
                     .child(self.builder_button("action-save", if editor.existing { "Save changes" } else { "Create action" }, Command::Save, cx).when(self.actions.read_only, |d| d.opacity(0.5).aria_description("Saving disabled until the settings file is repaired and Wiesel relaunched")))))
+    }
+    /// Switch between showing the result in Wiesel and pasting it over the selection.
+    fn paste_toggle(&self, on: bool, cx: &mut Context<Self>) -> Div {
+        let palette = theme::p();
+        let title = "Paste result back";
+        let switch = theme::key(
+            self.builder_button_base("action-paste", title, Command::PasteToggle, cx),
+            theme::Key::Grey,
+        )
+        .role(Role::Switch)
+        .aria_toggled(if on {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .w(px(38.))
+        .h(px(22.))
+        .p(px(3.))
+        .flex()
+        .items_center()
+        .when(on, |d| d.justify_end())
+        .child(div().size(px(14.)).rounded(px(3.)).bg(rgb(if on {
+            theme::LOGO_RED
+        } else {
+            palette.muted
+        })));
+        div().mt_4().flex().items_start().gap_3()
+            .child(switch)
+            .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
+                .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(title))
+                .child(Self::label(if on {
+                    "Sends the selected text straight to the model and pastes the result over it. Wiesel shows a spinner, then hides."
+                } else {
+                    "Off: the result opens in Wiesel, where you can read, copy or continue."
+                })))
     }
     pub(super) fn action_dialog(&self, cx: &mut Context<Self>) -> Div {
         let Some(dialog) = &self.actions.dialog else {
@@ -975,6 +1058,7 @@ mod tests {
             icon: "wand".into(),
             model_override: None,
             instructions: "Instructions\n".into(),
+            paste_result: false,
         }
     }
     #[test]

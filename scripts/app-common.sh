@@ -37,7 +37,7 @@ prepare() {
     if [[ -n "$identity_override" ]]; then WIESEL_SIGNING_IDENTITY="$identity_override"; fi
     identity="${WIESEL_SIGNING_IDENTITY:--}"
     if [[ "$mode" == dev && "$identity" == '-' ]]; then
-        fail 'dev.sh requires WIESEL_SIGNING_IDENTITY (a persistent code-signing certificate). See README → Development builds.'
+        fail 'dev.sh requires WIESEL_SIGNING_IDENTITY (a persistent code-signing certificate). See docs/development.md → Development builds.'
         return 1
     fi
     if [[ "$identity" != '-' ]]; then

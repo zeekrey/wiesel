@@ -6,6 +6,8 @@ pub struct Capture {
     pub text: Option<String>,
     pub error: String,
     pub writing_source: String,
+    /// The app the text was copied from, for pasting a result back over it.
+    pub source: Option<i32>,
 }
 impl Capture {
     pub fn update(&mut self, result: Result<String>) {
@@ -16,6 +18,7 @@ impl Capture {
             }
             Err(error) => {
                 self.text = None;
+                self.source = None;
                 self.error = format!("{error:#}");
             }
         }
@@ -45,6 +48,7 @@ mod tests {
         selection.update(Err(anyhow::anyhow!("No selection")));
         assert!(selection.text.is_none());
         assert_eq!(selection.error, "No selection");
+        assert!(selection.source.is_none());
     }
 }
 
@@ -121,6 +125,13 @@ mod macos {
     impl PendingCapture {
         pub fn failed(error: anyhow::Error) -> Self {
             Self::Failed(Some(error))
+        }
+        /// Process ID of the app being copied from, if capture got that far.
+        pub fn source(&self) -> Option<i32> {
+            match self {
+                Self::Failed(_) => None,
+                Self::Copy { capture, .. } => Some(capture.pid()),
+            }
         }
         pub fn poll(&mut self) -> Option<Result<String>> {
             match self {

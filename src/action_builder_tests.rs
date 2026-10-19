@@ -58,6 +58,7 @@ fn action(name: &str, model: Option<&str>) -> CustomQuickAction {
         icon: "wand".into(),
         model_override: model.map(Into::into),
         instructions: "Exact custom instructions\n with whitespace \n{selection}".into(),
+        paste_result: false,
     })
     .unwrap()
 }
@@ -1311,7 +1312,7 @@ fn busy_capture_activation_and_rejected_callback_preserve_confirmation_focus(
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.capture_scope = Some(app.session.scope());
-            app.finish_capture(Ok("New capture".into()), window, cx);
+            app.finish_capture(Ok("New capture".into()), None, window, cx);
         })
     });
     cx.run_until_parked();
@@ -1840,5 +1841,127 @@ fn editor_offers_tiers_then_models_from_both_providers(cx: &mut TestAppContext) 
             app.settings.custom_actions[0].model_override,
             Some(ActionModel::Model(ModelChoice::ollama("qwen3.5:0.8b")))
         );
+    });
+}
+
+fn paste_action(name: &str) -> CustomQuickAction {
+    let mut action = action(name, None);
+    action.paste_result = true;
+    action
+}
+fn set_source(app: &Entity<Wiesel>, cx: &mut VisualTestContext, source: Option<i32>) {
+    cx.update(|_, cx| app.update(cx, |app, _| app.selection.source = source));
+}
+fn pastes(app: &Entity<Wiesel>, cx: &mut VisualTestContext) -> Vec<(i32, String)> {
+    cx.read_entity(app, |app, _| app.recorded_pastes.clone().unwrap())
+}
+
+#[gpui::test]
+fn editor_paste_toggle_saves_and_reverting_it_is_not_dirty(cx: &mut TestAppContext) {
+    let (app, _, cx) = setup(cx);
+    let id = QuickAction::FixSpelling.persistent_id();
+    menu(cx, AdjustQuickActions);
+    click(cx, &format!("edit-{id}"));
+    click(cx, "action-paste");
+    cx.read_entity(&app, |app, cx| {
+        assert!(app.actions.editor.as_ref().unwrap().dirty(cx));
+    });
+    click(cx, "action-paste");
+    cx.read_entity(&app, |app, cx| {
+        assert!(!app.actions.editor.as_ref().unwrap().dirty(cx));
+    });
+    click(cx, "action-paste");
+    click(cx, "action-save");
+    cx.read_entity(&app, |app, _| {
+        assert!(app.settings.actions()[0].paste_result);
+        assert!(!app.settings.actions()[1].paste_result);
+    });
+    // The built-in Chat is always a conversation and offers no toggle.
+    click(cx, &format!("edit-{}", QuickAction::Chat.persistent_id()));
+    assert!(cx.debug_bounds("action-paste").is_none());
+}
+
+#[gpui::test]
+fn paste_action_spins_on_home_then_pastes_into_the_source_app(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    let custom = paste_action("Shout");
+    let id = custom.id;
+    seed(&app, cx, custom);
+    set_source(&app, cx, Some(42));
+    click(cx, &format!("custom-{id}"));
+    let (_, messages, chat) = backend.request(0);
+    assert!(!chat);
+    assert!(messages[1].content.contains("Selected source text"));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("home-spinner-5").is_some());
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Launcher);
+        assert_eq!(app.recorded_hides, Some(0));
+    });
+    // A second press while working sends nothing.
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 1);
+    backend.finish(0, Ok("SELECTED SOURCE TEXT".into()));
+    receive_results(&app, cx);
+    cx.run_until_parked();
+    assert_eq!(pastes(&app, cx), [(42, "SELECTED SOURCE TEXT".into())]);
+    assert!(cx.debug_bounds("home-spinner-5").is_none());
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Launcher);
+        assert_eq!(app.recorded_hides, Some(1));
+        assert!(app.messages.is_empty());
+        // One paste per capture: the replaced selection cannot be pasted over again.
+        assert!(app.selection.source.is_none());
+        assert!(app.direct_paste.is_none());
+    });
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 1);
+}
+
+#[gpui::test]
+fn builtin_paste_action_skips_the_writing_screen(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, _| {
+            let mut actions = app.settings.actions();
+            actions[0].paste_result = true;
+            app.settings.builtin_actions = Some(actions);
+            app.selection.text = Some("teh text".into());
+            app.selection.source = Some(7);
+        })
+    });
+    click(cx, "grammar");
+    backend.finish(0, Ok("the text".into()));
+    receive_results(&app, cx);
+    assert_eq!(pastes(&app, cx), [(7, "the text".into())]);
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.current_screen(), Screen::Launcher)
+    });
+}
+
+#[gpui::test]
+fn paste_action_without_a_source_app_or_with_a_failed_request_pastes_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (app, backend, cx) = setup(cx);
+    let custom = paste_action("Shout");
+    let id = custom.id;
+    seed(&app, cx, custom);
+    click(cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 0);
+    set_source(&app, cx, Some(42));
+    click(cx, &format!("custom-{id}"));
+    backend.finish(0, Err(anyhow::anyhow!("offline")));
+    receive_results(&app, cx);
+    // Empty output must not erase the selection either.
+    click(cx, &format!("custom-{id}"));
+    backend.finish(1, Ok("  \n".into()));
+    receive_results(&app, cx);
+    assert!(pastes(&app, cx).is_empty());
+    cx.read_entity(&app, |app, _| {
+        assert_eq!(app.recorded_hides, Some(0));
+        assert!(app.direct_paste.is_none());
+        assert!(!app.busy);
+        assert_eq!(app.selection.source, Some(42));
     });
 }

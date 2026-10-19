@@ -26,6 +26,7 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         request_generation: 0,
         active_request: None,
         recorded_hides: Some(0),
+        recorded_pastes: Some(Vec::new()),
         model_picker: cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx)),
         tier_pickers: Wiesel::new_tier_pickers(&settings, cx),
         provider_tab: Wiesel::initial_provider_tab(&settings),
@@ -66,6 +67,8 @@ fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel
         notifications: Notifications::default(),
         selection: selection::Capture::default(),
         pending_capture: None,
+        direct_paste: None,
+        paste_back: None,
         capture_scope: None,
         failed_chat: Default::default(),
         result: String::new(),
@@ -1205,7 +1208,7 @@ fn navigation_session_end_clears_private_state_and_stale_capture_without_releasi
             assert_eq!(app.navigation.current().id, settings_id);
             assert_eq!(app.settings.model, "test/chat-model");
             // A late successful capture cannot restore text or activate Home.
-            app.finish_capture(Ok("Stale private source".into()), window, cx);
+            app.finish_capture(Ok("Stale private source".into()), None, window, cx);
             app.poll_capture(window, cx);
             assert!(app.pending_capture.is_none());
             assert!(app.selection.text.is_none());
@@ -1369,6 +1372,7 @@ fn each_model_routes_to_its_own_provider(cx: &mut TestAppContext) {
         icon: "wand".into(),
         model_override: Some("test/pinned".into()),
         instructions: "Answer briefly.".into(),
+        paste_result: false,
     })
     .unwrap();
     cx.update(|window, cx| {

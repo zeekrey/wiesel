@@ -23,6 +23,8 @@ pub struct CustomActionFields {
     /// None follows the current default (Sharp), including subsequent changes.
     pub model_override: Option<ActionModel>,
     pub instructions: String,
+    /// Paste the result over the captured selection instead of showing it in Wiesel.
+    pub paste_result: bool,
 }
 
 /// Persisted editable action, including built-ins with stable reserved IDs.
@@ -34,6 +36,8 @@ pub struct CustomQuickAction {
     #[serde(default)]
     pub model_override: Option<ActionModel>,
     pub instructions: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paste_result: bool,
 }
 
 // Keep user-entered text out of debug chains, including failed test assertions.
@@ -107,6 +111,7 @@ impl CustomQuickAction {
             icon: fields.icon,
             model_override: fields.model_override,
             instructions: fields.instructions,
+            paste_result: fields.paste_result,
         }
     }
 
@@ -132,6 +137,22 @@ impl CustomQuickAction {
     /// Pinned to one model, rather than following a tier from Settings.
     pub fn pins_model(&self) -> bool {
         matches!(self.model_override, Some(ActionModel::Model(_)))
+    }
+
+    /// Fields as edited, so the editor and dirty checks see the saved values.
+    pub fn fields(&self) -> CustomActionFields {
+        CustomActionFields {
+            name: self.name.clone(),
+            icon: self.icon.clone(),
+            model_override: self.model_override.clone(),
+            instructions: self.instructions.clone(),
+            paste_result: self.paste_result,
+        }
+    }
+
+    /// Whether Settings offers direct paste: the built-in Chat is always a conversation.
+    pub fn can_paste_result(&self) -> bool {
+        self.id != QuickAction::Chat.persistent_id()
     }
 
     /// Convert a validated embedded icon key to the static key used by theme::icon.
@@ -296,6 +317,7 @@ impl QuickAction {
                 icon: self.icon().into(),
                 model_override: None,
                 instructions,
+                paste_result: false,
             },
         )
     }
@@ -444,6 +466,7 @@ mod custom_action_tests {
             icon: "wand".into(),
             model_override: None,
             instructions: "  Preserve these instructions exactly.\n  ".into(),
+            paste_result: false,
         }
     }
 
@@ -513,6 +536,31 @@ mod custom_action_tests {
         assert!(validate_custom_actions(&reordered).is_ok());
         let updated = update_custom_action(&reordered, Uuid::from_u128(1), fields()).unwrap();
         assert_eq!(updated, reordered);
+    }
+
+    #[test]
+    fn paste_result_defaults_off_and_is_only_stored_when_enabled() {
+        let mut action = action(1);
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.get("paste_result").is_none());
+        assert!(
+            !serde_json::from_value::<CustomQuickAction>(json)
+                .unwrap()
+                .paste_result
+        );
+        action.paste_result = true;
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["paste_result"], true);
+        assert_eq!(
+            serde_json::from_value::<CustomQuickAction>(json).unwrap(),
+            action
+        );
+        assert!(action.can_paste_result());
+        assert!(
+            !QuickAction::Chat
+                .editable(&Settings::default())
+                .can_paste_result()
+        );
     }
 
     #[test]

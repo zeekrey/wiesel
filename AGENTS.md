@@ -1,0 +1,1 @@
+- When creating a PR, make sure the PR description is compliant with scripts/release.py check-pr. To come up with a brief summary, use the show-me skill.

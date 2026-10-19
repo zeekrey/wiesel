@@ -640,6 +640,7 @@ mod custom_action_settings_tests {
             icon: "lightbulb".into(),
             model_override: None,
             instructions: "  private instruction fixture\n\"exact\"  ".into(),
+            paste_result: false,
         }
     }
     fn action() -> CustomQuickAction {
