@@ -1,139 +1,36 @@
 //! In-process chat tests: no settings, Keychain, clipboard, hotkeys, or network.
 use super::*;
-use completion_backend::{CompletionBackend, ControlledBackend};
-use gpui::{KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext};
+use gpui::{KeyUpEvent, Keystroke, TestAppContext, VisualTestContext};
+pub(super) use test_support::*;
 
-fn ephemeral_app(backend: ControlledBackend, cx: &mut Context<Wiesel>) -> Wiesel {
-    let now = settings::utc_now_ms().unwrap();
-    let credential = DeviceCredential::validated(
-        zeroize::Zeroizing::new(format!("wd_{}", "t".repeat(43))),
-        now + 3_600_000,
-        uuid::Uuid::from_u128(1),
-        now,
-    )
-    .unwrap();
-    let settings = Settings {
-        model: "test/chat-model".into(),
-        onboarded: true,
-        ..Default::default()
-    };
-    let (tx, rx) = mpsc::channel();
-    let (diagnostics_tx, diagnostics_rx) = mpsc::channel();
-    // Deliberately construct state rather than calling Wiesel::new, which loads
-    // user settings/credentials, checks OS permission, and registers a hotkey.
-    Wiesel {
-        navigation: Navigation::new(Screen::Launcher),
-        request_generation: 0,
-        active_request: None,
-        recorded_hides: Some(0),
-        recorded_pastes: Some(Vec::new()),
-        model_picker: cx.new(|cx| model_picker::ModelPicker::new(settings.model.clone(), cx)),
-        tier_pickers: Wiesel::new_tier_pickers(&settings, cx),
-        provider_tab: Wiesel::initial_provider_tab(&settings),
-        ollama_status: None,
-        ollama_checking: false,
-        settings,
-        actions: action_builder::ActionBuilder::fixture(),
-        diagnostics: None,
-        diagnostics_initializing: false,
-        diagnostics_busy: false,
-        controlled_diagnostic_requests: None,
-        diagnostics_tx,
-        diagnostics_rx,
-        diagnostic_flush: None,
-        diagnostic_flushed_at: Instant::now(),
-        diagnostics_open_focus: cx.focus_handle().tab_stop(true),
-        diagnostics_clear_focus: cx.focus_handle().tab_stop(true),
-        manager: None,
-        hotkey: None,
-        session: DesktopSession {
-            credential: Some(Arc::new(credential)),
-            ..Default::default()
-        },
-        login_focus: cx.focus_handle().tab_stop(true),
-        urls: mpsc::channel().1,
-        status_loading: false,
-        device_status: None,
-        recovery: CredentialRecovery::Ready,
-        composer: cx.new(|cx| {
-            TextInput::new("Ask anything…", false, cx).with_accessibility_id("wiesel.chat.composer")
-        }),
-        focus: cx.focus_handle(),
-        recording: false,
-        authenticated: true,
-        accessibility_granted: false,
-        permission_checked_at: Instant::now(),
-        busy: false,
-        notifications: Notifications::default(),
-        selection: selection::Capture::default(),
-        pending_capture: None,
-        direct_paste: None,
-        paste_back: None,
-        capture_scope: None,
-        failed_chat: Default::default(),
-        result: String::new(),
-        writing_title: String::new(),
-        messages: vec![],
-        chat_action_model: None,
-        tx,
-        rx,
-        chat_scroll: ScrollHandle::new(),
-        chat_follow_bottom: true,
-        streaming_chat: None,
-        completion_backend: CompletionBackend::Controlled(backend),
-    }
-}
-
-pub(super) fn setup(
-    cx: &mut TestAppContext,
-) -> (Entity<Wiesel>, ControlledBackend, &mut VisualTestContext) {
-    // GPUI's default TestPlatform uses NoopTextSystem, not AppKit/a GPU. It
-    // supports layout and input without a display, installed fonts, or OS AX.
-    cx.update(|cx| {
-        cx.set_reduce_motion(true);
-        cx.bind_keys([KeyBinding::new(
-            "cmd-a",
-            input::SelectAll,
-            Some("TextInput"),
-        )]);
-    });
-    let backend = ControlledBackend::default();
-    let (app, cx) = cx.add_window_view(|window, cx| {
-        let app = ephemeral_app(backend.clone(), cx);
-        window.focus(&app.focus, cx);
-        app
-    });
-    cx.simulate_resize(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
-    (app, backend, cx)
-}
-
-/// Settings and quick-action management are macOS menu commands, not on-screen keys.
-pub(super) fn menu(cx: &mut VisualTestContext, action: impl gpui::Action) {
-    cx.dispatch_action(action);
+/// Make a surface the key window, as clicking into it would.
+fn activate(app: &Entity<Wiesel>, cx: &mut VisualTestContext, surface: Surface) {
+    on_surface(app, cx, surface).update(|window, _| window.activate_window());
     cx.run_until_parked();
 }
 
-pub(super) fn click(cx: &mut VisualTestContext, selector: &'static str) {
-    let bounds = cx.debug_bounds(selector).expect("rendered control");
-    cx.simulate_click(bounds.center(), Modifiers::none());
+/// The global shortcut brings the launcher back.
+fn show_launcher(app: &Entity<Wiesel>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| app.update(cx, |app, cx| app.show_hud(window, cx)));
+    cx.run_until_parked();
+}
+
+/// Whether `focus` holds focus inside `surface`'s window.
+fn focused_in(
+    app: &Entity<Wiesel>,
+    cx: &mut VisualTestContext,
+    surface: Surface,
+    focus: impl FnOnce(&Wiesel, &App) -> FocusHandle,
+) -> bool {
+    on_surface(app, cx, surface).update(|window, cx| focus(app.read(cx), cx).is_focused(window))
 }
 
 fn open_chat(app: &Entity<Wiesel>, cx: &mut VisualTestContext) {
     click(cx, "chat");
     cx.read_entity(app, |app, cx| {
-        assert!(app.current_screen() == Screen::Chat);
+        assert!(app.is_open(Surface::Chat));
         assert!(app.composer.read(cx).content.is_empty());
     });
-}
-
-pub(super) fn receive_results(app: &Entity<Wiesel>, cx: &mut VisualTestContext) {
-    // Explicit releases enqueue real scoped ResultEvents. Drain only the same
-    // event receiver used by poll, avoiding its OS permission/hotkey side effects
-    // and any wall-clock timers, sleeping, or uncontrolled background threads.
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| app.receive_results(window, cx));
-    });
-    cx.run_until_parked();
 }
 
 fn history(messages: &[Message]) -> Vec<(&str, &str)> {
@@ -147,7 +44,7 @@ fn history(messages: &[Message]) -> Vec<(&str, &str)> {
 fn chat_send_commits_first_reply_and_clears_composer(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Hello Wiesel");
+    input(cx, "Hello Wiesel");
     cx.read_entity(&app, |app, cx| {
         assert_eq!(app.composer.read(cx).content.as_ref(), "Hello Wiesel");
     });
@@ -188,13 +85,13 @@ fn chat_send_commits_first_reply_and_clears_composer(cx: &mut TestAppContext) {
 fn chat_enter_sends_committed_multi_turn_history(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("First question");
-    cx.simulate_keystrokes("enter");
+    input(cx, "First question");
+    keys(cx, "enter");
     backend.finish(0, Ok("First answer".into()));
     receive_results(&app, cx);
 
-    cx.simulate_input("Follow up");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Follow up");
+    keys(cx, "enter");
     assert_eq!(backend.request_count(), 2);
     assert_eq!(
         history(&backend.request(1).1),
@@ -225,11 +122,11 @@ fn chat_enter_sends_committed_multi_turn_history(cx: &mut TestAppContext) {
 fn chat_busy_prevents_duplicate_send_and_enter_without_losing_new_draft(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Pending question");
-    cx.simulate_keystrokes("enter enter");
-    cx.simulate_input("New draft");
+    input(cx, "Pending question");
+    keys(cx, "enter enter");
+    input(cx, "New draft");
     click(cx, "send");
-    cx.simulate_keystrokes("enter");
+    keys(cx, "enter");
     assert_eq!(backend.request_count(), 1);
     cx.read_entity(&app, |app, cx| {
         assert!(app.busy);
@@ -248,7 +145,7 @@ fn chat_busy_prevents_duplicate_send_and_enter_without_losing_new_draft(cx: &mut
 fn chat_streamed_preview_is_not_committed_until_completion(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Stream please");
+    input(cx, "Stream please");
     click(cx, "send");
     backend.delta(0, "Partial ");
     receive_results(&app, cx);
@@ -281,8 +178,8 @@ fn chat_streamed_preview_is_not_committed_until_completion(cx: &mut TestAppConte
 fn chat_failed_stream_restores_draft_and_discards_preview(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Failed draft");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Failed draft");
+    keys(cx, "enter");
     backend.delta(0, "Incomplete reply");
     receive_results(&app, cx);
     backend.finish(0, Err(anyhow::anyhow!("Controlled failure")));
@@ -305,14 +202,14 @@ fn chat_failed_stream_restores_draft_and_discards_preview(cx: &mut TestAppContex
 fn chat_failed_send_preserves_newer_draft_and_committed_history(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("First question");
-    cx.simulate_keystrokes("enter");
+    input(cx, "First question");
+    keys(cx, "enter");
     backend.finish(0, Ok("First answer".into()));
     receive_results(&app, cx);
-    cx.simulate_input("Failed question");
+    input(cx, "Failed question");
     click(cx, "send");
     click(cx, "chat-composer");
-    cx.simulate_input("Newer draft");
+    input(cx, "Newer draft");
     backend.finish(1, Err(anyhow::anyhow!("Controlled failure")));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
@@ -331,8 +228,8 @@ fn chat_failed_send_preserves_newer_draft_and_committed_history(cx: &mut TestApp
 fn chat_rejects_stale_generation_deltas_and_completion(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Question");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Question");
+    keys(cx, "enter");
     app.update(cx, |app, _| app.session.cancel_login());
     backend.delta(0, "Stale preview");
     receive_results(&app, cx);
@@ -358,9 +255,9 @@ fn chat_requires_verified_authentication_even_with_injected_backend(cx: &mut Tes
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
     app.update(cx, |app, _| app.authenticated = false);
-    cx.simulate_input("Unsent draft");
+    input(cx, "Unsent draft");
     click(cx, "send");
-    cx.simulate_keystrokes("enter");
+    keys(cx, "enter");
     assert_eq!(backend.request_count(), 0);
     cx.read_entity(&app, |app, cx| {
         assert!(!app.busy);
@@ -374,8 +271,8 @@ fn chat_requires_verified_authentication_even_with_injected_backend(cx: &mut Tes
 fn chat_rejects_deltas_and_completion_from_replaced_device(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Question");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Question");
+    keys(cx, "enter");
     app.update(cx, |app, _| {
         let now = settings::utc_now_ms().unwrap();
         app.session.credential = Some(Arc::new(
@@ -404,8 +301,8 @@ fn chat_requires_device_credential_even_with_injected_backend(cx: &mut TestAppCo
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
     app.update(cx, |app, _| app.session.credential = None);
-    cx.simulate_input("Unsent draft");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Unsent draft");
+    keys(cx, "enter");
     assert_eq!(backend.request_count(), 0);
     cx.read_entity(&app, |app, cx| {
         assert!(!app.busy);
@@ -493,49 +390,50 @@ fn setup_settings(cx: &mut TestAppContext) -> (Entity<Wiesel>, &mut VisualTestCo
 #[gpui::test]
 fn settings_tab_and_shift_tab_reach_both_diagnostic_controls(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    let tier_focused = |index: usize, cx: &mut VisualTestContext| {
-        cx.update(|window, cx| {
-            let picker = app.read(cx).tier_pickers[index].clone();
-            assert!(picker.focus_handle(cx).is_focused(window));
-        })
+    let focused = |cx: &mut VisualTestContext, focus: fn(&Wiesel, &App) -> FocusHandle| {
+        assert!(focused_in(&app, cx, Surface::Settings, focus));
     };
+    let tier =
+        |index: usize| move |app: &Wiesel, cx: &App| app.tier_pickers[index].focus_handle(cx);
     // Account, then the three tier pickers, then diagnostics.
     for index in 0..3 {
-        cx.simulate_keystrokes("tab");
-        tier_focused(index, cx);
+        keys(cx, "tab");
+        assert!(focused_in(&app, cx, Surface::Settings, tier(index)));
     }
-    cx.simulate_keystrokes("tab");
-    cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
-    cx.simulate_keystrokes("tab");
-    cx.update(|window, cx| assert!(app.read(cx).diagnostics_clear_focus.is_focused(window)));
-    cx.simulate_keystrokes("shift-tab");
-    cx.update(|window, cx| assert!(app.read(cx).diagnostics_open_focus.is_focused(window)));
+    keys(cx, "tab");
+    focused(cx, |app, _| app.diagnostics_open_focus.clone());
+    keys(cx, "tab");
+    focused(cx, |app, _| app.diagnostics_clear_focus.clone());
+    keys(cx, "shift-tab");
+    focused(cx, |app, _| app.diagnostics_open_focus.clone());
     for index in (0..3).rev() {
-        cx.simulate_keystrokes("shift-tab");
-        tier_focused(index, cx);
+        keys(cx, "shift-tab");
+        assert!(focused_in(&app, cx, Surface::Settings, tier(index)));
     }
-    cx.simulate_keystrokes("shift-tab");
-    cx.update(|window, cx| assert!(app.read(cx).login_focus.is_focused(window)));
+    keys(cx, "shift-tab");
+    focused(cx, |app, _| app.login_focus.clone());
 }
 
 #[gpui::test]
 fn settings_tab_does_not_traverse_while_recording_a_shortcut(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    cx.update(|window, cx| {
+    on_surface(&app, cx, Surface::Settings).update(|window, cx| {
         app.update(cx, |app, cx| {
+            // As the Record button does: the window root captures the shortcut.
             app.recording = true;
-            window.focus(&app.focus, cx);
+            window.focus(&app.surface_focus(Surface::Settings), cx);
             cx.notify();
         });
     });
     cx.run_until_parked();
     // These modifier-free shortcuts are rejected by recording without touching
     // hotkey registration/settings persistence. They must not become traversal.
-    cx.simulate_keystrokes("tab shift-tab");
-    cx.update(|window, cx| {
-        let app = app.read(cx);
+    keys(cx, "tab shift-tab");
+    assert!(focused_in(&app, cx, Surface::Settings, |app, _| {
+        app.surface_focus(Surface::Settings)
+    }));
+    cx.read_entity(&app, |app, _| {
         assert!(app.recording);
-        assert!(app.focus.is_focused(window));
         assert_eq!(app.settings.hotkey, Settings::default().hotkey);
     });
 }
@@ -543,7 +441,6 @@ fn settings_tab_does_not_traverse_while_recording_a_shortcut(cx: &mut TestAppCon
 #[gpui::test]
 fn settings_lit_record_key_cancels_recording(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    cx.simulate_resize(size(px(800.), px(1600.)));
     click(cx, "record");
     cx.read_entity(&app, |app, _| assert!(app.recording));
     click(cx, "record");
@@ -566,8 +463,10 @@ fn signing_in_completes_onboarding_without_a_save_step(cx: &mut TestAppContext) 
 #[gpui::test]
 fn settings_modified_tab_does_not_traverse(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    cx.simulate_keystrokes("cmd-tab ctrl-tab alt-tab cmd-shift-tab");
-    cx.update(|window, cx| assert!(app.read(cx).login_focus.is_focused(window)));
+    keys(cx, "cmd-tab ctrl-tab alt-tab cmd-shift-tab");
+    assert!(focused_in(&app, cx, Surface::Settings, |app, _| app
+        .login_focus
+        .clone()));
 }
 
 fn assert_diagnostic_key_press_activates_once(
@@ -576,7 +475,8 @@ fn assert_diagnostic_key_press_activates_once(
     key: &str,
 ) {
     let (app, cx) = setup_settings(cx);
-    cx.update(|window, cx| {
+    let mut settings = on_surface(&app, cx, Surface::Settings);
+    settings.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.controlled_diagnostic_requests = Some(Vec::new());
             window.focus(
@@ -591,7 +491,7 @@ fn assert_diagnostic_key_press_activates_once(
     });
     cx.run_until_parked();
     let keystroke = Keystroke::parse(key).unwrap();
-    cx.simulate_event(KeyDownEvent {
+    settings.simulate_event(KeyDownEvent {
         keystroke: keystroke.clone(),
         is_held: false,
         prefer_character_input: false,
@@ -609,7 +509,7 @@ fn assert_diagnostic_key_press_activates_once(
         });
     });
     cx.run_until_parked();
-    cx.simulate_event(KeyUpEvent { keystroke });
+    settings.simulate_event(KeyUpEvent { keystroke });
     cx.read_entity(&app, |app, _| {
         let requests = app.controlled_diagnostic_requests.as_ref().unwrap();
         assert_eq!(
@@ -648,67 +548,67 @@ fn diagnostic_clear_logs_held_space_activates_once(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn navigation_settings_back_restores_chat_draft_selection_and_focus(cx: &mut TestAppContext) {
+fn settings_window_leaves_chat_draft_selection_and_focus_intact(cx: &mut TestAppContext) {
     let (app, _, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Chat draft");
-    cx.simulate_keystrokes("cmd-a");
-    let chat_id = cx.read_entity(&app, |app, _| app.navigation.current().id);
+    input(cx, "Chat draft");
+    keys(cx, "cmd-a");
     menu(cx, OpenSettings);
     menu(cx, OpenSettings);
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.current_screen(), Screen::Settings);
         assert_eq!(
             app.navigation.depth(),
-            3,
+            1,
             "duplicate Settings must not mount"
         );
     });
-    click(cx, "back");
-    cx.update(|window, cx| {
-        let app = app.read(cx);
-        assert_eq!(app.current_screen(), Screen::Chat);
-        assert_eq!(app.navigation.current().id, chat_id);
-        assert!(app.composer.focus_handle(cx).is_focused(window));
+    assert_eq!(windows(cx).len(), 3, "launcher, Chat and one Settings");
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, cx| {
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
         assert_eq!(app.composer.read(cx).content.as_ref(), "Chat draft");
     });
-    // Selection survives being covered: typing replaces, rather than appends.
-    cx.simulate_input("Replacement");
+    assert!(focused_in(&app, cx, Surface::Chat, |app, cx| app
+        .composer
+        .focus_handle(cx)));
+    // Selection survives the other window: typing replaces, rather than appends.
+    activate(&app, cx, Surface::Chat);
+    input(cx, "Replacement");
     cx.read_entity(&app, |app, cx| {
         assert_eq!(app.composer.read(cx).content.as_ref(), "Replacement")
     });
-    click(cx, "back");
-    cx.update(|window, cx| {
-        let app = app.read(cx);
-        assert_eq!(app.current_screen(), Screen::Launcher);
-        assert!(app.navigation.is_root());
-        assert!(app.focus.is_focused(window));
-    });
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, _| assert!(!app.is_open(Surface::Chat)));
+    // The launcher keeps its own focus throughout.
+    cx.update(|window, cx| assert!(app.read(cx).focus.is_focused(window)));
 }
 
 #[gpui::test]
-fn navigation_escape_pops_one_entry_and_root_escape_records_hide_without_underflow(
+fn escape_closes_one_window_at_a_time_and_bare_launcher_escape_records_hide(
     cx: &mut TestAppContext,
 ) {
     let (app, _, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Retained draft");
+    input(cx, "Retained draft");
     menu(cx, OpenSettings);
-    cx.simulate_keystrokes("escape");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Chat);
-        assert_eq!(app.navigation.depth(), 2);
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
         assert_eq!(app.recorded_hides, Some(0));
     });
-    cx.simulate_keystrokes("escape");
+    activate(&app, cx, Surface::Chat);
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Chat));
         assert_eq!(app.recorded_hides, Some(0));
     });
-    cx.simulate_keystrokes("escape escape");
+    // Only the launcher is left: Esc hands focus back every time.
+    keys(cx, "escape escape");
     cx.read_entity(&app, |app, cx| {
-        assert_eq!(app.navigation.depth(), 1);
-        assert_eq!(app.current_screen(), Screen::Launcher);
+        assert!(Surface::ALL.iter().all(|surface| !app.is_open(*surface)));
         assert_eq!(
             app.recorded_hides,
             Some(2),
@@ -719,81 +619,80 @@ fn navigation_escape_pops_one_entry_and_root_escape_records_hide_without_underfl
 }
 
 #[gpui::test]
-fn navigation_recording_escape_takes_precedence(cx: &mut TestAppContext) {
+fn settings_recording_escape_takes_precedence_over_closing(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    // Make the real settings controls visible without involving a native window.
-    cx.simulate_resize(size(px(800.), px(1600.)));
     click(cx, "record");
     cx.read_entity(&app, |app, _| assert!(app.recording));
-    cx.simulate_keystrokes("escape");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
         assert!(!app.recording);
+        assert!(app.is_open(Surface::Settings));
         assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.navigation.depth(), 2);
     });
-    cx.simulate_keystrokes("escape");
-    cx.read_entity(&app, |app, _| assert!(app.navigation.is_root()));
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, _| assert!(!app.is_open(Surface::Settings)));
 }
 
 #[gpui::test]
-fn navigation_chat_completion_while_covered_preserves_route_messages_and_new_draft(
-    cx: &mut TestAppContext,
-) {
+fn chat_completion_behind_settings_preserves_messages_and_new_draft(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Question");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("New draft");
+    input(cx, "Question");
+    keys(cx, "enter");
+    input(cx, "New draft");
     menu(cx, OpenSettings);
     backend.delta(0, "Preview");
     receive_results(&app, cx);
     cx.read_entity(&app, |app, _| {
         assert!(app.busy);
-        assert_eq!(app.current_screen(), Screen::Settings);
+        assert!(app.is_open(Surface::Settings));
         assert_eq!(app.streaming_chat.as_ref().unwrap().content, "Preview");
     });
     backend.finish(0, Ok("Completed answer".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
         assert!(!app.busy);
-        assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.navigation.depth(), 3);
+        assert!(app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
         assert_eq!(
             history(&app.messages),
             vec![("user", "Question"), ("assistant", "Completed answer")]
         );
         assert_eq!(app.composer.read(cx).content.as_ref(), "New draft");
     });
-    click(cx, "back");
-    cx.update(|window, cx| assert!(app.read(cx).composer.focus_handle(cx).is_focused(window)));
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, _| assert!(!app.is_open(Surface::Settings)));
+    assert!(focused_in(&app, cx, Surface::Chat, |app, cx| app
+        .composer
+        .focus_handle(cx)));
 }
 
 #[gpui::test]
-fn navigation_popped_chat_request_remains_busy_and_completion_does_not_resurrect_chat(
-    cx: &mut TestAppContext,
-) {
+fn closed_chat_request_remains_busy_and_completion_does_not_reopen_chat(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Question");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("New draft");
-    cx.simulate_keystrokes("escape");
-    // A second inference cannot be started from Home while the old view is popped.
-    cx.simulate_keystrokes("1");
+    input(cx, "Question");
+    keys(cx, "enter");
+    input(cx, "New draft");
+    keys(cx, "escape");
+    // A second inference cannot be started from the launcher while Chat is closed.
+    show_launcher(&app, cx);
+    keys(cx, "1");
     cx.read_entity(&app, |app, _| {
         assert!(app.busy);
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Chat));
+        assert!(!app.is_open(Surface::Writing));
     });
     assert_eq!(backend.request_count(), 1);
     click(cx, "chat");
     click(cx, "new-chat");
-    cx.simulate_keystrokes("enter escape");
+    keys(cx, "enter escape");
     assert_eq!(backend.request_count(), 1);
     backend.delta(0, "Late preview");
     backend.finish(0, Ok("Late answer".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Chat));
         assert!(!app.busy);
         assert_eq!(
             history(&app.messages),
@@ -801,58 +700,62 @@ fn navigation_popped_chat_request_remains_busy_and_completion_does_not_resurrect
         );
         assert_eq!(app.composer.read(cx).content.as_ref(), "New draft");
     });
+    show_launcher(&app, cx);
     click(cx, "chat");
     cx.read_entity(&app, |app, _| assert_eq!(app.messages.len(), 2));
 }
 
 #[gpui::test]
-fn navigation_chat_failure_while_covered_retains_recoverable_draft(cx: &mut TestAppContext) {
+fn chat_failure_behind_settings_retains_recoverable_draft(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Failed question");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("New draft");
+    input(cx, "Failed question");
+    keys(cx, "enter");
+    input(cx, "New draft");
     menu(cx, OpenSettings);
     backend.finish(0, Err(anyhow::anyhow!("Controlled failure")));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
-        assert_eq!(app.current_screen(), Screen::Settings);
+        assert!(app.is_open(Surface::Settings));
         assert!(!app.busy);
         assert!(app.messages.is_empty());
         assert_eq!(app.failed_chat, vec!["Failed question".to_owned()]);
         assert_eq!(app.composer.read(cx).content.as_ref(), "New draft");
     });
-    click(cx, "back");
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, _| {
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
+    });
     assert_eq!(backend.request_count(), 1, "no retry on failure");
 }
 
 #[gpui::test]
-fn navigation_chat_failure_after_pop_restores_draft_without_changing_route(
-    cx: &mut TestAppContext,
-) {
+fn chat_failure_after_closing_restores_draft_without_reopening_chat(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Recover me");
-    cx.simulate_keystrokes("enter escape");
+    input(cx, "Recover me");
+    keys(cx, "enter escape");
     backend.finish(0, Err(anyhow::anyhow!("Controlled failure")));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Chat));
         assert!(!app.busy);
         assert!(app.messages.is_empty());
         assert_eq!(app.composer.read(cx).content.as_ref(), "Recover me");
     });
+    show_launcher(&app, cx);
     click(cx, "chat");
-    cx.simulate_keystrokes("enter");
+    keys(cx, "enter");
     assert_eq!(backend.request_count(), 2, "only explicit Enter resubmits");
 }
 
 #[gpui::test]
-fn navigation_replayed_old_request_does_not_mutate_newer_chat_request(cx: &mut TestAppContext) {
+fn replayed_old_request_does_not_mutate_newer_chat_request(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("First");
-    cx.simulate_keystrokes("enter");
+    input(cx, "First");
+    keys(cx, "enter");
     let old_scope = cx.read_entity(&app, |app, _| EventScope {
         completion: app.active_request,
         ..app.session.scope()
@@ -860,8 +763,8 @@ fn navigation_replayed_old_request_does_not_mutate_newer_chat_request(cx: &mut T
     backend.finish(0, Ok("First answer".into()));
     receive_results(&app, cx);
     click(cx, "new-chat");
-    cx.simulate_input("Second");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Second");
+    keys(cx, "enter");
     // Replay already-settled events through the normal receiver. Same login/device,
     // different request ownership; ControlledBackend itself disallows double finish.
     app.update(cx, |app, _| {
@@ -895,13 +798,13 @@ fn navigation_replayed_old_request_does_not_mutate_newer_chat_request(cx: &mut T
 }
 
 #[gpui::test]
-fn navigation_busy_new_chat_is_blocked_and_session_invalidation_rejects_covered_completion(
+fn busy_new_chat_is_blocked_and_session_invalidation_rejects_completion_behind_settings(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Question");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Question");
+    keys(cx, "enter");
     click(cx, "new-chat");
     cx.read_entity(&app, |app, _| {
         assert_eq!(history(&app.messages), vec![("user", "Question")])
@@ -912,7 +815,8 @@ fn navigation_busy_new_chat_is_blocked_and_session_invalidation_rejects_covered_
     backend.finish(0, Ok("Stale answer".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Settings);
+        assert!(app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
         assert!(
             !app.busy,
             "the exact stale terminal settles only its own physical request"
@@ -923,73 +827,91 @@ fn navigation_busy_new_chat_is_blocked_and_session_invalidation_rejects_covered_
 }
 
 #[gpui::test]
-fn navigation_unauthenticated_home_stays_root_and_setup_gating_cannot_send(
-    cx: &mut TestAppContext,
-) {
+fn unauthenticated_chat_tile_reveals_sign_in_and_setup_gating_cannot_send(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     app.update(cx, |app, _| {
         app.authenticated = false;
         app.settings.onboarded = false;
     });
-    // Pad 3 is Chat; setup gating redirects it to Settings.
-    cx.simulate_keystrokes("3");
+    // Tile 3 is Chat; setup gating reveals sign-in in Settings instead.
+    keys(cx, "3");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.navigation.root().component, Screen::Launcher);
+        assert!(app.is_open(Surface::Settings));
+        assert!(!app.is_open(Surface::Chat));
         assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.navigation.depth(), 2);
+        assert_eq!(app.navigation.depth(), 1);
     });
-    click(cx, "back");
-    cx.simulate_keystrokes("escape");
+    assert!(focused_in(&app, cx, Surface::Settings, |app, _| app
+        .login_focus
+        .clone()));
+    // Esc closes Settings, then hides from the bare launcher.
+    keys(cx, "escape");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Settings));
         assert_eq!(app.recorded_hides, Some(1));
     });
     assert_eq!(backend.request_count(), 0);
-    // Verification alone must not bypass incomplete setup after Back.
+    // Verification alone must not bypass incomplete setup.
     app.update(cx, |app, _| app.authenticated = true);
+    show_launcher(&app, cx);
     click(cx, "chat");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Settings)
+        assert!(app.is_open(Surface::Settings));
+        assert!(!app.is_open(Surface::Chat));
     });
     assert_eq!(backend.request_count(), 0);
 }
 
 #[gpui::test]
-fn navigation_startup_login_only_pops_current_startup_settings(cx: &mut TestAppContext) {
+fn startup_login_closes_only_untouched_startup_settings(cx: &mut TestAppContext) {
     let (app, _, cx) = setup(cx);
+    // Invoke only the navigation half of login readiness (no model/network refresh).
+    let login_ready = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.finish_startup_navigation(true, window, cx)
+            });
+        });
+        cx.run_until_parked();
+    };
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            // Parse an in-memory hotkey without registering it, and invoke only
-            // the navigation half of login readiness (no model/network refresh).
+            // Parse an in-memory hotkey without registering it.
             app.hotkey = Some(parse_hotkey(&app.settings.hotkey).unwrap());
             app.push_settings(true, window, cx);
-            app.push_screen(Screen::Chat, false, window, cx);
-            app.finish_startup_navigation(true, window, cx);
-            assert_eq!(app.current_screen(), Screen::Chat);
-            assert_eq!(app.navigation.depth(), 3);
         });
+    });
+    cx.run_until_parked();
+    // The user moved on inside setup Settings: login leaves it open.
+    menu(cx, AdjustQuickActions);
+    login_ready(cx);
+    cx.read_entity(&app, |app, _| {
+        assert!(app.is_open(Surface::Settings));
+        assert_eq!(app.current_screen(), Screen::ActionManager);
+        assert_eq!(app.navigation.depth(), 2);
     });
     click(cx, "back");
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            app.finish_startup_navigation(true, window, cx)
-        });
-    });
-    cx.read_entity(&app, |app, _| assert!(app.navigation.is_root()));
-    menu(cx, OpenSettings);
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            app.finish_startup_navigation(true, window, cx)
-        });
-    });
+    login_ready(cx);
     cx.read_entity(&app, |app, _| {
+        assert!(!app.is_open(Surface::Settings));
+        assert!(!app.settings_startup);
+        assert!(app.hud_visible, "the launcher replaces setup Settings");
+    });
+    menu(cx, OpenSettings);
+    login_ready(cx);
+    cx.read_entity(&app, |app, _| {
+        assert!(
+            app.is_open(Surface::Settings),
+            "explicit Settings stays open"
+        );
         assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.navigation.depth(), 2, "explicit Settings stays mounted");
+        assert_eq!(app.navigation.depth(), 1);
     });
 }
 
 #[gpui::test]
-fn navigation_writing_completion_after_pop_retains_result_and_selection_without_resurrection(
+fn writing_completion_after_closing_retains_result_and_selection_without_reopening(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
@@ -999,23 +921,26 @@ fn navigation_writing_completion_after_pop_retains_result_and_selection_without_
     click(cx, "grammar");
     assert!(!backend.request(0).2);
     menu(cx, OpenSettings);
-    click(cx, "back");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Writing);
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Writing));
         assert_eq!(app.selection.writing_source, "Selected source");
         assert!(app.busy);
     });
-    click(cx, "back");
+    activate(&app, cx, Surface::Writing);
+    keys(cx, "escape");
+    show_launcher(&app, cx);
     click(cx, "grammar");
     assert_eq!(
         backend.request_count(),
         1,
-        "popping does not cancel or permit a second inference"
+        "closing does not cancel or permit a second inference"
     );
     backend.finish(0, Ok("Edited source".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, _| {
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Writing));
         assert!(!app.busy);
         assert_eq!(app.result, "Edited source");
         assert_eq!(app.selection.writing_source, "Selected source");
@@ -1024,46 +949,53 @@ fn navigation_writing_completion_after_pop_retains_result_and_selection_without_
 }
 
 #[gpui::test]
-fn navigation_hotkey_root_activation_retains_settings_and_busy_screen_but_unwinds_idle_chat(
-    cx: &mut TestAppContext,
-) {
+fn hotkey_activation_shows_launcher_and_retains_every_window(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
+    let hotkey = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| app.update(cx, |app, cx| app.activate_from_hotkey(window, cx)));
+        cx.run_until_parked();
+    };
     open_chat(&app, cx);
-    cx.simulate_input("Draft");
-    cx.update(|window, cx| app.update(cx, |app, cx| app.activate_from_hotkey(window, cx)));
+    input(cx, "Draft");
+    hotkey(cx);
     cx.read_entity(&app, |app, cx| {
-        assert!(app.navigation.is_root());
+        assert!(app.hud_visible);
+        assert!(app.is_open(Surface::Chat));
         assert_eq!(app.composer.read(cx).content.as_ref(), "Draft");
     });
-    click(cx, "chat");
-    cx.simulate_keystrokes("enter");
-    cx.update(|window, cx| app.update(cx, |app, cx| app.activate_from_hotkey(window, cx)));
+    activate(&app, cx, Surface::Chat);
+    keys(cx, "enter");
+    hotkey(cx);
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Chat)
+        assert!(app.busy);
+        assert!(app.is_open(Surface::Chat));
     });
-    menu(cx, OpenSettings);
+    menu(cx, AdjustQuickActions);
     backend.finish(0, Ok("Answer".into()));
     receive_results(&app, cx);
-    cx.update(|window, cx| app.update(cx, |app, cx| app.activate_from_hotkey(window, cx)));
+    hotkey(cx);
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Settings);
-        assert_eq!(app.navigation.depth(), 3);
+        assert!(app.hud_visible);
+        assert!(app.is_open(Surface::Chat));
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.current_screen(), Screen::ActionManager);
+        assert_eq!(app.navigation.depth(), 2);
     });
 }
 
 #[gpui::test]
-fn navigation_settings_pop_restores_chat_history_scroll_position(cx: &mut TestAppContext) {
+fn settings_window_leaves_chat_history_scroll_position(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Long answer please");
-    cx.simulate_keystrokes("enter");
+    input(cx, "Long answer please");
+    keys(cx, "enter");
     backend.finish(
         0,
         Ok("A long paragraph in the retained chat history.\n\n".repeat(50)),
     );
     receive_results(&app, cx);
-    // Seed the reader's position after actual history layout. Covering the chat
-    // must not replace its scroll handle or resume following the bottom.
+    // Seed the reader's position after actual history layout. Opening Settings must
+    // not replace the chat's scroll handle or resume following the bottom.
     app.update(cx, |app, cx| {
         app.chat_follow_bottom = false;
         app.chat_scroll.set_offset(point(px(0.), px(-100.)));
@@ -1073,9 +1005,10 @@ fn navigation_settings_pop_restores_chat_history_scroll_position(cx: &mut TestAp
     let offset = cx.read_entity(&app, |app, _| app.chat_scroll.offset());
     assert!(offset.y < px(0.));
     menu(cx, OpenSettings);
-    click(cx, "back");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Chat);
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
         assert_eq!(app.messages.len(), 2);
         assert_eq!(app.chat_scroll.offset(), offset);
         assert!(!app.chat_follow_bottom);
@@ -1083,7 +1016,7 @@ fn navigation_settings_pop_restores_chat_history_scroll_position(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn navigation_writing_completion_while_covered_restores_result_on_back(cx: &mut TestAppContext) {
+fn writing_completion_behind_settings_keeps_result_in_writing_window(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     app.update(cx, |app, _| {
         app.selection.update(Ok("Selected source".into()))
@@ -1093,78 +1026,74 @@ fn navigation_writing_completion_while_covered_restores_result_on_back(cx: &mut 
     backend.finish(0, Ok("Edited source".into()));
     receive_results(&app, cx);
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Settings);
+        assert!(app.is_open(Surface::Settings));
         assert_eq!(app.result, "Edited source");
         assert!(!app.busy);
     });
-    click(cx, "back");
+    keys(cx, "escape");
     cx.read_entity(&app, |app, _| {
-        assert_eq!(app.current_screen(), Screen::Writing);
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Writing));
         assert_eq!(app.result, "Edited source");
         assert_eq!(app.selection.writing_source, "Selected source");
     });
+    assert!(
+        on_surface(&app, cx, Surface::Writing)
+            .debug_bounds("copy-result")
+            .is_some()
+    );
     assert_eq!(backend.request_count(), 1);
 }
 
 #[gpui::test]
-fn navigation_settings_activation_reveals_existing_entry_without_losing_intervening_drafts(
-    cx: &mut TestAppContext,
-) {
+fn settings_activation_reveals_existing_window_without_losing_chat_draft(cx: &mut TestAppContext) {
     let (app, cx) = setup_settings(cx);
-    let settings_id = cx.read_entity(&app, |app, _| app.navigation.current().id);
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            app.push_screen(Screen::Chat, false, window, cx);
-        });
+    let (settings_window, settings_id) = cx.read_entity(&app, |app, _| {
+        (
+            app.surface_window(Surface::Settings),
+            app.navigation.current().id,
+        )
     });
-    cx.run_until_parked();
-    cx.simulate_input("Retained Chat draft");
+    assert!(settings_window.is_some());
+    show_launcher(&app, cx);
+    open_chat(&app, cx);
+    input(cx, "Retained Chat draft");
     menu(cx, OpenSettings);
     cx.read_entity(&app, |app, cx| {
+        assert_eq!(app.surface_window(Surface::Settings), settings_window);
         assert_eq!(app.current_screen(), Screen::Settings);
         assert_eq!(app.navigation.current().id, settings_id);
-        assert_eq!(app.navigation.depth(), 2);
+        assert_eq!(app.navigation.depth(), 1);
         assert_eq!(
             app.composer.read(cx).content.as_ref(),
             "Retained Chat draft"
         );
     });
-    click(cx, "back");
-    cx.read_entity(&app, |app, _| assert!(app.navigation.is_root()));
-}
-
-#[gpui::test]
-fn navigation_pushing_launcher_unwinds_to_permanent_root_instead_of_mounting_another_home(
-    cx: &mut TestAppContext,
-) {
-    let (app, _, cx) = setup(cx);
-    open_chat(&app, cx);
-    menu(cx, OpenSettings);
-    let root_id = cx.read_entity(&app, |app, _| app.navigation.root().id);
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            assert_eq!(
-                app.push_screen(Screen::Launcher, false, window, cx),
-                root_id
-            );
-        });
-    });
-    cx.read_entity(&app, |app, _| {
-        assert_eq!(app.navigation.depth(), 1);
-        assert_eq!(app.navigation.current().id, root_id);
+    assert_eq!(
+        Some(in_key_window(cx, |window, _| window.window_handle())),
+        settings_window,
+        "Settings comes forward"
+    );
+    keys(cx, "escape");
+    cx.read_entity(&app, |app, cx| {
+        assert!(!app.is_open(Surface::Settings));
+        assert!(app.is_open(Surface::Chat));
+        assert_eq!(
+            app.composer.read(cx).content.as_ref(),
+            "Retained Chat draft"
+        );
     });
 }
 
 #[gpui::test]
-fn navigation_session_end_clears_private_state_and_stale_capture_without_releasing_physical_inference(
+fn session_end_clears_private_state_and_stale_capture_without_releasing_physical_inference(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
-    cx.simulate_input("Home private draft");
     open_chat(&app, cx);
-    cx.simulate_input("Private question");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_input("Private composer draft");
+    input(cx, "Private question");
+    keys(cx, "enter");
+    input(cx, "Private composer draft");
     menu(cx, OpenSettings);
     let old_scope = cx.read_entity(&app, |app, _| EventScope {
         completion: app.active_request,
@@ -1205,14 +1134,16 @@ fn navigation_session_end_clears_private_state_and_stale_capture_without_releasi
                 app.pending_capture.is_some(),
                 "drain physical Copy to preserve restoration"
             );
+            assert!(app.is_open(Surface::Settings) && app.is_open(Surface::Chat));
             assert_eq!(app.navigation.current().id, settings_id);
             assert_eq!(app.settings.model, "test/chat-model");
-            // A late successful capture cannot restore text or activate Home.
+            // A late successful capture cannot restore text or show the launcher.
             app.finish_capture(Ok("Stale private source".into()), None, window, cx);
             app.poll_capture(window, cx);
             assert!(app.pending_capture.is_none());
             assert!(app.selection.text.is_none());
             assert!(app.selection.error.is_empty());
+            assert!(!app.hud_visible);
             assert_eq!(app.navigation.current().id, settings_id);
         });
     });
@@ -1238,9 +1169,10 @@ fn navigation_session_end_clears_private_state_and_stale_capture_without_releasi
         ));
         app.authenticated = true;
     });
-    click(cx, "back");
-    cx.simulate_input("Replacement prompt");
-    cx.simulate_keystrokes("enter");
+    keys(cx, "escape");
+    activate(&app, cx, Surface::Chat);
+    input(cx, "Replacement prompt");
+    keys(cx, "enter");
     assert_eq!(
         backend.request_count(),
         1,
@@ -1253,9 +1185,9 @@ fn navigation_session_end_clears_private_state_and_stale_capture_without_releasi
         assert!(app.active_request.is_none());
         assert!(app.messages.is_empty());
         assert_eq!(app.composer.read(cx).content.as_ref(), "Replacement prompt");
-        assert_eq!(app.current_screen(), Screen::Chat);
+        assert!(app.is_open(Surface::Chat));
     });
-    cx.simulate_keystrokes("enter");
+    keys(cx, "enter");
     assert_eq!(
         backend.request_count(),
         2,
@@ -1292,14 +1224,14 @@ fn navigation_session_end_clears_private_state_and_stale_capture_without_releasi
 }
 
 #[gpui::test]
-fn navigation_stale_failure_settles_ended_sessions_exact_physical_slot_without_draft_recovery(
+fn stale_failure_settles_ended_sessions_exact_physical_slot_without_draft_recovery(
     cx: &mut TestAppContext,
 ) {
     let (app, backend, cx) = setup(cx);
     open_chat(&app, cx);
-    cx.simulate_input("Ended-session draft");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_keystrokes("escape");
+    input(cx, "Ended-session draft");
+    keys(cx, "enter");
+    keys(cx, "escape");
     app.update(cx, |app, cx| {
         app.end_session_state(cx);
     });
@@ -1308,7 +1240,7 @@ fn navigation_stale_failure_settles_ended_sessions_exact_physical_slot_without_d
     receive_results(&app, cx);
     cx.read_entity(&app, |app, cx| {
         assert!(!app.busy);
-        assert!(app.navigation.is_root());
+        assert!(!app.is_open(Surface::Chat));
         assert!(!app.authenticated);
         assert!(app.messages.is_empty());
         assert!(app.failed_chat.is_empty());
@@ -1331,7 +1263,7 @@ fn ollama_sharp_tier_serves_chat_without_sign_in(cx: &mut TestAppContext) {
         use_sharp(app, ModelChoice::ollama("qwen3.5:0.8b"));
     });
     open_chat(&app, cx);
-    cx.simulate_input("Hello local");
+    input(cx, "Hello local");
     click(cx, "send");
     assert_eq!(backend.request_count(), 1);
     assert!(backend.local(0));
@@ -1359,7 +1291,7 @@ fn each_model_routes_to_its_own_provider(cx: &mut TestAppContext) {
     });
     // Built-in actions follow the Sharp tier, here a local model.
     open_chat(&app, cx);
-    cx.simulate_input("Local");
+    input(cx, "Local");
     click(cx, "send");
     assert!(backend.local(0));
     assert_eq!(backend.request(0).0, "llama3:8b");
@@ -1389,7 +1321,7 @@ fn each_model_routes_to_its_own_provider(cx: &mut TestAppContext) {
         app.new_chat(cx);
     });
     cx.read_entity(&app, |app, _| assert!(app.settings.models.sharp.is_none()));
-    cx.simulate_input("Cloud");
+    input(cx, "Cloud");
     click(cx, "send");
     assert!(!backend.local(2));
     assert_eq!(backend.request(2).0, "test/chat-model");
@@ -1403,7 +1335,7 @@ fn wiesel_tier_requires_sign_in(cx: &mut TestAppContext) {
         app.authenticated = false;
         use_sharp(app, ModelChoice::wiesel("test/chat-model"));
     });
-    cx.simulate_input("Hello");
+    input(cx, "Hello");
     click(cx, "send");
     assert_eq!(backend.request_count(), 0);
     cx.read_entity(&app, |app, cx| {
@@ -1416,7 +1348,7 @@ fn ollama_failures_use_local_copy(cx: &mut TestAppContext) {
     let (app, backend, cx) = setup(cx);
     app.update(cx, |app, _| use_sharp(app, ModelChoice::ollama("m")));
     open_chat(&app, cx);
-    cx.simulate_input("Hello");
+    input(cx, "Hello");
     click(cx, "send");
     backend.finish(0, Err(ollama::OllamaError("Ollama is not running.").into()));
     receive_results(&app, cx);
@@ -1457,14 +1389,9 @@ fn catalogs_fill_every_tier_picker_and_picks_persist(cx: &mut TestAppContext) {
             assert_eq!(picker.read(cx).wiesel.models, ["test/sage"]);
         }
     });
-    // Choosing in Settings persists the tier.
-    cx.simulate_resize(size(px(800.), px(2400.)));
-    cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            app.push_settings(false, window, cx);
-            cx.notify();
-        })
-    });
+    // Choosing in Settings persists the tier. A tall window paints every section.
+    menu(cx, OpenSettings);
+    on_surface(&app, cx, Surface::Settings).simulate_resize(size(px(800.), px(2400.)));
     cx.run_until_parked();
     click(cx, "tier-sage-select");
     // Option 0 is "Not set", 1 the Ollama model, 2 the Wiesel model.
@@ -1496,6 +1423,7 @@ fn settings_switches_between_provider_tabs(cx: &mut TestAppContext) {
     });
     // Sign-in entry points reveal the account tab again.
     cx.update(|window, cx| app.update(cx, |app, cx| app.start_login(window, cx)));
+    cx.run_until_parked();
     cx.read_entity(&app, |app, _| {
         assert_eq!(app.provider_tab, Provider::Wiesel)
     });

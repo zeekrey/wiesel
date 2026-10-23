@@ -7,10 +7,8 @@ use gpui::{prelude::*, *};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Two lines of header status text.
-pub const STATUS_BAR_HEIGHT: f32 = 28.;
-/// Messages up to this length are printed as tracked caps, like the design's READY.
-const PRINTED_STATUS_GRAPHEMES: usize = 22;
+/// Fixed status line height, so messages never shift the layout.
+pub const STATUS_BAR_HEIGHT: f32 = 16.;
 const MAX_MESSAGE_GRAPHEMES: usize = 96;
 const FEEDBACK_DURATION: Duration = Duration::from_secs(5);
 
@@ -24,13 +22,13 @@ pub enum Severity {
 impl Severity {
     fn led_color(self) -> u32 {
         match self {
-            Self::Info => theme::PAD_GLOW,
+            Self::Info => theme::LED_BLUE,
             Self::Success => theme::LED_GREEN,
             Self::Warning => theme::LED_AMBER,
             Self::Error => theme::LED_RED,
         }
     }
-    /// Readable text on either chassis; LEDs stay saturated, copy is darkened in light mode.
+    /// Readable text on either appearance; dots stay saturated, copy is darkened in light mode.
     fn text_color(self) -> u32 {
         let dark = theme::p().dark;
         match self {
@@ -100,6 +98,8 @@ pub struct Notifications {
     activity: Vec<(Source, Notification)>,
     feedback: Option<(Notification, Instant)>,
     visible: Option<Notification>,
+    /// The visible message reports pending work: show a spinner instead of a dot.
+    working: bool,
     revision: usize,
     animate: bool,
     pub suppress_motion: bool,
@@ -174,17 +174,15 @@ impl Notifications {
         {
             self.feedback = None;
         }
-        let next = self
-            .feedback
-            .as_ref()
-            .map(|(n, _)| n)
-            .or_else(|| {
-                self.issues
-                    .iter()
-                    .rev()
-                    .find(|(_, n)| n.severity == Severity::Error)
-                    .map(|(_, n)| n)
-            })
+        let feedback_or_error = self.feedback.as_ref().map(|(n, _)| n).or_else(|| {
+            self.issues
+                .iter()
+                .rev()
+                .find(|(_, n)| n.severity == Severity::Error)
+                .map(|(_, n)| n)
+        });
+        self.working = feedback_or_error.is_none() && !self.activity.is_empty();
+        let next = feedback_or_error
             .or_else(|| self.activity.last().map(|(_, n)| n))
             .or_else(|| {
                 self.issues
@@ -202,80 +200,121 @@ impl Notifications {
         self.animate = !self.suppress_motion;
         true
     }
-    /// The header status: an LED plus a short printed label, or up to two lines of copy.
-    /// `busy` lights the LED amber while a request is pending.
-    pub fn render(&self, busy: bool) -> Div {
-        let notification = self
-            .visible
-            .clone()
-            .unwrap_or_else(|| Notification::new(Severity::Success, "Ready"));
-        // A restrained opacity transition avoids layout motion and looping pulses.
-        // GPUI honors App::reduce_motion for this native animation wrapper.
-        let animate = self.animate;
-        let duration = Duration::from_millis(180);
-        let severity = notification.severity;
-        let led = if busy && severity <= Severity::Success {
-            theme::LED_AMBER
-        } else {
-            severity.led_color()
-        };
-        let message = format!(
-            "{}{}",
-            if matches!(severity, Severity::Warning | Severity::Error) {
-                format!("{}: ", severity.label())
-            } else {
-                String::new()
-            },
-            notification.message
-        );
-        let printed = message.graphemes(true).count() <= PRINTED_STATUS_GRAPHEMES;
-        let text = if printed {
-            theme::silkscreen(message, severity.text_color())
-        } else {
-            div()
-                .text_size(px(11.))
-                .line_height(px(14.))
-                .text_color(rgb(severity.text_color()))
-                .text_right()
-                .line_clamp(2)
-                .text_ellipsis()
-                .overflow_hidden()
-                .child(message)
-        };
-        div()
+    /// One status line: a severity dot (a spinner while work is pending), the headline,
+    /// and muted detail after a ` · `, e.g. "Ready · 369 characters selected".
+    pub fn render(&self) -> Div {
+        let bar = div()
             .h(px(STATUS_BAR_HEIGHT))
             .min_h(px(STATUS_BAR_HEIGHT))
             .max_h(px(STATUS_BAR_HEIGHT))
             .min_w_0()
             .flex()
             .items_center()
-            .justify_end()
             .gap(px(8.))
-            .child(theme::led(led).map(|chip| {
+            .overflow_hidden();
+        let Some(notification) = self.visible.as_ref() else {
+            return bar;
+        };
+        // A restrained opacity transition avoids layout motion and looping pulses.
+        // GPUI honors App::reduce_motion for this native animation wrapper.
+        let animate = self.animate;
+        let duration = Duration::from_millis(180);
+        let severity = notification.severity;
+        let line = headline(&notification.message);
+        let (message, detail) = line
+            .split_once(" · ")
+            .map_or((line.as_str(), None), |(message, detail)| {
+                (message, Some(detail.to_owned()))
+            });
+        let text = div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .overflow_hidden()
+            .text_size(px(11.))
+            .line_height(px(14.))
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(severity.text_color()))
+                    .child(message.to_owned()),
+            )
+            .when_some(detail, |d, detail| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .overflow_hidden()
+                        .text_color(rgb(theme::p().status_detail))
+                        .child(detail),
+                )
+            });
+        let indicator = if self.working {
+            theme::icon("loader", 11.)
+                .text_color(rgb(theme::p().status_label))
+                .with_animation(
+                    "status-spinner",
+                    Animation::new(Duration::from_millis(900)).repeat(),
+                    |icon, delta| {
+                        icon.with_transformation(Transformation::rotate(percentage(delta)))
+                    },
+                )
+                .into_any_element()
+        } else {
+            theme::led(severity.led_color()).map(|dot| {
                 if animate {
-                    chip.with_animation(
+                    dot.with_animation(
                         ("status-dot", self.revision),
                         Animation::new(duration).with_easing(ease_out_quint()),
-                        |chip, progress| chip.opacity(0.55 + 0.45 * progress),
+                        |dot, progress| dot.opacity(0.55 + 0.45 * progress),
                     )
                     .into_any_element()
                 } else {
-                    chip.into_any_element()
+                    dot.into_any_element()
                 }
-            }))
-            .child(div().min_w_0().flex_shrink(1.).child(text).map(|text| {
-                if animate {
-                    text.with_animation(
-                        ("status-text", self.revision),
-                        Animation::new(duration).with_easing(ease_out_quint()),
-                        |text, progress| text.opacity(0.65 + 0.35 * progress),
-                    )
-                    .into_any_element()
-                } else {
-                    text.into_any_element()
-                }
-            }))
+            })
+        };
+        bar.child(
+            div()
+                .size(px(11.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(indicator),
+        )
+        .child(text.map(|text| {
+            if animate {
+                text.with_animation(
+                    ("status-text", self.revision),
+                    Animation::new(duration).with_easing(ease_out_quint()),
+                    |text, progress| text.opacity(0.65 + 0.35 * progress),
+                )
+                .into_any_element()
+            } else {
+                text.into_any_element()
+            }
+        }))
     }
+    /// Full text of the visible problem, for accessibility; None when all is well.
+    pub fn description(&self) -> Option<String> {
+        self.visible
+            .as_ref()
+            .filter(|n| n.severity != Severity::Success)
+            .map(|n| format!("{}: {}", n.severity.label(), n.message))
+    }
+}
+
+/// The first sentence of a message, without its final period: the header has one short line.
+fn headline(message: &str) -> String {
+    let end = [". ", "; ", "! ", "? "]
+        .iter()
+        .filter_map(|separator| message.find(separator))
+        .min()
+        .unwrap_or(message.len());
+    message[..end].trim_end_matches('.').trim().to_string()
 }
 
 /// Translate capture safety failures without displaying a multi-line error chain.
@@ -481,11 +520,23 @@ mod tests {
     #[test]
     fn status_bar_has_fixed_dimensions() {
         use gpui::{Styled, px};
-        let mut bar = Notifications::default().render(false);
+        let mut bar = Notifications::default().render();
         let height = Some(px(super::STATUS_BAR_HEIGHT).into());
         assert_eq!(bar.style().size.height, height);
         assert_eq!(bar.style().min_size.height, height);
         assert_eq!(bar.style().max_size.height, height);
+    }
+    #[test]
+    fn headline_keeps_the_first_sentence() {
+        assert_eq!(
+            super::headline("Clipboard changed. Capture cancelled; newer content preserved."),
+            "Clipboard changed"
+        );
+        assert_eq!(
+            super::headline("Ollama isn't running."),
+            "Ollama isn't running"
+        );
+        assert_eq!(super::headline("Log in (⌘⇧L)."), "Log in (⌘⇧L)");
     }
     #[test]
     fn clipboard_restoration_failure_is_an_error() {

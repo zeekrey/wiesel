@@ -5,13 +5,16 @@ coverage, and a Swift Accessibility smoke test for the actual macOS bundle.
 
 ## 1. Fast logic and chat-state tests
 
-Ordinary Rust unit tests cover isolated logic. `#[gpui::test]` scenarios in
-`src/chat_tests.rs` simulate clicks, typing, and Enter through the real chat UI.
-`src/action_builder_tests.rs` reuses that ephemeral fixture for real create/edit/
-delete, icon/model selection, multiline input, confirmation and custom dispatch.
+Ordinary Rust unit tests cover isolated logic. `#[gpui::test]` scenarios share the
+ephemeral fixture in `src/test_support.rs`, whose helpers route clicks to the window
+that renders a control and typing to the key window. `src/surface_tests.rs` covers the
+launcher HUD (one row of tiles, launcher size, number/arrow keys) and opening/closing
+the Settings, Chat and result windows. `src/chat_tests.rs` simulates clicks, typing,
+and Enter through the real chat UI. `src/action_builder_tests.rs` covers real create/
+edit/delete, icon/model selection, multiline input, confirmation and custom dispatch.
 Persistence is injected into memory or a private disposable directory, including
-failed saves and corrupt-file recovery. These tests also cover busy/nested navigation
-and three-column overflow with the fixed 48px notification footer.
+failed saves and corrupt-file recovery. These tests also cover busy requests across
+windows and the Settings window's nested navigation.
 A test-only controlled backend records requests and explicitly releases streaming
 deltas, replies, or failures through the application's normal scoped event path.
 Assertions cover history, committed versus partial replies, busy/composer state,
@@ -30,6 +33,7 @@ gestures, held model-selection keys, modal-safe scoped events and catalog update
 
 ```sh
 cargo test --offline --locked
+cargo test --offline --locked --bin wiesel surface_tests
 cargo test --offline --locked --bin wiesel chat_tests
 cargo test --offline --locked --bin wiesel action_builder_tests
 # Optional suite runner, if Cargo Nextest is installed:
@@ -112,7 +116,7 @@ No login, credential inspection or live inference is needed for the local contro
 
 1. Launch the bundle, open Settings before any login/request, and find Diagnostics
    by scrolling. Check privacy/retention text wraps within the existing layout and
-   the bottom notification bar stays 48px high at the minimum supported width.
+   the title-bar status line stays one line high at the minimum window width.
 2. Click **Open Logs Folder**: Finder opens `~/Library/Logs/Wiesel`. Check Tab focus,
    Enter/Space activation, button labels and VoiceOver descriptions. Check that
    in-progress controls do not enqueue duplicate actions. No shell is involved.

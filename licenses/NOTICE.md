@@ -7,7 +7,7 @@
 - License: Apache License, Version 2.0 (see `GPUI-APACHE-2.0.txt`)
 - Modifications: reusable field API, dark styling, secret masking, horizontal caret scrolling, clipboard restrictions for secrets, Unicode/IME offset fixes, and tests.
 
-`src/theme.rs` embeds Lucide SVG icon paths used by the Paper designs:
+`src/theme.rs` embeds Lucide SVG icon paths used by the Paper designs, and `resources/lucide/icons.tsv` embeds the Lucide icon set and tags (from the `lucide-static` npm package) offered for quick actions:
 
 - Source: https://github.com/lucide-icons/lucide
 - License: ISC / MIT (see `Lucide-LICENSE.txt`)

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/wiesel.png" alt="Wiesel's launcher: a grid of quick actions like Fix spelling, Rewrite, Chat, Summarize and Explain" width="420">
+  <img src="docs/assets/wiesel.png" alt="Wiesel's launcher: a cmd+tab-style row of quick actions like Fix spelling, Rewrite, Chat, Summarize and Explain" width="420">
 </p>
 
 <h1 align="center">Wiesel</h1>
@@ -22,7 +22,7 @@ You're writing an email, a doc or a Slack message, and the sentence just isn't r
 
 - ✍️ **Fix spelling, rewrite, summarize, explain** with one keystroke
 - 💬 **Chat** about anything you selected
-- 🧩 **Your own quick actions**: up to nine pads, each with its own prompt, icon and model
+- 🧩 **Your own quick actions**: a cmd+tab-style launcher with 3, 5 or 8 tiles, each with its own prompt, icon and model
 - 📋 **Paste result back**: let an action replace your selection directly, no extra clicks
 - 🏠 **Runs locally if you want**: use [Ollama](https://ollama.com) on your Mac, or sign in to Wiesel for cloud models
 - 🪶 **Native and lightweight**: no Electron, follows Light/Dark mode, stays out of your way
@@ -78,7 +78,7 @@ Results show up in Wiesel so you can review and **Copy** them. Turn on **Paste r
 
 ### Make your own quick actions
 
-Click the **+** pad (or **File → New Quick Action…**), give it a name and an icon, and write instructions. Two placeholders make it useful:
+Choose **File → New Quick Action…** (or **Settings → Quick actions → Manage…**), give it a name, pick any of the [Lucide icons](https://lucide.dev/icons) (search by name or tag), and write instructions. Two placeholders make it useful:
 
 - `{selection}`: the text you selected
 - `{clipboard}`: whatever's on your clipboard
