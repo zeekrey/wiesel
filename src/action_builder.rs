@@ -15,7 +15,6 @@ pub(super) struct ActionBuilder {
     error: Option<String>,
     // Controls outlive rendered frames so lifecycle focus remains mounted on return.
     focus_handles: std::cell::RefCell<std::collections::HashMap<String, FocusHandle>>,
-    pub home_scroll: ScrollHandle,
     pub manager_scroll: ScrollHandle,
     #[cfg(test)]
     pub persist: Option<ActionPersistence>,
@@ -28,7 +27,6 @@ impl ActionBuilder {
             read_only,
             error: None,
             focus_handles: Default::default(),
-            home_scroll: ScrollHandle::new(),
             manager_scroll: ScrollHandle::new(),
             #[cfg(test)]
             persist: None,
@@ -48,6 +46,12 @@ pub(super) struct Editor {
     pub(super) model: Entity<tier_picker::TierPicker>,
     icon: &'static str,
     icon_open: bool,
+    icon_search: Entity<TextInput>,
+    // Index into icon_options(); moved with the arrow keys or the pointer.
+    icon_highlight: usize,
+    // Last searched query, so caret moves keep the highlight.
+    icon_query: gpui::SharedString,
+    icon_scroll: gpui::UniformListScrollHandle,
     paste_result: bool,
     // The built-in Chat always opens a conversation.
     can_paste: bool,
@@ -58,7 +62,7 @@ pub(super) struct Editor {
     pub scroll: ScrollHandle,
 }
 impl Editor {
-    fn fields(&self, cx: &App) -> CustomActionFields {
+    pub(super) fn fields(&self, cx: &App) -> CustomActionFields {
         // Sharp is the default, so choosing it keeps following the default.
         let selected = &self.model.read(cx).selected;
         CustomActionFields {
@@ -75,6 +79,25 @@ impl Editor {
         let fields = self.fields(cx);
         fields_changed(&self.initial, &fields)
     }
+    fn icon_options(&self, cx: &App) -> Vec<&'static str> {
+        icon_options(&self.icon_search.read(cx).content)
+    }
+}
+/// Icons in the picker grid.
+pub(super) const ICON_COLUMNS: usize = 10;
+/// Picker options: suggested icons first, then every Lucide icon matching the name/tag query.
+pub(super) fn icon_options(query: &str) -> Vec<&'static str> {
+    let needle = query.trim().to_lowercase();
+    let suggested = CUSTOM_ACTION_ICONS
+        .into_iter()
+        .filter(|icon| icon.contains(&needle) || icon.replace('-', " ").contains(&needle));
+    let mut options: Vec<&'static str> = suggested.collect();
+    for icon in crate::lucide::search(query) {
+        if !options.contains(&icon) {
+            options.push(icon);
+        }
+    }
+    options
 }
 fn fields_changed(original: &CustomActionFields, draft: &CustomActionFields) -> bool {
     original.name != draft.name
@@ -88,7 +111,8 @@ fn fields_changed(original: &CustomActionFields, draft: &CustomActionFields) -> 
 pub(super) enum Removal {
     One,
     To(EntryId),
-    Root,
+    /// Closing the Settings window unmounts its whole stack.
+    Close,
 }
 pub(super) enum DialogKind {
     Discard(Removal),
@@ -113,66 +137,65 @@ pub(super) enum Command {
 }
 #[derive(Clone)]
 pub(super) enum HomeAction {
-    Builtin(QuickAction),
     Configured(QuickAction, CustomQuickAction),
     Custom(CustomQuickAction),
 }
 impl HomeAction {
-    /// The persisted action this pad runs; None for Add.
-    pub fn action_id(&self) -> Option<uuid::Uuid> {
+    fn action(&self) -> &CustomQuickAction {
         match self {
-            Self::Builtin(QuickAction::Add) => None,
-            Self::Builtin(action) => Some(action.persistent_id()),
-            Self::Configured(_, action) | Self::Custom(action) => Some(action.id),
+            Self::Configured(_, action) | Self::Custom(action) => action,
         }
     }
-    pub fn presentation(&self) -> (String, String, &'static str, &'static str, bool) {
+    /// The persisted action this tile runs.
+    pub fn action_id(&self) -> uuid::Uuid {
+        self.action().id
+    }
+    /// The action reads the captured selection, so it cannot run without one.
+    pub fn needs_selection(&self) -> bool {
+        let action = self.action();
+        action.instructions.contains("{selection}")
+            || (action.paste_result && action.can_paste_result())
+    }
+    /// (debug/accessibility id, title, icon, built-in shortcut)
+    pub fn presentation(&self) -> (String, String, &'static str, &'static str) {
         match self {
-            Self::Builtin(action) => (
-                action.id().into(),
-                action.title().into(),
-                action.icon(),
-                action.shortcut(),
-                *action == QuickAction::Add,
-            ),
             Self::Configured(builtin, action) => (
                 builtin.id().into(),
                 action.name.clone(),
                 action.icon_name().unwrap_or("wand"),
                 builtin.shortcut(),
-                false,
             ),
             Self::Custom(action) => (
                 format!("custom-{}", action.id),
                 action.name.clone(),
                 action.icon_name().unwrap_or("wand"),
                 "",
-                false,
             ),
         }
     }
 }
 impl Wiesel {
+    /// The launcher's tiles: the first `quick_action_count` configured actions, in order.
+    /// New actions are added from the menu, never from the launcher.
     pub(super) fn home_actions(&self) -> Vec<HomeAction> {
         self.settings
             .actions()
             .into_iter()
+            .take(self.settings.quick_action_count)
             .map(|action| match QuickAction::from_persistent_id(action.id) {
                 Some(builtin) => HomeAction::Configured(builtin, action),
                 None => HomeAction::Custom(action),
             })
-            .chain(std::iter::once(HomeAction::Builtin(QuickAction::Add)))
             .collect()
     }
-    /// Reserve three rows and keep Add in the final column without inventing actions.
-    pub(super) fn home_action_slots(&self) -> Vec<Option<HomeAction>> {
-        let mut actions = self.home_actions();
-        let add = actions.pop();
-        let slot_count = (actions.len() + 1).max(9).div_ceil(3) * 3;
-        let mut slots: Vec<_> = actions.into_iter().map(Some).collect();
-        slots.resize(slot_count - 1, None);
-        slots.push(add);
-        slots
+    /// Selection-based tiles are disabled until text has been captured.
+    pub(super) fn home_action_enabled(&self, action: &HomeAction) -> bool {
+        !action.needs_selection()
+            || self
+                .selection
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
     }
     pub(super) fn run_home_action(
         &mut self,
@@ -180,10 +203,11 @@ impl Wiesel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.home_action_enabled(&action) {
+            return;
+        }
         match action {
-            HomeAction::Builtin(action) | HomeAction::Configured(action, _) => {
-                self.run_quick_action(action, window, cx)
-            }
+            HomeAction::Configured(action, _) => self.run_quick_action(action, window, cx),
             HomeAction::Custom(action) => self.run_custom_action(action, window, cx),
         }
     }
@@ -200,7 +224,7 @@ impl Wiesel {
         let local = model.local();
         if !local && !self.signed_in() {
             self.show_account_tab(cx);
-            self.push_settings(false, window, cx);
+            self.reveal_login(window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
             return;
@@ -262,7 +286,7 @@ impl Wiesel {
             } else {
                 self.selection.writing_source.clear();
             }
-            self.push_screen(Screen::Writing, false, window, cx);
+            self.open_surface(Surface::Writing, None, cx);
             self.result.clear();
             self.writing_title = action.name;
             self.request_with_model(messages, false, model, cx);
@@ -360,18 +384,6 @@ impl Wiesel {
             .find(|(_, handle)| handle.is_focused(window))
             .map(|(id, _)| id.clone());
         match self.current_screen() {
-            Screen::Launcher => {
-                if let Some(id) = focused {
-                    let index = self.home_action_slots().iter().position(|action| {
-                        action
-                            .as_ref()
-                            .is_some_and(|action| action.presentation().0 == id)
-                    });
-                    if let Some(index) = index {
-                        self.actions.home_scroll.scroll_to_item(index / 3);
-                    }
-                }
-            }
             Screen::ActionManager => {
                 if let Some(id) = focused.and_then(|id| {
                     id.strip_prefix("edit-")
@@ -489,6 +501,22 @@ impl Wiesel {
             Command::IconToggle => {
                 if let Some(editor) = &mut self.actions.editor {
                     editor.icon_open = !editor.icon_open;
+                    if editor.icon_open {
+                        // Start from a clear search with the current icon highlighted.
+                        let search = editor.icon_search.clone();
+                        search.update(cx, |input, cx| input.set("", cx));
+                        editor.icon_query = Default::default();
+                        editor.icon_highlight = icon_options("")
+                            .iter()
+                            .position(|icon| *icon == editor.icon)
+                            .unwrap_or(0);
+                        editor.icon_scroll = gpui::UniformListScrollHandle::new();
+                        editor.icon_scroll.scroll_to_item(
+                            editor.icon_highlight / ICON_COLUMNS,
+                            gpui::ScrollStrategy::Nearest,
+                        );
+                        window.focus(&search.focus_handle(cx), cx);
+                    }
                 }
             }
             Command::Icon(icon) => {
@@ -547,6 +575,25 @@ impl Wiesel {
                 .with_tab_stop()
         });
         instructions.update(cx, |input, cx| input.set(initial.instructions.clone(), cx));
+        let icon_search = cx.new(|cx| {
+            TextInput::new("Search icons by name or tag…", false, cx)
+                .with_accessibility_id("wiesel.actions.icon-search")
+                .with_tab_stop()
+        });
+        cx.observe(&icon_search, |this, search, cx| {
+            let query = search.read(cx).content.clone();
+            if let Some(editor) = &mut this.actions.editor
+                && editor.icon_query != query
+            {
+                editor.icon_query = query;
+                editor.icon_highlight = 0;
+                editor
+                    .icon_scroll
+                    .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            }
+            cx.notify();
+        })
+        .detach();
         let selected = initial
             .model_override
             .clone()
@@ -566,7 +613,7 @@ impl Wiesel {
             this.input_notification(notification, cx)
         })
         .detach();
-        for input in [&name, &instructions] {
+        for input in [&name, &instructions, &icon_search] {
             cx.subscribe(input, |this, _, notification: &Notification, cx| {
                 this.input_notification(notification, cx)
             })
@@ -580,6 +627,10 @@ impl Wiesel {
             model,
             icon,
             icon_open: false,
+            icon_search,
+            icon_highlight: 0,
+            icon_query: Default::default(),
+            icon_scroll: gpui::UniformListScrollHandle::new(),
             paste_result: initial.paste_result,
             can_paste: id != Some(QuickAction::Chat.persistent_id()),
             initial,
@@ -588,7 +639,7 @@ impl Wiesel {
             scroll: ScrollHandle::new(),
         });
         self.actions.error = None;
-        self.push_screen(Screen::ActionEditor, false, window, cx);
+        self.push_screen(Screen::ActionEditor, window, cx);
     }
     fn persist_actions(
         &mut self,
@@ -681,7 +732,7 @@ impl Wiesel {
         }
         let removes_editor = match removal {
             Removal::One => self.current_screen() == Screen::ActionEditor,
-            Removal::Root => self.actions.editor.is_some(),
+            Removal::Close => self.actions.editor.is_some(),
             Removal::To(id) => self
                 .navigation
                 .entries()
@@ -777,7 +828,7 @@ impl Wiesel {
                     Removal::To(id) => {
                         self.pop_to_screen(id, window, cx);
                     }
-                    Removal::Root => self.pop_to_root(window, cx),
+                    Removal::Close => self.close_surface(Surface::Settings, cx),
                 }
             }
             DialogKind::Delete(id) => {
@@ -788,15 +839,8 @@ impl Wiesel {
                     Ok(()) => {
                         self.actions.error = None;
                         self.notifications.success("Action deleted.");
-                        let home_id = QuickAction::from_persistent_id(id)
-                            .map_or_else(|| format!("custom-{id}"), |action| action.id().into());
-                        let deleted_home_focus =
-                            self.actions.focus_handles.borrow().get(&home_id).cloned();
-                        if let Some(deleted_home_focus) = deleted_home_focus {
-                            self.redirect_deleted_home_restore_focus(&deleted_home_focus);
-                        }
                         let mut handles = self.actions.focus_handles.borrow_mut();
-                        for key in [format!("edit-{id}"), format!("delete-{id}"), home_id] {
+                        for key in [format!("edit-{id}"), format!("delete-{id}")] {
                             handles.remove(&key);
                         }
                         drop(handles);
@@ -873,7 +917,7 @@ impl Wiesel {
         }
         if matches!(
             self.current_screen(),
-            Screen::ActionEditor | Screen::ActionManager | Screen::Launcher
+            Screen::ActionEditor | Screen::ActionManager
         ) && key.key == "tab"
             && !key.modifiers.platform
             && !key.modifiers.control
@@ -920,8 +964,7 @@ impl Wiesel {
                     .child(div().w_full().min_w_0().flex().flex_col().gap_2().child(Self::label("Name & icon"))
                         .child(div().flex().gap_2().child(self.builder_button("action-icon", "", Command::IconToggle, cx).aria_label("Choose action icon").aria_expanded(editor.icon_open).w(px(36.)).child(theme::icon(editor.icon, 18.)))
                             .child(div().flex_1().min_w_0().debug_selector(|| "action-name".into()).child(editor.name.clone())))
-                        .when(editor.icon_open, |d| d.child(div().id("action-icon-options").w(px(268.)).flex().flex_wrap().gap_2().p_2().rounded_md().bg(rgb(theme::p().card)).border_1().border_color(rgba(theme::p().border))
-                            .children(CUSTOM_ACTION_ICONS.into_iter().map(|icon| self.builder_button(&format!("icon-{icon}"), "", Command::Icon(icon), cx).aria_label(icon).aria_selected(editor.icon == icon).w(px(68.)).h(px(44.)).child(theme::icon(icon, 18.)).when(editor.icon == icon, |d| d.border_color(rgb(theme::p().primary))))))))
+                        .when(editor.icon_open, |d| d.child(self.icon_picker(editor, cx))))
                     .child(div().w_full().flex().flex_col().gap_2().child(Self::label("Model")).child(editor.model.clone())))
                 .child(div().mt_4().flex().flex_col().gap_2().child(Self::label("Instructions · What should this action do?"))
                     .child(div().debug_selector(|| "action-instructions".into()).child(editor.instructions.clone()))
@@ -932,6 +975,163 @@ impl Wiesel {
                 .child(Self::label("⌘ Enter to save · Esc to go back"))
                 .child(div().flex().gap_2().child(self.builder_button("action-cancel", "Cancel", Command::Cancel, cx))
                     .child(self.builder_button("action-save", if editor.existing { "Save changes" } else { "Create action" }, Command::Save, cx).when(self.actions.read_only, |d| d.opacity(0.5).aria_description("Saving disabled until the settings file is repaired and Wiesel relaunched")))))
+    }
+    /// Searchable grid of every Lucide icon; only visible rows are rendered.
+    fn icon_picker(&self, editor: &Editor, cx: &mut Context<Self>) -> Stateful<Div> {
+        const GRID_HEIGHT: f32 = 200.;
+        let palette = theme::p();
+        let options = std::rc::Rc::new(editor.icon_options(cx));
+        let count = options.len();
+        let highlighted = options.get(editor.icon_highlight).copied();
+        let grid = if count == 0 {
+            div()
+                .h(px(GRID_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Self::label("No icons match. Try another name or tag."))
+                .into_any_element()
+        } else {
+            gpui::uniform_list(
+                "action-icon-grid",
+                count.div_ceil(ICON_COLUMNS),
+                cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
+                    rows.map(|row| {
+                        let start = row * ICON_COLUMNS;
+                        let end = (start + ICON_COLUMNS).min(options.len());
+                        // Columns flex to the available width; spacers keep the last row aligned.
+                        div()
+                            .w_full()
+                            .flex()
+                            .gap(px(4.))
+                            .pb(px(4.))
+                            .children(options[start..end].iter().enumerate().map(
+                                |(column, icon)| {
+                                    this.icon_option(icon, start + column, cx)
+                                        .into_any_element()
+                                },
+                            ))
+                            .children(
+                                (end - start..ICON_COLUMNS)
+                                    .map(|_| div().flex_1().min_w_0().into_any_element()),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(&editor.icon_scroll)
+            .h(px(GRID_HEIGHT))
+            .into_any_element()
+        };
+        div()
+            .id("action-icon-options")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(palette.card))
+            .border_1()
+            .border_color(rgba(palette.border))
+            .child(
+                div()
+                    .debug_selector(|| "icon-search".into())
+                    .capture_key_down(cx.listener(Self::icon_picker_key))
+                    .child(editor.icon_search.clone()),
+            )
+            .child(grid)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        Self::label(highlighted.unwrap_or(""))
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .overflow_hidden(),
+                    )
+                    .child(
+                        Self::label(&format!("{count} icons · ↑↓ Enter"))
+                            .flex_shrink_0()
+                            .whitespace_nowrap(),
+                    ),
+            )
+    }
+    fn icon_option(
+        &self,
+        icon: &'static str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let (selected, highlighted) = self
+            .actions
+            .editor
+            .as_ref()
+            .map_or((false, false), |editor| {
+                (editor.icon == icon, editor.icon_highlight == index)
+            });
+        theme::key(
+            self.builder_button_base(&format!("icon-{icon}"), icon, Command::Icon(icon), cx),
+            theme::Key::Grey,
+        )
+        .aria_selected(selected)
+        .flex_1()
+        .min_w_0()
+        .h(px(34.))
+        .child(theme::icon(icon, 18.))
+        .when(selected, |d| d.border_color(rgb(theme::p().primary)))
+        .when(highlighted, |d| {
+            d.border_2().border_color(rgb(theme::p().ring))
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if let Some(editor) = &mut this.actions.editor
+                && *hovered
+                && editor.icon_highlight != index
+            {
+                editor.icon_highlight = index;
+                cx.notify();
+            }
+        }))
+    }
+    /// Arrow keys move through the grid while typing stays in the search field.
+    fn icon_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if key.modifiers.platform || key.modifiers.control || key.modifiers.alt {
+            return;
+        }
+        let Some(editor) = &mut self.actions.editor else {
+            return;
+        };
+        let options = editor.icon_options(cx);
+        let last = options.len().saturating_sub(1);
+        match key.key.as_str() {
+            "down" => editor.icon_highlight = (editor.icon_highlight + ICON_COLUMNS).min(last),
+            "up" => editor.icon_highlight = editor.icon_highlight.saturating_sub(ICON_COLUMNS),
+            "enter" => {
+                cx.stop_propagation();
+                if !event.is_held
+                    && let Some(icon) = options.get(editor.icon_highlight).copied()
+                {
+                    self.builder_command(Command::Icon(icon), window, cx);
+                }
+                return;
+            }
+            _ => return,
+        }
+        editor.icon_scroll.scroll_to_item(
+            editor.icon_highlight / ICON_COLUMNS,
+            gpui::ScrollStrategy::Nearest,
+        );
+        cx.stop_propagation();
+        cx.notify();
     }
     /// Switch between showing the result in Wiesel and pasting it over the selection.
     fn paste_toggle(&self, on: bool, cx: &mut Context<Self>) -> Div {
@@ -947,17 +1147,29 @@ impl Wiesel {
         } else {
             gpui::Toggled::False
         })
-        .w(px(38.))
-        .h(px(22.))
-        .p(px(3.))
+        .w(px(36.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
         .flex()
         .items_center()
-        .when(on, |d| d.justify_end())
-        .child(div().size(px(14.)).rounded(px(3.)).bg(rgb(if on {
-            theme::LOGO_RED
-        } else {
-            palette.muted
-        })));
+        .when(on, |d| {
+            d.justify_end()
+                .bg(rgb(palette.primary))
+                .border_color(rgb(palette.primary))
+        })
+        .when(!on, |d| d.justify_start().bg(rgb(palette.accent)))
+        .child(
+            div()
+                .size(px(14.))
+                .rounded_full()
+                .bg(rgb(if on {
+                    palette.primary_foreground
+                } else {
+                    0xffffff
+                }))
+                .shadow(vec![theme::shadow(0., 1., 2., 0., 0x00000033)]),
+        );
         div().mt_4().flex().items_start().gap_3()
             .child(switch)
             .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
