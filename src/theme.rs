@@ -47,8 +47,10 @@ pub struct Palette {
     pub tile_face: (u32, u32),
     pub tile_rim: u32,
     pub tile_ink: u32,
-    /// 0xRRGGBBAA soft highlight behind the selected tile.
+    /// 0xRRGGBBAA soft hover fill for small launcher controls.
     pub tile_selected: u32,
+    /// 0xRRGGBBAA halo around the selected icon tile.
+    pub tile_halo: u32,
     pub tile_label: u32,
     pub tile_label_selected: u32,
     pub tile_number: u32,
@@ -89,6 +91,7 @@ pub const LIGHT: Palette = Palette {
     tile_rim: 0x00000017,
     tile_ink: 0x171717,
     tile_selected: 0x00000012,
+    tile_halo: 0x00000024,
     tile_label: 0x424242,
     tile_label_selected: 0x0a0a0a,
     tile_number: 0x8a8a8a,
@@ -127,6 +130,7 @@ pub const DARK: Palette = Palette {
     tile_rim: 0xffffff10,
     tile_ink: 0xfafafa,
     tile_selected: 0xffffff21,
+    tile_halo: 0xffffff38,
     tile_label: 0xb8b8b8,
     tile_label_selected: 0xfafafa,
     tile_number: 0x7a7a7a,
@@ -265,9 +269,10 @@ pub fn key<E: Styled + StatefulInteractiveElement>(element: E, kind: Key) -> E {
 }
 
 /// The launcher's icon square: a softly lit rounded tile, like an app icon in cmd+tab.
-pub fn tile<E: Styled + StatefulInteractiveElement>(element: E) -> E {
+/// Selection is a halo hugging the tile; its spread follows the tile's corners.
+pub fn tile<E: Styled + StatefulInteractiveElement>(element: E, selected: bool) -> E {
     let palette = p();
-    let rest = vec![
+    let mut rest = vec![
         inset(
             0.,
             1.,
@@ -291,6 +296,9 @@ pub fn tile<E: Styled + StatefulInteractiveElement>(element: E) -> E {
             if palette.dark { 0x00000040 } else { 0x0000000f },
         ),
     ];
+    if selected {
+        rest.insert(0, shadow(0., 0., 0., 3., palette.tile_halo));
+    }
     let ring = focus_ring(rest.clone());
     element
         .relative()

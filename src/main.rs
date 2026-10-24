@@ -3021,7 +3021,7 @@ impl Wiesel {
         };
         // Every tile is printed with its position; 1–9 double as keyboard shortcuts.
         let number = (slot < 9).then(|| (slot + 1).to_string());
-        let square = theme::tile(div().id(("home-tile", slot)))
+        let square = theme::tile(div().id(("home-tile", slot)), selected)
             .size(px(HUD_TILE))
             .flex()
             .flex_col()
@@ -3060,14 +3060,8 @@ impl Wiesel {
             .items_center()
             .justify_center()
             .gap(px(8.))
-            .rounded(px(20.))
-            // The one highlight for hover and keyboard selection covers the whole slot.
+            // Hover and keyboard selection light the icon tile and label, not the slot.
             // Hover never selects a disabled tile; the keyboard may, and sees it muted.
-            .when(selected, |d| {
-                d.bg(rgba(palette.tile_selected)).shadow(vec![
-                    theme::shadow(0., 0., 0., 1., palette.tile_rim).inset(),
-                ])
-            })
             .when(enabled, |d| d.cursor_pointer().active(|s| s.opacity(0.8)))
             .when((pasting && !loading) || !enabled, |d| d.opacity(0.4))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
