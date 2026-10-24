@@ -103,6 +103,8 @@ Launcher HUD:
 1. `1`–`9` run the tile printed with that number.
 2. ←/→ and Tab/⇧Tab move the highlight (wrapping); Enter or Space runs it. Hovering a
    tile highlights it too.
+   Tiles whose instructions use `{selection}` (and paste-back tiles) are muted and do
+   nothing until text has been captured.
 3. Escape dismisses the HUD. With no other window open it hides Wiesel instead, so
    focus returns to the previous app.
 

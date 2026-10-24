@@ -45,7 +45,6 @@ pub struct Palette {
     pub hud_tint: u32,
     /// Icon tile faces (top, bottom), 0xRRGGBBAA rim and printed glyph.
     pub tile_face: (u32, u32),
-    pub tile_hover: (u32, u32),
     pub tile_rim: u32,
     pub tile_ink: u32,
     /// 0xRRGGBBAA soft highlight behind the selected tile.
@@ -87,7 +86,6 @@ pub const LIGHT: Palette = Palette {
     bubble_meta: 0x737373,
     hud_tint: 0xf6f6f8e6,
     tile_face: (0xffffff, 0xf2f2f2),
-    tile_hover: (0xffffff, 0xf8f8f8),
     tile_rim: 0x00000017,
     tile_ink: 0x171717,
     tile_selected: 0x00000012,
@@ -126,7 +124,6 @@ pub const DARK: Palette = Palette {
     bubble_meta: 0xa1a1a1,
     hud_tint: 0x1e1e20eb,
     tile_face: (0x383838, 0x1f1f1f),
-    tile_hover: (0x424242, 0x262626),
     tile_rim: 0xffffff10,
     tile_ink: 0xfafafa,
     tile_selected: 0xffffff21,
@@ -270,7 +267,6 @@ pub fn key<E: Styled + StatefulInteractiveElement>(element: E, kind: Key) -> E {
 /// The launcher's icon square: a softly lit rounded tile, like an app icon in cmd+tab.
 pub fn tile<E: Styled + StatefulInteractiveElement>(element: E) -> E {
     let palette = p();
-    let (hover_top, hover_bottom) = palette.tile_hover;
     let rest = vec![
         inset(
             0.,
@@ -301,9 +297,7 @@ pub fn tile<E: Styled + StatefulInteractiveElement>(element: E) -> E {
         .rounded(px(18.))
         .bg(vertical(palette.tile_face.0, palette.tile_face.1, 1.))
         .shadow(rest)
-        .cursor_pointer()
-        .hover(move |s| s.bg(vertical(hover_top, hover_bottom, 1.)))
-        .active(move |s| s.opacity(0.8))
+        // Hover and press feedback belong to the whole launcher slot, not the square.
         .focus_visible(move |s| s.shadow(ring))
 }
 
@@ -401,7 +395,9 @@ const ICONS: &[(&str, &str)] = &[
         r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>"#,
     ),
     ("arrow-up", r#"<path d="m5 12 7-7 7 7M12 19V5"/>"#),
-    ("loader", r#"<path d="M21 12a9 9 0 1 1-6.219-8.56"/>"#),
+    // A quiet ring with a short arc riding on it: the launcher's single progress spinner.
+    ("spinner-track", r#"<circle cx="12" cy="12" r="9"/>"#),
+    ("spinner-arc", r#"<path d="M12 3a9 9 0 0 1 9 9"/>"#),
     (
         "copy",
         r#"<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/>"#,

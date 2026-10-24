@@ -98,8 +98,6 @@ pub struct Notifications {
     activity: Vec<(Source, Notification)>,
     feedback: Option<(Notification, Instant)>,
     visible: Option<Notification>,
-    /// The visible message reports pending work: show a spinner instead of a dot.
-    working: bool,
     revision: usize,
     animate: bool,
     pub suppress_motion: bool,
@@ -181,7 +179,6 @@ impl Notifications {
                 .find(|(_, n)| n.severity == Severity::Error)
                 .map(|(_, n)| n)
         });
-        self.working = feedback_or_error.is_none() && !self.activity.is_empty();
         let next = feedback_or_error
             .or_else(|| self.activity.last().map(|(_, n)| n))
             .or_else(|| {
@@ -200,8 +197,8 @@ impl Notifications {
         self.animate = !self.suppress_motion;
         true
     }
-    /// One status line: a severity dot (a spinner while work is pending), the headline,
-    /// and muted detail after a ` · `, e.g. "Ready · 369 characters selected".
+    /// One status line: a severity dot, the headline,
+    /// and muted detail after a ` · `.
     pub fn render(&self) -> Div {
         let bar = div()
             .h(px(STATUS_BAR_HEIGHT))
@@ -252,31 +249,20 @@ impl Notifications {
                         .child(detail),
                 )
             });
-        let indicator = if self.working {
-            theme::icon("loader", 11.)
-                .text_color(rgb(theme::p().status_label))
-                .with_animation(
-                    "status-spinner",
-                    Animation::new(Duration::from_millis(900)).repeat(),
-                    |icon, delta| {
-                        icon.with_transformation(Transformation::rotate(percentage(delta)))
-                    },
+        // Pending work spins only on the element doing it (e.g. the quick action tile),
+        // so the status line keeps a calm dot instead of a second spinner.
+        let indicator = theme::led(severity.led_color()).map(|dot| {
+            if animate {
+                dot.with_animation(
+                    ("status-dot", self.revision),
+                    Animation::new(duration).with_easing(ease_out_quint()),
+                    |dot, progress| dot.opacity(0.55 + 0.45 * progress),
                 )
                 .into_any_element()
-        } else {
-            theme::led(severity.led_color()).map(|dot| {
-                if animate {
-                    dot.with_animation(
-                        ("status-dot", self.revision),
-                        Animation::new(duration).with_easing(ease_out_quint()),
-                        |dot, progress| dot.opacity(0.55 + 0.45 * progress),
-                    )
-                    .into_any_element()
-                } else {
-                    dot.into_any_element()
-                }
-            })
-        };
+            } else {
+                dot.into_any_element()
+            }
+        });
         bar.child(
             div()
                 .size(px(11.))

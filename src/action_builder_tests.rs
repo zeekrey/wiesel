@@ -2029,3 +2029,41 @@ fn icon_picker_searches_every_lucide_icon_by_name_and_tag(cx: &mut TestAppContex
     });
     assert_eq!(backend.request_count(), 0);
 }
+
+#[gpui::test]
+fn selection_actions_are_disabled_until_text_is_captured(cx: &mut TestAppContext) {
+    let (app, backend, cx) = setup(cx);
+    let custom = action("Needs text", None);
+    let id = custom.id;
+    seed(&app, cx, custom);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.selection.text = Some("  ".into());
+            cx.notify();
+        })
+    });
+    cx.read_entity(&app, |app, _| {
+        let actions = app.home_actions();
+        let tile = actions.iter().find(|a| a.action_id() == id).unwrap();
+        assert!(tile.needs_selection());
+        assert!(!app.home_action_enabled(tile));
+        // Chat never reads the selection and stays available.
+        let chat = actions
+            .iter()
+            .find(|a| a.action_id() == QuickAction::Chat.persistent_id())
+            .unwrap();
+        assert!(app.home_action_enabled(chat));
+    });
+    // Neither the pointer nor the printed number runs a disabled tile.
+    run_tile(&app, cx, &format!("custom-{id}"));
+    hud_keys(&app, cx, "6");
+    assert_eq!(backend.request_count(), 0);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.selection.text = Some("Selected".into());
+            cx.notify();
+        })
+    });
+    run_tile(&app, cx, &format!("custom-{id}"));
+    assert_eq!(backend.request_count(), 1);
+}

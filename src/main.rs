@@ -1584,11 +1584,6 @@ impl Wiesel {
     fn idle_notification(&self) -> Notification {
         if !self.can_request() {
             Notification::new(Severity::Warning, "Log in to Wiesel in Settings (⌘⇧L).")
-        } else if let Some(text) = &self.selection.text {
-            Notification::new(
-                Severity::Success,
-                format!("Ready · {} characters selected", text.chars().count()),
-            )
         } else {
             Notification::new(Severity::Success, "Ready")
         }
@@ -1732,10 +1727,7 @@ impl Wiesel {
         );
         self.notifications.clear(Source::Selection);
         match &result {
-            Ok(text) => self.notifications.success(format!(
-                "Captured {} characters. Ready for writing.",
-                text.chars().count()
-            )),
+            Ok(_) => self.notifications.success("Text captured"),
             Err(e) => {
                 let (severity, message) = notifications::capture_issue(e);
                 self.notifications
@@ -2991,22 +2983,40 @@ impl Wiesel {
             && self
                 .direct_paste
                 .is_some_and(|paste| item.action_id() == paste.action);
+        let enabled = self.home_action_enabled(&item);
         let debug_id = id.clone();
+        let ink = palette.tile_ink;
         let glyph = if loading {
-            theme::icon("loader", 30.)
+            // A faint full ring with a short arc circling it, at the glyph's optical size.
+            // Constant motion stays linear; a brisk turn makes the wait feel shorter.
+            div()
                 .debug_selector(move || format!("home-spinner-{slot}"))
-                .text_color(rgb(palette.tile_ink))
-                .with_animation(
-                    "home-spinner",
-                    Animation::new(Duration::from_millis(900)).repeat(),
-                    |icon, delta| {
-                        icon.with_transformation(Transformation::rotate(percentage(delta)))
-                    },
+                .relative()
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    theme::icon("spinner-track", 24.)
+                        .absolute()
+                        .text_color(rgba((ink << 8) | 0x29)),
+                )
+                .child(
+                    theme::icon("spinner-arc", 24.)
+                        .absolute()
+                        .text_color(rgb(ink))
+                        .with_animation(
+                            "home-spinner",
+                            Animation::new(Duration::from_millis(700)).repeat(),
+                            |icon, delta| {
+                                icon.with_transformation(Transformation::rotate(percentage(delta)))
+                            },
+                        ),
                 )
                 .into_any_element()
         } else {
             theme::icon(icon, 30.)
-                .text_color(rgb(palette.tile_ink))
+                .text_color(rgb(ink))
                 .into_any_element()
         };
         // Every tile is printed with its position; 1–9 double as keyboard shortcuts.
@@ -3039,6 +3049,9 @@ impl Wiesel {
             .when(loading, |d| {
                 d.aria_description("Working; the result will be pasted back")
             })
+            .when(!enabled, |d| {
+                d.aria_description("Select text in another app to use this action")
+            })
             .w(px(HUD_SLOT_WIDTH))
             .h(px(HUD_SLOT_HEIGHT))
             .flex_shrink_0()
@@ -3048,19 +3061,25 @@ impl Wiesel {
             .justify_center()
             .gap(px(8.))
             .rounded(px(20.))
+            // The one highlight for hover and keyboard selection covers the whole slot.
+            // Hover never selects a disabled tile; the keyboard may, and sees it muted.
             .when(selected, |d| {
                 d.bg(rgba(palette.tile_selected)).shadow(vec![
                     theme::shadow(0., 0., 0., 1., palette.tile_rim).inset(),
                 ])
             })
-            .when(pasting && !loading, |d| d.opacity(0.4))
+            .when(enabled, |d| d.cursor_pointer().active(|s| s.opacity(0.8)))
+            .when((pasting && !loading) || !enabled, |d| d.opacity(0.4))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered && this.hud_selected != slot {
+                if *hovered && enabled && this.hud_selected != slot {
                     this.hud_selected = slot;
                     cx.notify();
                 }
             }))
             .on_click(cx.listener(move |this, _, window, cx| {
+                if !enabled {
+                    return;
+                }
                 this.hud_selected = slot;
                 this.run_home_action(item.clone(), window, cx);
             }))
@@ -3070,11 +3089,7 @@ impl Wiesel {
                     .max_w(px(HUD_SLOT_WIDTH - 8.))
                     .text_size(px(12.))
                     .line_height(px(16.))
-                    .font_weight(if selected {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(if selected {
                         palette.tile_label_selected
                     } else {

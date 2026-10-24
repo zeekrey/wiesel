@@ -141,11 +141,20 @@ pub(super) enum HomeAction {
     Custom(CustomQuickAction),
 }
 impl HomeAction {
+    fn action(&self) -> &CustomQuickAction {
+        match self {
+            Self::Configured(_, action) | Self::Custom(action) => action,
+        }
+    }
     /// The persisted action this tile runs.
     pub fn action_id(&self) -> uuid::Uuid {
-        match self {
-            Self::Configured(_, action) | Self::Custom(action) => action.id,
-        }
+        self.action().id
+    }
+    /// The action reads the captured selection, so it cannot run without one.
+    pub fn needs_selection(&self) -> bool {
+        let action = self.action();
+        action.instructions.contains("{selection}")
+            || (action.paste_result && action.can_paste_result())
     }
     /// (debug/accessibility id, title, icon, built-in shortcut)
     pub fn presentation(&self) -> (String, String, &'static str, &'static str) {
@@ -179,12 +188,24 @@ impl Wiesel {
             })
             .collect()
     }
+    /// Selection-based tiles are disabled until text has been captured.
+    pub(super) fn home_action_enabled(&self, action: &HomeAction) -> bool {
+        !action.needs_selection()
+            || self
+                .selection
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+    }
     pub(super) fn run_home_action(
         &mut self,
         action: HomeAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.home_action_enabled(&action) {
+            return;
+        }
         match action {
             HomeAction::Configured(action, _) => self.run_quick_action(action, window, cx),
             HomeAction::Custom(action) => self.run_custom_action(action, window, cx),
