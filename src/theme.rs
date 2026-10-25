@@ -1,5 +1,5 @@
-//! Tokens from Paper's "Wiesel MPC · Clean A (light)" and "Clean B (dark)" artboards:
-//! a quiet chassis, a slim header with the wordmark and a status LED, and backlit rubber pads.
+//! Tokens from Paper's "Wiesel · Switcher (dark/light)" artboards and the shadcn/ui
+//! neutral theme: a cmd+tab-style glass HUD of icon tiles, and quiet neutral windows.
 //! The palette follows the Appearance setting (Auto tracks macOS); `set_appearance` is called
 //! before every frame.
 use crate::settings::Appearance;
@@ -12,30 +12,22 @@ use std::{
 /// Every themed color, as 0xRRGGBB (or 0xRRGGBBAA where noted).
 pub struct Palette {
     pub dark: bool,
-    // Chassis and header.
-    pub chassis_hi: u32,
-    pub chassis: u32,
-    pub header: u32,
-    pub header_hi: u32,
-    pub header_edge: u32,
-    pub status_label: u32,
-    // Rubber pads.
-    pub empty_pad: u32,
-    pub empty_pad_hi: u32,
-    pub empty_pad_edge: u32,
-    pub pad_number: u32,
-    pub pad_title: u32,
-    pub add_icon: u32,
-    // Content surfaces.
+    // Windows and content surfaces (shadcn/ui neutral).
+    pub background: u32,
     pub foreground: u32,
     pub muted: u32,
-    pub paper: u32,
-    pub paper_border: u32,
     pub card: u32,
     pub field: u32,
+    /// Hover/selected fill for ghost controls.
     pub accent: u32,
+    /// Solid primary button fill and its label.
     pub primary: u32,
+    pub primary_foreground: u32,
+    pub destructive: u32,
     pub ring: u32,
+    pub paper: u32,
+    pub paper_border: u32,
+    pub status_label: u32,
     /// 0xRRGGBBAA hairlines.
     pub border: u32,
     /// 0xRRGGBBAA field outlines.
@@ -48,72 +40,115 @@ pub struct Palette {
     pub bubble_edge: u32,
     pub bubble_text: u32,
     pub bubble_meta: u32,
+    // The launcher HUD. Tints sit on top of the window's native blur.
+    /// 0xRRGGBBAA glass tint.
+    pub hud_tint: u32,
+    /// Icon tiles are double-bezeled: an outer shell (top, bottom) around a recessed well.
+    /// Rims are 0xRRGGBBAA hairlines; selection only brightens the shell a shade.
+    pub tile_shell: (u32, u32),
+    pub tile_shell_selected: (u32, u32),
+    pub tile_shell_rim: u32,
+    pub tile_well: (u32, u32),
+    pub tile_well_rim: u32,
+    /// Printed glyph, and its quieter resting tone.
+    pub tile_ink: u32,
+    pub tile_ink_rest: u32,
+    /// 0xRRGGBBAA soft hover fill for small launcher controls.
+    pub tile_selected: u32,
+    pub tile_label: u32,
+    pub tile_label_selected: u32,
+    pub tile_number: u32,
+    /// 0xRRGGBBAA status strip fill and top hairline.
+    pub status_fill: u32,
+    pub status_edge: u32,
+    pub status_detail: u32,
+    /// 0xRRGGBBAA keycap fill.
+    pub kbd: u32,
+    pub kbd_text: u32,
 }
 
 pub const LIGHT: Palette = Palette {
     dark: false,
-    chassis_hi: 0xf1efe9,
-    chassis: 0xe5e2da,
-    header: 0xf6f4ef,
-    header_hi: 0xf0eee8,
-    header_edge: 0xd3cfc5,
-    status_label: 0x6f6d68,
-    empty_pad: 0xdcd9d1,
-    empty_pad_hi: 0xe0ddd5,
-    empty_pad_edge: 0xc9c5bc,
-    pad_number: 0x9a978f,
-    pad_title: 0x26262a,
-    add_icon: 0x5a9fd6,
-    foreground: 0x1e2228,
-    muted: 0x5e5a52,
-    paper: 0xf6f3ec,
-    paper_border: 0xcdc7ba,
-    card: 0xfbf9f4,
-    field: 0xfffdf8,
-    accent: 0xe9e4d8,
-    primary: 0x1f5d8f,
-    ring: 0x2f8cc4,
-    border: 0x11100f26,
-    input_border: 0x11100f40,
-    edge_highlight: 0xffffffb3,
-    bubble_hi: 0x2a3340,
-    bubble: 0x1f262f,
-    bubble_edge: 0x38424f,
-    bubble_text: 0xeef1f5,
-    bubble_meta: 0x9fb0bf,
+    background: 0xffffff,
+    foreground: 0x0a0a0a,
+    muted: 0x737373,
+    card: 0xffffff,
+    field: 0xffffff,
+    accent: 0xf5f5f5,
+    primary: 0x171717,
+    primary_foreground: 0xfafafa,
+    destructive: 0xdc2626,
+    ring: 0xa3a3a3,
+    paper: 0xffffff,
+    paper_border: 0xe5e5e5,
+    status_label: 0x171717,
+    border: 0x0000001a,
+    input_border: 0x00000024,
+    edge_highlight: 0xffffffcc,
+    bubble_hi: 0xf5f5f5,
+    bubble: 0xf0f0f0,
+    bubble_edge: 0xe5e5e5,
+    bubble_text: 0x0a0a0a,
+    bubble_meta: 0x737373,
+    hud_tint: 0xf6f6f8e6,
+    tile_shell: (0xffffff, 0xf3f3f5),
+    tile_shell_selected: (0xffffff, 0xf7f7f9),
+    tile_shell_rim: 0x00000014,
+    tile_well: (0xeeeef0, 0xf5f5f7),
+    tile_well_rim: 0x0000000f,
+    tile_ink: 0x171717,
+    tile_ink_rest: 0x3d3d3d,
+    tile_selected: 0x00000012,
+    tile_label: 0x424242,
+    tile_label_selected: 0x0a0a0a,
+    tile_number: 0x8a8a8a,
+    status_fill: 0x00000009,
+    status_edge: 0x0000000f,
+    status_detail: 0x636363,
+    kbd: 0xffffffcc,
+    kbd_text: 0x404040,
 };
 
 pub const DARK: Palette = Palette {
     dark: true,
-    chassis_hi: 0x1d1e22,
-    chassis: 0x141518,
-    header: 0x0b0c0e,
-    header_hi: 0x111215,
-    header_edge: 0x232429,
-    status_label: 0xa3a5aa,
-    empty_pad: 0x2a2b30,
-    empty_pad_hi: 0x2e2f34,
-    empty_pad_edge: 0x3a3b41,
-    pad_number: 0x7c7e84,
-    pad_title: 0xe7e7ea,
-    add_icon: 0x63a9e0,
-    foreground: 0xe6e7ea,
-    muted: 0x9a9ca2,
-    paper: 0x1c1d21,
-    paper_border: 0x2f3036,
-    card: 0x24252a,
-    field: 0x16171a,
-    accent: 0x303137,
-    primary: 0x63a9e0,
-    ring: 0x5babdb,
-    border: 0xffffff1f,
-    input_border: 0xffffff2e,
-    edge_highlight: 0xffffff12,
-    bubble_hi: 0x2f3742,
-    bubble: 0x262d36,
-    bubble_edge: 0x3b4552,
-    bubble_text: 0xeef1f5,
-    bubble_meta: 0x9fb0bf,
+    background: 0x0a0a0a,
+    foreground: 0xfafafa,
+    muted: 0xa1a1a1,
+    card: 0x171717,
+    field: 0x141414,
+    accent: 0x262626,
+    primary: 0xe5e5e5,
+    primary_foreground: 0x171717,
+    destructive: 0xf87171,
+    ring: 0x737373,
+    paper: 0x171717,
+    paper_border: 0x2a2a2a,
+    status_label: 0xd9d9d9,
+    border: 0xffffff1a,
+    input_border: 0xffffff26,
+    edge_highlight: 0xffffff0f,
+    bubble_hi: 0x2a2a2a,
+    bubble: 0x262626,
+    bubble_edge: 0x333333,
+    bubble_text: 0xfafafa,
+    bubble_meta: 0xa1a1a1,
+    hud_tint: 0x1e1e20eb,
+    tile_shell: (0x2c2c2e, 0x232325),
+    tile_shell_selected: (0x313134, 0x28282a),
+    tile_shell_rim: 0xffffff0f,
+    tile_well: (0x121213, 0x18181a),
+    tile_well_rim: 0xffffff0a,
+    tile_ink: 0xfafafa,
+    tile_ink_rest: 0xcfcfcf,
+    tile_selected: 0xffffff21,
+    tile_label: 0xb8b8b8,
+    tile_label_selected: 0xfafafa,
+    tile_number: 0x7a7a7a,
+    status_fill: 0x0000002e,
+    status_edge: 0xffffff12,
+    status_detail: 0x8f8f8f,
+    kbd: 0xffffff12,
+    kbd_text: 0xc7c7c7,
 };
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);
@@ -141,21 +176,16 @@ pub fn p() -> &'static Palette {
     }
 }
 
-// Appearance-independent brand and pad colors.
-pub const LOGO_RED: u32 = 0xc8301c;
-pub const LED_GREEN: u32 = 0x4ea865;
-pub const LED_AMBER: u32 = 0xe8a33a;
-pub const LED_RED: u32 = 0xe5402a;
-pub const PAD_FACE: u32 = 0xa4a6aa;
-pub const PAD_FACE_HI: u32 = 0xbabcbf;
-pub const PAD_GLOW: u32 = 0x6aa8dc;
-pub const PAD_FOCUS: u32 = 0xe6dc6a;
-pub const PAD_INK: u32 = 0x45484d;
+// Appearance-independent status colors (macOS system green/orange/red, accent blue).
+pub const LED_GREEN: u32 = 0x34c759;
+pub const LED_AMBER: u32 = 0xff9f0a;
+pub const LED_RED: u32 = 0xff453a;
+pub const LED_BLUE: u32 = 0x0a84ff;
 
-pub const SANS: &str = "Inter";
-/// Pad-printed hardware lettering (wordmark, key caps, labels). The bundled Inter is a
-/// variable font whose weights GPUI cannot select, and Helvetica Neue ships with every Mac.
-pub const PRINT: &str = "Helvetica Neue";
+/// The macOS UI font (SF Pro), so every weight renders natively.
+pub const SANS: &str = ".SystemUIFont";
+/// Keycaps and pad numbers.
+pub const MONO: &str = "DM Mono";
 
 /// CSS-ordered shadow helper: `x y blur spread color`, colors as 0xRRGGBBAA.
 pub fn shadow(x: f32, y: f32, blur: f32, spread: f32, color: u32) -> BoxShadow {
@@ -173,52 +203,58 @@ pub fn vertical(top: u32, bottom: u32, split: f32) -> Background {
         linear_color_stop(rgb(bottom), split),
     )
 }
+/// Focus ring shared by every control: 3px of the ring color at half strength.
+fn focus_ring(base: Vec<BoxShadow>) -> Vec<BoxShadow> {
+    let mut ring = base;
+    ring.insert(0, shadow(0., 0., 0., 3., (p().ring << 8) | 0x80));
+    ring
+}
 
-/// Physical key colorways.
+/// shadcn/ui button variants.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    /// Neutral key; light grey rubber in light mode, dark rubber in dark mode.
+    /// Outline button: the default.
     Grey,
-    /// Lit blue key: the primary action.
+    /// Solid primary button.
     Blue,
-    /// Red key: destructive confirmation.
+    /// Destructive confirmation.
     Red,
 }
 impl Key {
-    // (face top, face bottom, hover top, hover bottom, border, skirt, label)
-    fn colors(self) -> (u32, u32, u32, u32, u32, u32, u32) {
+    /// (fill, hover fill, border 0xRRGGBBAA, label)
+    fn colors(self) -> (u32, u32, u32, u32) {
+        let palette = p();
         match self {
-            Self::Grey if p().dark => (
-                0x3a3c41, 0x2c2d32, 0x45474d, 0x34363b, 0x0a0a0c, 0x050506, 0xd6dade,
-            ),
             Self::Grey => (
-                0xe2e4e4, 0xc9cdcd, 0xe8eaea, 0xd2d6d6, 0x9a9fa3, 0x868b8f, 0x1e2228,
+                palette.background,
+                palette.accent,
+                palette.input_border,
+                palette.foreground,
             ),
             Self::Blue => (
-                0x7ccdfb, 0x56bdf9, 0x8ad3fb, 0x66c4f9, 0x2f8cc4, 0x2474a6, 0x0b2233,
+                palette.primary,
+                if palette.dark { 0xd4d4d4 } else { 0x2e2e2e },
+                (palette.primary << 8) | 0xff,
+                palette.primary_foreground,
             ),
             Self::Red => (
-                0xd2442e, 0xb8321f, 0xd9503a, 0xc23a27, 0x8e2616, 0x6f1d11, 0xfff0ec,
+                palette.destructive,
+                if palette.dark { 0xef6060 } else { 0xc81e1e },
+                (palette.destructive << 8) | 0xff,
+                0xffffff,
             ),
         }
     }
     pub fn label(self) -> u32 {
-        self.colors().6
+        self.colors().3
     }
 }
 
-/// Styles any stateful element as a raised key that bottoms out when pressed.
+/// Styles any stateful element as a shadcn/ui button.
 pub fn key<E: Styled + StatefulInteractiveElement>(element: E, kind: Key) -> E {
-    let (top, bottom, hover_top, hover_bottom, border, skirt, label) = kind.colors();
-    let rest = move || {
-        vec![
-            shadow(0., 2., 0., 0., (skirt << 8) | 0xff),
-            shadow(0., 3., 4., 0., 0x00000040),
-            inset(0., 1., 0., 0., 0xffffff40),
-            inset(0., -1., 0., 0., 0x00000026),
-        ]
-    };
-    let ring_color = p().ring;
+    let (fill, hover, border, label) = kind.colors();
+    let rest = vec![shadow(0., 1., 2., 0., 0x0000000d)];
+    let ring = focus_ring(rest.clone());
     element
         .relative()
         .flex_shrink_0()
@@ -226,130 +262,139 @@ pub fn key<E: Styled + StatefulInteractiveElement>(element: E, kind: Key) -> E {
         .items_center()
         .justify_center()
         .gap(px(6.))
-        .rounded(px(4.))
+        .rounded(px(6.))
         .border_1()
-        .border_color(rgb(border))
-        .bg(vertical(top, bottom, 1.))
-        .shadow(rest())
+        .border_color(rgba(border))
+        .bg(rgb(fill))
+        .shadow(rest)
         .text_color(rgb(label))
-        .font_family(PRINT)
-        .font_weight(FontWeight::BOLD)
-        .text_size(px(9.))
+        .font_family(SANS)
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(px(12.5))
+        .whitespace_nowrap()
         .cursor_pointer()
-        .hover(move |s| s.bg(vertical(hover_top, hover_bottom, 1.)))
-        .active(move |s| {
-            s.top(px(2.)).shadow(vec![
-                shadow(0., 0., 1., 0., 0x00000059),
-                inset(0., 2., 3., 0., 0x00000040),
-            ])
-        })
-        .focus_visible(move |s| {
-            let mut ring = rest();
-            ring.insert(0, shadow(0., 0., 0., 2., (ring_color << 8) | 0xff));
-            s.shadow(ring)
-        })
+        .hover(move |s| s.bg(rgb(hover)))
+        .active(move |s| s.opacity(0.85))
+        .focus_visible(move |s| s.shadow(ring))
 }
 
-/// Backlit rubber pad: grey face with a blue rim; keyboard focus lights it yellow.
-/// Unlit pads are empty slots recessed into the chassis.
-pub fn pad<E: Styled + StatefulInteractiveElement>(element: E, lit: bool) -> E {
-    let glow = |color: u32, alpha: u32, blur: f32| {
-        vec![
-            shadow(0., 0., 0., 2., (color << 8) | alpha),
-            shadow(0., 0., blur, 1., (color << 8) | 0x33),
-            inset(0., 1., 0., 0., 0xffffff59),
-            inset(0., -2., 3., 0., 0x00000026),
-        ]
+/// Outer bezel of a launcher tile: a softly lit rounded shell framing a recessed well
+/// (see `tile_well`), like a piece of hardware set into the glass. Selection brightens the
+/// shell by a shade, the way a hovered card on libraries.dev does; nothing else moves.
+pub fn tile<E: Styled + StatefulInteractiveElement>(element: E, selected: bool) -> E {
+    let palette = p();
+    let (top, bottom) = if selected {
+        palette.tile_shell_selected
+    } else {
+        palette.tile_shell
     };
-    let element = element.relative().rounded(px(4.)).border_1();
-    if !lit {
-        let palette = p();
-        let rest = vec![
-            shadow(0., 1., 1., 0., 0x0000001a),
-            inset(0., 1., 0., 0., palette.edge_highlight),
-        ];
-        return element
-            .bg(vertical(palette.empty_pad_hi, palette.empty_pad, 1.))
-            .border_color(rgb(palette.empty_pad_edge))
-            .shadow(rest.clone())
-            .focus_visible(move |s| {
-                let mut ring = rest.clone();
-                ring.insert(0, shadow(0., 0., 0., 2., (PAD_FOCUS << 8) | 0xff));
-                s.shadow(ring)
-            });
-    }
+    let rest = vec![
+        // Top-edge catch light, then the hairline rim.
+        inset(
+            0.,
+            1.,
+            0.,
+            0.,
+            if palette.dark { 0xffffff14 } else { 0xffffffff },
+        ),
+        inset(0., 0., 0., 1., palette.tile_shell_rim),
+        shadow(
+            0.,
+            1.,
+            2.,
+            0.,
+            if palette.dark { 0x00000073 } else { 0x00000014 },
+        ),
+        shadow(
+            0.,
+            8.,
+            18.,
+            -4.,
+            if palette.dark { 0x00000059 } else { 0x00000014 },
+        ),
+    ];
+    let ring = focus_ring(rest.clone());
     element
-        .bg(vertical(PAD_FACE_HI, PAD_FACE, 1.))
-        .border_color(rgb(0x8a8d92))
-        .shadow(glow(PAD_GLOW, 0xd9, 6.))
-        .cursor_pointer()
-        .hover(move |s| {
-            s.bg(vertical(0xc3c5c8, 0xadafb3, 1.))
-                .shadow(glow(PAD_GLOW, 0xff, 10.))
-        })
-        .active(move |s| {
-            s.bg(vertical(0x9a9da1, 0xa5a7ab, 1.))
-                .border_color(rgb(0x7a7d82))
-                .shadow(vec![
-                    shadow(0., 0., 0., 2., 0x8ccbf0ff),
-                    shadow(0., 0., 12., 3., 0x6aa8dc80),
-                    inset(0., 2., 4., 0., 0x00000059),
-                ])
-        })
-        .focus_visible(move |s| s.shadow(glow(PAD_FOCUS, 0xff, 10.)))
+        .relative()
+        .rounded(px(TILE_RADIUS))
+        .p(px(TILE_BEZEL))
+        .bg(vertical(top, bottom, 1.))
+        .shadow(rest)
+        // Hover and press feedback belong to the whole launcher slot, not the square.
+        .focus_visible(move |s| s.shadow(ring))
 }
 
-/// Small status LED pill.
-pub fn led(color: u32) -> Div {
+/// Corner radius of the tile shell; the well's radius stays concentric with it.
+pub const TILE_RADIUS: f32 = 20.;
+/// Width of the shell's bezel around the well.
+pub const TILE_BEZEL: f32 = 6.;
+
+/// Inner well of a launcher tile: sunk into the shell with a shadow under its top edge
+/// and a faint lip of light along the bottom.
+pub fn tile_well() -> Div {
+    let palette = p();
+    let (top, bottom) = palette.tile_well;
     div()
-        .w(px(14.))
-        .h(px(6.))
-        .rounded(px(3.))
-        .flex_shrink_0()
-        .bg(rgb(color))
+        .size_full()
+        .rounded(px(TILE_RADIUS - TILE_BEZEL))
+        .bg(vertical(top, bottom, 1.))
         .shadow(vec![
-            shadow(0., 0., 5., 0., (color << 8) | 0x80),
-            inset(0., 1., 0., 0., 0xffffff40),
+            inset(
+                0.,
+                1.,
+                3.,
+                0.,
+                if palette.dark { 0x000000a6 } else { 0x0000001a },
+            ),
+            inset(0., 0., 0., 1., palette.tile_well_rim),
+            inset(
+                0.,
+                -1.,
+                0.,
+                0.,
+                if palette.dark { 0xffffff0a } else { 0xffffffb3 },
+            ),
         ])
 }
 
-/// Printed label: tiny tracked caps.
-pub fn silkscreen(text: impl Into<SharedString>, color: u32) -> Div {
-    div()
-        .font_family(PRINT)
-        .text_size(px(9.5))
-        .line_height(px(12.))
-        .font_weight(FontWeight::BOLD)
-        .text_color(rgb(color))
-        .whitespace_nowrap()
-        .child(spaced(&text.into()))
-}
-/// GPUI has no letter-spacing, so printed caps get a six-per-em space between letters,
-/// approximating the design's tracking (hair spaces shape to almost nothing).
-pub fn spaced(text: &str) -> String {
-    const TRACKING: &str = "\u{2006}";
-    let mut out = String::with_capacity(text.len() * 4);
-    for (index, ch) in text.to_uppercase().chars().enumerate() {
-        if index > 0 {
-            out.push_str(TRACKING);
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// The sheet that holds long-form content on the chassis.
-pub fn paper() -> Div {
+/// Small keycap, e.g. `esc` in the status strip.
+pub fn kbd(text: impl Into<SharedString>) -> Div {
     let palette = p();
     div()
-        .rounded(px(6.))
-        .bg(rgb(palette.paper))
-        .border_1()
-        .border_color(rgb(palette.paper_border))
-        .shadow(vec![
-            shadow(0., 1., 0., 0., palette.edge_highlight),
-            inset(0., 1., 3., 0., 0x0000001f),
-        ])
+        .flex_shrink_0()
+        .h(px(16.))
+        .px(px(5.))
+        .flex()
+        .items_center()
+        .rounded(px(4.))
+        .bg(rgba(palette.kbd))
+        .shadow(vec![inset(0., 0., 0., 1., palette.border)])
+        .font_family(MONO)
+        .text_size(px(10.))
+        .text_color(rgb(palette.kbd_text))
+        .child(text.into())
+}
+
+/// Status dot with a soft halo.
+pub fn led(color: u32) -> Div {
+    div()
+        .size(px(7.))
+        .rounded_full()
+        .flex_shrink_0()
+        .bg(rgb(color))
+        .shadow(vec![shadow(0., 0., 0., 3., (color << 8) | 0x29)])
+}
+
+/// Section heading: small, medium-weight muted text.
+pub fn silkscreen(text: impl Into<SharedString>, color: u32) -> Div {
+    div()
+        .font_family(SANS)
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(color))
+        .whitespace_nowrap()
+        .child(text.into())
 }
 
 pub fn load_fonts(cx: &App) {
@@ -369,20 +414,6 @@ pub fn icon(name: &'static str, size: f32) -> Svg {
         .flex_shrink_0()
         .text_color(rgb(p().foreground))
 }
-
-/// The WIESEL wordmark: Inter Black (OFL, bundled) outlines with tight tracking and a slight
-/// horizontal condense, matching the design's lettering. Painted with the element's color.
-pub fn wordmark(height: f32) -> Svg {
-    svg()
-        .path(WORDMARK)
-        .w(px(height * WORDMARK_ASPECT))
-        .h(px(height))
-        .flex_shrink_0()
-        .text_color(rgb(LOGO_RED))
-}
-const WORDMARK: &str = "wordmark";
-const WORDMARK_ASPECT: f32 = 6556. / 1490.;
-const WORDMARK_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 6556.0 1490"><path fill="white" d="M350.9 1490 0 0H401.6L507.3 578Q527.7 687 545.5 796.5Q563.3 906 580.6 1015Q597.9 1124 613.9 1234H528.6Q547.3 1124 566 1015Q584.6 906 604.6 796.5Q624.6 687 646.8 578L764.1 0H1123L1240.3 578Q1262.5 687 1282.5 796.5Q1302.5 906 1321.2 1015Q1339.8 1124 1358.5 1234H1272.3Q1289.2 1124 1306 1015Q1322.9 906 1341.1 796.5Q1359.4 687 1378.9 578L1485.5 0H1887.1L1536.2 1490H1130.1L980 802Q963.1 722 943.1 606Q923.1 490 889.4 322H997.7Q964 490 944.4 606Q924.9 722 907.1 802L757 1490ZM2247.8 0V1490H1878.2V0ZM2310 1490V0H3335.3V352H2679.6V576H3284.7V916H2679.6V1138H3335.3V1490ZM3934.1 1514Q3751.1 1514 3624.1 1454Q3497 1394 3431.3 1277.5Q3365.5 1161 3365.5 994H3714.7Q3717.3 1054 3745.3 1097Q3773.3 1140 3822.6 1163Q3871.9 1186 3938.6 1186Q3997.2 1186 4040.7 1169.5Q4084.3 1153 4108.7 1123.5Q4133.1 1094 4133.1 1055Q4133.1 1019 4110 992Q4086.9 965 4039 945Q3991 925 3916.4 909L3784.9 881Q3593 840 3491.7 729Q3390.4 618 3390.4 452Q3390.4 310 3458.8 203Q3527.2 96 3648.9 36Q3770.7 -24 3931.5 -24Q4096.7 -24 4215.8 35Q4334.8 94 4400.6 205Q4466.3 316 4470.8 472H4131.4Q4125.2 394 4073.2 349Q4021.2 304 3938.6 304Q3887 304 3847.1 320.5Q3807.1 337 3784.4 365.5Q3761.8 394 3761.8 432Q3761.8 468 3782.2 493Q3802.6 518 3846.6 536.5Q3890.6 555 3959 569L4065.6 591Q4179.4 615 4261.5 652Q4343.7 689 4396.1 742Q4448.6 795 4473.4 865Q4498.3 935 4498.3 1024Q4498.3 1180 4432.1 1289.5Q4365.9 1399 4239.8 1456.5Q4113.6 1514 3934.1 1514ZM4546.3 1490V0H5571.6V352H4915.9V576H5520.9V916H4915.9V1138H5571.6V1490ZM5616 1490V0H5985.6V1138H6556V1490Z"/></svg>"#;
 
 // Embedded SVGs keep the packaged app independent of the working directory.
 pub struct Assets;
@@ -420,7 +451,9 @@ const ICONS: &[(&str, &str)] = &[
         r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>"#,
     ),
     ("arrow-up", r#"<path d="m5 12 7-7 7 7M12 19V5"/>"#),
-    ("loader", r#"<path d="M21 12a9 9 0 1 1-6.219-8.56"/>"#),
+    // A quiet ring with a short arc riding on it: the launcher's single progress spinner.
+    ("spinner-track", r#"<circle cx="12" cy="12" r="9"/>"#),
+    ("spinner-arc", r#"<path d="M12 3a9 9 0 0 1 9 9"/>"#),
     (
         "copy",
         r#"<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/>"#,
@@ -428,10 +461,13 @@ const ICONS: &[(&str, &str)] = &[
 ];
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-        if path == WORDMARK {
-            return Ok(Some(Cow::Borrowed(WORDMARK_SVG.as_bytes())));
-        }
-        Ok(ICONS.iter().find(|(name, _)| *name == path).map(|(_, body)| {
+        // App icons take precedence; any other Lucide icon may back a quick action.
+        let body = ICONS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, body)| *body)
+            .or_else(|| crate::lucide::find(path).map(|icon| icon.body));
+        Ok(body.map(|body| {
             Cow::Owned(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">{body}</svg>"#).into_bytes())
         }))
     }
@@ -439,7 +475,11 @@ impl AssetSource for Assets {
         Ok(ICONS
             .iter()
             .map(|(name, _)| SharedString::from(*name))
-            .chain(std::iter::once(SharedString::from(WORDMARK)))
+            .chain(
+                crate::lucide::icons()
+                    .iter()
+                    .map(|icon| SharedString::from(icon.name)),
+            )
             .collect())
     }
 }
@@ -463,7 +503,7 @@ mod tests {
     }
     #[test]
     fn palettes_differ_in_surfaces() {
-        assert_ne!(LIGHT.chassis, DARK.chassis);
+        assert_ne!(LIGHT.background, DARK.background);
         assert_ne!(LIGHT.foreground, DARK.foreground);
         // Only assert the light default: other tests in this process render in Light.
         set_appearance(Appearance::Auto, WindowAppearance::Light);

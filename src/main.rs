@@ -12,7 +12,9 @@ mod completion_backend;
 mod diagnostics;
 mod gateway;
 mod input;
+mod lucide;
 mod model_picker;
+mod native;
 mod navigation;
 mod notifications;
 mod ollama;
@@ -20,6 +22,10 @@ mod quick_actions;
 mod selection;
 mod settings;
 mod settings_view;
+#[cfg(test)]
+mod surface_tests;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tier_picker;
 
@@ -30,9 +36,10 @@ use diagnostics::{
 use gateway::Message;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use gpui::{
-    Animation, AnimationExt, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle,
-    Focusable, FontWeight, KeyBinding, KeyDownEvent, MouseButton, Role, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, Stateful, Transformation, Window, WindowBounds, WindowOptions, actions, div,
+    Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Div,
+    Entity, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, MouseButton, Pixels,
+    Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, Size, Stateful, TitlebarOptions,
+    Transformation, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, div,
     percentage, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use input::TextInput;
@@ -110,18 +117,111 @@ mod draft_tests {
     }
 }
 
+/// Screens of the Settings window's navigation stack; Settings is its permanent root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
     Settings,
-    Launcher,
-    Chat,
-    Writing,
     ActionManager,
     ActionEditor,
 }
+
+/// Windows besides the launcher HUD. Each is a singleton rendered from `Wiesel`'s state,
+/// so closing one keeps its drafts and history for the next time it opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Settings,
+    Chat,
+    Writing,
+}
+impl Surface {
+    const ALL: [Surface; 3] = [Surface::Settings, Surface::Chat, Surface::Writing];
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Surface::Settings => "Settings",
+            Surface::Chat => "Chat",
+            Surface::Writing => "Result",
+        }
+    }
+    fn size(self) -> Size<Pixels> {
+        match self {
+            Surface::Settings => size(px(600.), px(680.)),
+            Surface::Chat => size(px(560.), px(640.)),
+            Surface::Writing => size(px(520.), px(560.)),
+        }
+    }
+    fn options(self, cx: &App) -> WindowOptions {
+        let window_size = self.size();
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                window_size,
+                cx,
+            ))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(self.title().into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.), px(15.))),
+            }),
+            window_min_size: Some(size(px(440.), px(420.))),
+            ..Default::default()
+        }
+    }
+}
+
+/// Window handles and root focus for every `Surface`.
+pub(crate) struct Surfaces {
+    windows: [Option<AnyWindowHandle>; 3],
+    opening: [bool; 3],
+    /// Focus to apply once a surface window exists or is activated.
+    pending_focus: [Option<FocusHandle>; 3],
+    focus: [FocusHandle; 3],
+}
+impl Surfaces {
+    fn new(cx: &mut App) -> Self {
+        Self {
+            windows: [None; 3],
+            opening: [false; 3],
+            pending_focus: Default::default(),
+            focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+        }
+    }
+}
+
+/// A secondary window's root view: renders one surface from the shared app state.
+struct SurfaceView {
+    app: Entity<Wiesel>,
+    surface: Surface,
+}
+impl SurfaceView {
+    fn new(
+        app: Entity<Wiesel>,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
+            .detach();
+        let weak = app.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |app, cx| app.surface_should_close(surface, window, cx))
+                .unwrap_or(true)
+        });
+        Self { app, surface }
+    }
+}
+impl Render for SurfaceView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let surface = self.surface;
+        self.app
+            .update(cx, |app, cx| app.render_surface(surface, window, cx))
+    }
+}
 struct ScreenLifecycle {
     restore_focus: Option<FocusHandle>,
-    startup: bool,
 }
 
 // Completion ownership survives an entry's pop, but cannot be reused by a newer request.
@@ -162,7 +262,8 @@ actions!(
         AdjustQuickActions,
         NewQuickAction,
         NewChat,
-        HideWiesel
+        HideWiesel,
+        CloseWindow
     ]
 );
 
@@ -589,7 +690,18 @@ fn run_diagnostic_control(
 }
 
 struct Wiesel {
+    /// The Settings window's stack: Settings → Quick actions → action editor.
     navigation: Navigation<Screen, ScreenLifecycle>,
+    surfaces: Surfaces,
+    /// The launcher HUD window (this view's own window).
+    hud: Option<AnyWindowHandle>,
+    hud_visible: bool,
+    /// Highlighted launcher tile; arrows, Tab and hover move it, Enter runs it.
+    hud_selected: usize,
+    /// The launcher was summoned over another app, so Esc hands focus back to it.
+    hud_hides_app: bool,
+    /// Settings was opened for setup at launch and may close itself after sign-in.
+    settings_startup: bool,
     request_generation: u64,
     active_request: Option<CompletionScope>,
     #[cfg(test)]
@@ -651,78 +763,268 @@ struct Wiesel {
     completion_backend: completion_backend::CompletionBackend,
 }
 impl Wiesel {
+    /// The visible screen of the Settings window's stack.
     fn current_screen(&self) -> Screen {
         self.navigation.current().component
     }
 
     fn screen_focus(&self, cx: &App) -> FocusHandle {
         match self.current_screen() {
-            Screen::Launcher => self.focus.clone(),
-            Screen::Chat => self.composer.focus_handle(cx),
             Screen::Settings if self.provider_tab == Provider::Wiesel => self.login_focus.clone(),
-            Screen::Settings => self.focus.clone(),
-            Screen::Writing | Screen::ActionManager => self.focus.clone(),
-            Screen::ActionEditor => self
-                .actions
-                .editor
-                .as_ref()
-                .map_or_else(|| self.focus.clone(), |editor| editor.name.focus_handle(cx)),
+            Screen::Settings | Screen::ActionManager => self.surface_focus(Surface::Settings),
+            Screen::ActionEditor => self.actions.editor.as_ref().map_or_else(
+                || self.surface_focus(Surface::Settings),
+                |editor| editor.name.focus_handle(cx),
+            ),
         }
     }
 
-    /// Push without resetting retained screen state; capture the covered screen's focus.
+    fn surface_focus(&self, surface: Surface) -> FocusHandle {
+        self.surfaces.focus[surface.index()].clone()
+    }
+    fn surface_window(&self, surface: Surface) -> Option<AnyWindowHandle> {
+        self.surfaces.windows[surface.index()]
+    }
+    /// Open, or opening: its state is mounted even before the native window appears.
+    fn is_open(&self, surface: Surface) -> bool {
+        self.surfaces.windows[surface.index()].is_some() || self.surfaces.opening[surface.index()]
+    }
+    fn window_is(&self, surface: Surface, window: &Window) -> bool {
+        self.surface_window(surface) == Some(window.window_handle())
+    }
+
+    /// Bring a surface window forward (opening it if needed) and focus `focus` inside it.
+    /// Windows open after the current update, because opening one renders it immediately.
+    fn open_surface(
+        &mut self,
+        surface: Surface,
+        focus: Option<FocusHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let index = surface.index();
+        self.surfaces.pending_focus[index] =
+            Some(focus.unwrap_or_else(|| self.surface_focus(surface)));
+        self.dismiss_hud(cx);
+        cx.activate(true);
+        cx.notify();
+        if self.surfaces.opening[index] {
+            return;
+        }
+        let app = cx.entity();
+        if let Some(handle) = self.surfaces.windows[index] {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    app.update(cx, |app, cx| app.apply_pending_focus(surface, window, cx));
+                });
+            });
+            return;
+        }
+        self.surfaces.opening[index] = true;
+        cx.defer(move |cx| {
+            // Closed again before the window existed.
+            if !app.read(cx).surfaces.opening[index] {
+                return;
+            }
+            let opened = cx.open_window(surface.options(cx), |window, cx| {
+                let view = cx.new(|cx| SurfaceView::new(app.clone(), surface, window, cx));
+                app.update(cx, |app, cx| app.apply_pending_focus(surface, window, cx));
+                view
+            });
+            let opened = opened.ok().map(AnyWindowHandle::from);
+            app.update(cx, |app, cx| {
+                app.surfaces.opening[index] = false;
+                app.surfaces.windows[index] = opened;
+                cx.notify();
+            });
+            if let Some(handle) = opened {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
+        });
+    }
+    fn apply_pending_focus(
+        &mut self,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(focus) = self.surfaces.pending_focus[surface.index()].take() {
+            window.focus(&focus, cx);
+        }
+    }
+    /// Focus inside a surface; from another window this activates the surface first.
+    fn focus_in(
+        &mut self,
+        surface: Surface,
+        focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.window_is(surface, window) {
+            window.focus(&focus, cx);
+        } else {
+            self.open_surface(surface, Some(focus), cx);
+        }
+    }
+    /// Run a Settings-window operation inside that window, so focus capture/restore and
+    /// confirmation dialogs act on the right window. Returns true when it was deferred.
+    fn route_to_settings(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        operation: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        let Some(handle) = self.surface_window(Surface::Settings) else {
+            return false;
+        };
+        if handle == window.window_handle() {
+            return false;
+        }
+        let app = cx.entity();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                app.update(cx, |app, cx| operation(app, window, cx));
+            });
+        });
+        true
+    }
+    /// Forget a surface's window and leave its screens; the caller closes the native window.
+    fn forget_surface(
+        &mut self,
+        surface: Surface,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyWindowHandle> {
+        let index = surface.index();
+        self.surfaces.pending_focus[index] = None;
+        self.surfaces.opening[index] = false;
+        if surface == Surface::Settings {
+            for entry in self.navigation.pop_to_root() {
+                self.finish_pop(entry, cx);
+            }
+            self.leave_settings(cx);
+            self.settings_startup = false;
+        }
+        cx.notify();
+        self.surfaces.windows[index].take()
+    }
+    fn close_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
+        if let Some(handle) = self.forget_surface(surface, cx) {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            });
+        }
+    }
+    /// The close button, ⌘W or Esc at a root: Settings first confirms a dirty action draft.
+    fn surface_should_close(
+        &mut self,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if surface == Surface::Settings
+            && self.guard_action_removal(action_builder::Removal::Close, window, cx)
+        {
+            return false;
+        }
+        self.forget_surface(surface, cx);
+        true
+    }
+    fn request_close(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface_should_close(surface, window, cx) {
+            window.remove_window();
+        }
+    }
+
+    /// Show the launcher centered on screen with the first tile highlighted.
+    fn show_hud(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let summoned = match cx.active_window() {
+            // Another app was frontmost (also after Wiesel hid itself).
+            None => {
+                self.hud_hides_app = true;
+                true
+            }
+            Some(active) if Some(active) == self.hud => !self.hud_visible,
+            Some(_) => {
+                self.hud_hides_app = false;
+                true
+            }
+        };
+        // Actions may have changed while the launcher was away.
+        self.sync_hud_size(window);
+        if summoned {
+            self.hud_selected = 0;
+            native::center(window);
+        }
+        self.hud_visible = true;
+        cx.activate(true);
+        window.activate_window();
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+    /// Take the launcher off screen without hiding Wiesel's other windows.
+    fn dismiss_hud(&mut self, cx: &mut Context<Self>) {
+        if !self.hud_visible {
+            return;
+        }
+        self.hud_visible = false;
+        // GPUI orders windows front from a foreground task; queue behind it.
+        if let Some(hud) = self.hud {
+            cx.spawn(async move |this, cx| {
+                let still_hidden = this.read_with(cx, |this, _| !this.hud_visible);
+                if still_hidden.unwrap_or(false) {
+                    let _ = hud.update(cx, |_, window, _| native::order_out(window));
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Push onto the Settings window's stack, opening the window and capturing the covered
+    /// screen's focus.
     fn push_screen(
         &mut self,
         screen: Screen,
-        startup: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EntryId {
-        debug_assert_eq!(self.navigation.root().component, Screen::Launcher);
-        if screen == Screen::Launcher {
-            self.pop_to_root(window, cx);
-            return self.navigation.root().id;
-        }
-        if self.current_screen() == screen {
+        debug_assert_eq!(self.navigation.root().component, Screen::Settings);
+        if self.current_screen() == screen && self.is_open(Surface::Settings) {
             return self.navigation.current().id;
         }
-        let restore_focus = window.focused(cx).or_else(|| Some(self.screen_focus(cx)));
-        let id = self.navigation.push(
-            screen,
-            ScreenLifecycle {
-                restore_focus,
-                startup,
-            },
-        );
-        window.focus(&self.screen_focus(cx), cx);
+        let restore_focus = self
+            .window_is(Surface::Settings, window)
+            .then(|| window.focused(cx))
+            .flatten()
+            .or_else(|| Some(self.screen_focus(cx)));
+        let id = if self.current_screen() == screen {
+            self.navigation.current().id
+        } else {
+            self.navigation
+                .push(screen, ScreenLifecycle { restore_focus })
+        };
+        let focus = self.screen_focus(cx);
+        self.focus_in(Surface::Settings, focus, window, cx);
         cx.notify();
         id
     }
 
-    fn redirect_deleted_home_restore_focus(&mut self, deleted: &FocusHandle) {
-        for lifecycle in self.navigation.lifecycles_mut() {
-            if lifecycle.restore_focus.as_ref() == Some(deleted) {
-                lifecycle.restore_focus = Some(self.focus.clone());
-            }
-        }
-    }
-
+    /// Open Settings at its root. An open window reveals Settings instead of stacking it.
     fn push_settings(&mut self, startup: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.actions.dialog.is_some() {
             return;
         }
-        let existing = self
-            .navigation
-            .entries()
-            .find(|entry| entry.component == Screen::Settings)
-            .map(|entry| entry.id);
-        if let Some(id) = existing {
-            if id != self.navigation.current().id {
-                self.pop_to_screen(id, window, cx);
-            }
+        if !self.is_open(Surface::Settings) {
+            self.settings_startup = startup;
+        }
+        let root = self.navigation.root().id;
+        if root != self.navigation.current().id && !self.pop_to_screen(root, window, cx) {
             return;
         }
-        self.push_screen(Screen::Settings, startup, window, cx);
+        let focus = self.screen_focus(cx);
+        self.focus_in(Surface::Settings, focus, window, cx);
+        cx.notify();
     }
 
     /// Quick-action management is a singleton like Settings: reveal it instead of stacking.
@@ -739,9 +1041,12 @@ impl Wiesel {
             Some(id) if id != self.navigation.current().id => {
                 self.pop_to_screen(id, window, cx);
             }
-            Some(_) => (),
+            Some(_) => {
+                let focus = self.screen_focus(cx);
+                self.focus_in(Surface::Settings, focus, window, cx);
+            }
             None => {
-                self.push_screen(Screen::ActionManager, false, window, cx);
+                self.push_screen(Screen::ActionManager, window, cx);
             }
         }
     }
@@ -759,7 +1064,8 @@ impl Wiesel {
         for entry in entries {
             restored = self.finish_pop(entry, cx);
         }
-        window.focus(&restored.unwrap_or_else(|| self.screen_focus(cx)), cx);
+        let focus = restored.unwrap_or_else(|| self.screen_focus(cx));
+        self.focus_in(Surface::Settings, focus, window, cx);
         cx.notify();
         true
     }
@@ -773,16 +1079,20 @@ impl Wiesel {
             self.actions.editor = None;
         }
         if entry.component == Screen::Settings {
-            self.recording = false;
-            if self.session.attempt.is_some() || self.session.exchanging {
-                self.cancel_login(cx);
-            }
+            self.leave_settings(cx);
         }
         // Inference is not canceled: retained state and busy ownership outlive the entry.
         entry.on_pop.and_then(|lifecycle| lifecycle.restore_focus)
     }
+    /// Leaving Settings stops recording and cancels a pending browser login.
+    fn leave_settings(&mut self, cx: &mut Context<Self>) {
+        self.recording = false;
+        if self.session.attempt.is_some() || self.session.exchanging {
+            self.cancel_login(cx);
+        }
+    }
 
-    /// Returns false only at the permanent Launcher root.
+    /// Pops one Settings-window screen; returns false at its Settings root.
     fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.navigation.is_root() {
             return false;
@@ -796,31 +1106,27 @@ impl Wiesel {
         let focus = self
             .finish_pop(entry, cx)
             .unwrap_or_else(|| self.screen_focus(cx));
-        window.focus(&focus, cx);
+        self.focus_in(Surface::Settings, focus, window, cx);
         cx.notify();
         true
     }
 
-    fn pop_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.guard_action_removal(action_builder::Removal::Root, window, cx) {
-            return;
-        }
-        for entry in self.navigation.pop_to_root() {
-            self.finish_pop(entry, cx);
-        }
-        window.focus(&self.focus, cx);
-        cx.notify();
+    // A completed selection capture shows the launcher; other windows keep their state.
+    fn activate_from_hotkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_hud(window, cx);
     }
 
-    // A completed selection capture activates Home unless Settings or an inference is active.
-    fn activate_from_hotkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.actions.dialog.is_some() {
-            return;
-        }
-        if !self.busy && self.current_screen() != Screen::Settings {
-            self.pop_to_root(window, cx);
+    /// Esc on the launcher: put it away. Summoned over another app (or with no other
+    /// window open), hand focus back to that app; otherwise return to Wiesel's windows.
+    fn escape_hud(&mut self, cx: &mut Context<Self>) {
+        if !self.hud_hides_app
+            && Surface::ALL
+                .into_iter()
+                .any(|surface| self.is_open(surface))
+        {
+            self.dismiss_hud(cx);
         } else {
-            window.focus(&self.screen_focus(cx), cx);
+            self.hide_window(cx);
         }
     }
 
@@ -881,7 +1187,13 @@ impl Wiesel {
         let provider_tab = Self::initial_provider_tab(&settings);
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
-            navigation: Navigation::new(Screen::Launcher),
+            navigation: Navigation::new(Screen::Settings),
+            surfaces: Surfaces::new(cx),
+            hud: Some(window.window_handle()),
+            hud_visible: true,
+            hud_selected: 0,
+            hud_hides_app: true,
+            settings_startup: false,
             request_generation: 0,
             active_request: None,
             #[cfg(test)]
@@ -979,6 +1291,7 @@ impl Wiesel {
             cx.hide();
             false
         });
+        app.sync_hud_size(window);
         app.push_settings(true, window, cx);
         app.poll_diagnostics(cx);
         app.sync_permission_issue();
@@ -1271,11 +1584,6 @@ impl Wiesel {
     fn idle_notification(&self) -> Notification {
         if !self.can_request() {
             Notification::new(Severity::Warning, "Log in to Wiesel in Settings (⌘⇧L).")
-        } else if let Some(text) = &self.selection.text {
-            Notification::new(
-                Severity::Success,
-                format!("Ready · {} characters selected", text.chars().count()),
-            )
         } else {
             Notification::new(Severity::Success, "Ready")
         }
@@ -1312,6 +1620,7 @@ impl Wiesel {
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notifications
             .set_visible(Instant::now(), window.is_visible());
+        self.sync_hud_size(window);
         if self.permission_checked_at.elapsed() >= Duration::from_secs(1) {
             cx.set_reduce_motion(
                 objc2_app_kit::NSWorkspace::sharedWorkspace()
@@ -1365,7 +1674,7 @@ impl Wiesel {
             }
         }
         self.poll_capture(window, cx);
-        self.poll_paste_back(window, cx);
+        self.poll_paste_back(cx);
         // Callback activation must not steal focus before Copy restoration finishes.
         if self.pending_capture.is_none() {
             self.receive_callbacks(window, cx);
@@ -1418,10 +1727,7 @@ impl Wiesel {
         );
         self.notifications.clear(Source::Selection);
         match &result {
-            Ok(text) => self.notifications.success(format!(
-                "Captured {} characters. Ready for writing.",
-                text.chars().count()
-            )),
+            Ok(_) => self.notifications.success("Text captured"),
             Err(e) => {
                 let (severity, message) = notifications::capture_issue(e);
                 self.notifications
@@ -1434,8 +1740,6 @@ impl Wiesel {
             self.selection.source = source;
         }
         self.activate_from_hotkey(window, cx);
-        cx.activate(true);
-        window.activate_window();
         cx.notify();
     }
     fn receive_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1679,38 +1983,52 @@ impl Wiesel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if std::env::var_os("WIESEL_SHOT").is_some() && self.current_screen() == Screen::Settings {
+        if std::env::var_os("WIESEL_SHOT").is_some() && self.settings_startup {
+            self.close_surface(Surface::Settings, cx);
             if std::env::var_os("WIESEL_SHOT_CHAT").is_some() {
-                self.pop_screen(window, cx);
-                self.push_screen(Screen::Chat, false, window, cx);
                 self.messages.push(gateway::Message {
                     role: "user".into(),
                     content: "Can you make this paragraph sound friendlier for a customer email?"
                         .into(),
                 });
                 self.messages.push(gateway::Message { role: "assistant".into(), content: "Of course! Here's a warmer version: “Thanks so much for reaching out — we've looked into your order and it's on its way. If anything else comes up, we're happy to help.”".into() });
+                self.open_chat(window, cx);
             } else {
-                self.pop_screen(window, cx);
+                self.show_hud_from(window, cx);
             }
             return;
         }
+        // Only setup Settings that is still on its root closes itself; an explicitly
+        // opened Settings window never does.
         if show_launcher
             && self.can_request()
             && self.hotkey.is_some()
             && self.settings.onboarded
-            && self.current_screen() == Screen::Settings
-            && self
-                .navigation
-                .current()
-                .on_pop
-                .as_ref()
-                .is_some_and(|lifecycle| lifecycle.startup)
+            && self.settings_startup
+            && self.is_open(Surface::Settings)
+            && self.navigation.is_root()
         {
-            self.pop_screen(window, cx);
+            self.close_surface(Surface::Settings, cx);
+            self.show_hud_from(window, cx);
+        }
+    }
+    /// Show the launcher from any window's context.
+    fn show_hud_from(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hud == Some(window.window_handle()) {
+            self.show_hud(window, cx);
+        } else if let Some(hud) = self.hud {
+            let app = cx.entity();
+            cx.defer(move |cx| {
+                let _ = hud.update(cx, |_, window, cx| {
+                    app.update(cx, |app, cx| app.show_hud(window, cx));
+                });
+            });
         }
     }
     fn start_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.actions.dialog.is_some() {
+        if self.actions.dialog.is_some()
+            || self.route_to_settings(window, cx, |this, window, cx| this.start_login(window, cx))
+        {
             return;
         }
         self.show_account_tab(cx);
@@ -1720,7 +2038,8 @@ impl Wiesel {
         if self.current_screen() != Screen::Settings || self.actions.dialog.is_some() {
             return;
         }
-        window.focus(&self.login_focus, cx);
+        let focus = self.login_focus.clone();
+        self.focus_in(Surface::Settings, focus, window, cx);
         if self.session.credential.is_some() {
             self.notifications
                 .info("Already signed in. Sign out to switch accounts.");
@@ -1764,7 +2083,6 @@ impl Wiesel {
     }
     fn handle_callback(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
         cx.activate(true);
-        window.activate_window();
         match self.session.consume_callback(raw) {
             Ok(request) => {
                 self.notifications
@@ -1796,12 +2114,20 @@ impl Wiesel {
         }
         if !self.authenticated {
             self.show_account_tab(cx);
-            self.push_settings(false, window, cx);
-            if self.current_screen() == Screen::Settings && self.actions.dialog.is_none() {
-                window.focus(&self.login_focus, cx);
-            }
+            self.reveal_login(window, cx);
         }
         cx.notify();
+    }
+    /// Open Settings on its root with the account control focused.
+    fn reveal_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.route_to_settings(window, cx, |this, window, cx| this.reveal_login(window, cx)) {
+            return;
+        }
+        self.push_settings(false, window, cx);
+        if self.current_screen() == Screen::Settings && self.actions.dialog.is_none() {
+            let focus = self.login_focus.clone();
+            self.focus_in(Surface::Settings, focus, window, cx);
+        }
     }
     fn valid_credential(&mut self, cx: &mut Context<Self>) -> Option<Arc<DeviceCredential>> {
         let credential = self.session.credential.as_ref()?.clone();
@@ -2255,13 +2581,9 @@ impl Wiesel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if action == QuickAction::Add {
-            self.open_action_editor(None, window, cx);
-            return;
-        }
         if !self.can_request() {
             self.show_account_tab(cx);
-            self.push_settings(false, window, cx);
+            self.reveal_login(window, cx);
             self.notifications.warning("Sign in to Wiesel first.");
             cx.notify();
             return;
@@ -2276,7 +2598,6 @@ impl Wiesel {
         }
         match action {
             QuickAction::Chat => self.open_chat(window, cx),
-            QuickAction::Add => self.open_action_editor(None, window, cx),
             _ => self.writing(action, window, cx),
         }
     }
@@ -2303,7 +2624,7 @@ impl Wiesel {
             .working(Source::Request, "Pasting result…");
         self.paste_back = Some(clipboard_capture::PasteBack::new(paste.source, text));
     }
-    fn poll_paste_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn poll_paste_back(&mut self, cx: &mut Context<Self>) {
         let Some(result) = self
             .paste_back
             .as_mut()
@@ -2334,16 +2655,14 @@ impl Wiesel {
                         error.to_string().trim_end_matches('.')
                     ),
                 );
-                self.push_screen(Screen::Writing, false, window, cx);
-                cx.activate(true);
-                window.activate_window();
+                self.open_surface(Surface::Writing, None, cx);
             }
         }
         cx.notify();
     }
     fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.push_screen(Screen::Chat, false, window, cx);
-        window.focus(&self.composer.focus_handle(cx), cx);
+        let composer = self.composer.focus_handle(cx);
+        self.focus_in(Surface::Chat, composer, window, cx);
         cx.notify();
     }
     fn writing(&mut self, action: QuickAction, window: &mut Window, cx: &mut Context<Self>) {
@@ -2423,12 +2742,90 @@ impl Wiesel {
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.notifications.suppress_motion = true;
-        self.key_down_impl(event, window, cx);
+        self.hud_key(event, window, cx);
         self.notifications
             .update(Instant::now(), self.idle_notification());
         self.notifications.suppress_motion = false;
     }
-    fn key_down_impl(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn surface_key_down(
+        &mut self,
+        surface: Surface,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notifications.suppress_motion = true;
+        match surface {
+            Surface::Settings => self.settings_key(event, window, cx),
+            Surface::Chat | Surface::Writing => self.content_key(surface, event, window, cx),
+        }
+        self.notifications
+            .update(Instant::now(), self.idle_notification());
+        self.notifications.suppress_motion = false;
+    }
+    /// Launcher keys, as in cmd+tab: arrows/Tab move the highlight, Enter runs it, the
+    /// printed numbers run their tile directly and Esc puts the launcher away.
+    fn hud_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
+        let plain = !key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt;
+        let actions = self.home_actions();
+        match key.key.as_str() {
+            "escape" => self.escape_hud(cx),
+            "left" | "right" | "tab" if plain && !actions.is_empty() => {
+                let back = key.key == "left" || (key.key == "tab" && key.modifiers.shift);
+                let count = actions.len();
+                self.hud_selected = if back {
+                    (self.hud_selected + count - 1) % count
+                } else {
+                    (self.hud_selected + 1) % count
+                };
+                cx.notify();
+            }
+            "enter" | "space" if plain => {
+                if !event.is_held
+                    && let Some(action) = actions.get(self.hud_selected).cloned()
+                {
+                    self.run_home_action(action, window, cx);
+                }
+            }
+            digit if plain && !event.is_held => {
+                // Number keys press the tile printed with the same number.
+                let Some(slot) = home_slot_shortcut(digit) else {
+                    return;
+                };
+                if let Some(action) = actions.get(slot).cloned() {
+                    self.hud_selected = slot;
+                    self.run_home_action(action, window, cx);
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+    fn content_key(
+        &mut self,
+        surface: Surface,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.request_close(surface, window, cx);
+            cx.stop_propagation();
+        } else if surface == Surface::Chat
+            && key.key == "enter"
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !event.is_held
+        {
+            self.send_chat(cx);
+            cx.stop_propagation();
+        }
+    }
+    fn settings_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.action_builder_key(event, window, cx) {
             return;
         }
@@ -2505,37 +2902,15 @@ impl Wiesel {
             cx.stop_propagation();
         } else if key.key == "escape" {
             if !self.pop_screen(window, cx) {
-                self.hide_window(cx);
+                self.request_close(Surface::Settings, window, cx);
             }
-            cx.stop_propagation();
-        } else if self.current_screen() == Screen::Launcher
-            && !key.modifiers.platform
-            && !key.modifiers.control
-            && !key.modifiers.alt
-            && !event.is_held
-            && let Some(slot) = home_slot_shortcut(&key.key)
-        {
-            // Number keys press the pad printed with the same number.
-            if let Some(Some(action)) = self.home_action_slots().get(slot).cloned() {
-                self.run_home_action(action, window, cx);
-            }
-            cx.stop_propagation();
-        } else if self.current_screen() == Screen::Chat
-            && key.key == "enter"
-            && !key.modifiers.shift
-            && !key.modifiers.platform
-            && !key.modifiers.control
-            && !key.modifiers.alt
-            && !event.is_held
-        {
-            self.send_chat(cx);
             cx.stop_propagation();
         }
     }
     fn button(id: &'static str, title: &str) -> Stateful<Div> {
         Self::key_button(id, title, theme::Key::Grey)
     }
-    /// A labelled hardware key; the caption is printed on the cap in bold caps.
+    /// A labelled shadcn/ui button.
     fn key_button(id: &'static str, title: &str, kind: theme::Key) -> Stateful<Div> {
         theme::key(
             div()
@@ -2546,8 +2921,7 @@ impl Wiesel {
         )
         .h(px(28.))
         .px(px(12.))
-        .text_size(px(10.))
-        .child(title.to_uppercase())
+        .child(title.to_owned())
     }
 
     fn label(text: &str) -> Div {
@@ -2556,194 +2930,275 @@ impl Wiesel {
             .text_color(rgb(theme::p().muted))
             .child(text.to_owned())
     }
-    fn launcher(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-        // Fit three pad rows (plus their printed labels) below the header, as in the design.
-        let viewport = window.viewport_size();
-        let gap = px(HOME_COLUMN_GAP);
-        let rows_chrome = HEADER_HEIGHT
-            + HOME_PADDING_TOP
-            + HOME_PADDING_BOTTOM
-            + 3. * (HOME_LABEL_GAP + HOME_LABEL_HEIGHT)
-            + 2. * HOME_ROW_GAP;
-        let pad = ((viewport.height - px(rows_chrome)) / 3.)
-            .min((viewport.width - px(2. * HOME_PADDING_X) - gap * 2.) / 3.)
-            .max(px(64.));
-        let grid_width = pad * 3. + gap * 2.;
+    /// The launcher's row of icon tiles, like the cmd+tab switcher.
+    fn launcher(&self, cx: &mut Context<Self>) -> Div {
+        let actions = self.home_actions();
+        let selected = self.hud_selected.min(actions.len().saturating_sub(1));
         div()
-            .flex_1()
-            .min_h_0()
+            .debug_selector(|| "quick-actions".into())
+            .flex_shrink_0()
             .flex()
-            .flex_col()
-            .items_center()
-            .child(
-                div()
-                    .id("quick-actions-scroll")
-                    .debug_selector(|| "quick-actions-scroll".into())
-                    .track_scroll(&self.actions.home_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(HOME_ROW_GAP))
-                    .pt(px(HOME_PADDING_TOP))
-                    .pb(px(HOME_PADDING_BOTTOM))
-                    .children(self.home_action_slots().chunks(3).enumerate().map(
-                        |(row, actions)| {
+            .justify_center()
+            .gap(px(HUD_TILE_GAP))
+            .pt(px(HUD_PADDING))
+            .pb(px(HUD_PADDING - 2.))
+            .px(px(HUD_PADDING))
+            .when(actions.is_empty(), |d| {
+                d.child(
+                    div()
+                        .h(px(HUD_SLOT_HEIGHT))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(4.))
+                        .child(
                             div()
-                                .w(grid_width)
-                                .flex()
-                                .flex_shrink_0()
-                                .gap(gap)
-                                .children(actions.iter().cloned().enumerate().map(
-                                    |(column, item)| self.home_pad(row * 3 + column, item, pad, cx),
-                                ))
-                        },
-                    )),
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("No quick actions"),
+                        )
+                        .child(Self::label("Add one with File → New Quick Action…")),
+                )
+            })
+            .children(
+                actions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, item)| self.home_pad(slot, item, slot == selected, cx)),
             )
     }
     fn home_pad(
         &self,
         slot: usize,
-        item: Option<action_builder::HomeAction>,
-        size: gpui::Pixels,
+        item: action_builder::HomeAction,
+        selected: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> AnyElement {
         let palette = theme::p();
-        // Every pad is printed with its position; 1–9 double as keyboard shortcuts.
-        let number = if slot < 9 {
-            (slot + 1).to_string()
-        } else {
-            String::new()
-        };
-        let label = |title: Option<String>| {
-            div()
-                .h(px(HOME_LABEL_HEIGHT))
-                .w(size)
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(1.))
-                .font_family(theme::PRINT)
-                .text_size(px(9.5))
-                .line_height(px(HOME_LABEL_HEIGHT))
-                .font_weight(FontWeight::BOLD)
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(rgb(palette.pad_number))
-                        .child(number.clone()),
-                )
-                .child(match title {
-                    Some(title) => div()
-                        .min_w_0()
-                        .text_ellipsis()
-                        .overflow_hidden()
-                        .text_color(rgb(palette.pad_title))
-                        .child(theme::spaced(&title)),
-                    None => div()
-                        .text_color(rgb(palette.pad_number))
-                        .font_weight(FontWeight::NORMAL)
-                        .child("—"),
-                })
-        };
-        let column = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .gap(px(HOME_LABEL_GAP));
-        let Some(item) = item else {
-            return column
-                .child(
-                    theme::pad(
-                        div()
-                            .id(("home-empty", slot))
-                            .debug_selector(move || format!("home-empty-{slot}")),
-                        false,
-                    )
-                    .size(size),
-                )
-                .child(label(None))
-                .into_any_element();
-        };
-        let (id, title, icon, _, add) = item.presentation();
-        // A direct-paste action spins on its own pad while the model works.
-        let loading = self.busy
+        let (id, title, icon, _) = item.presentation();
+        // A direct-paste action spins on its own tile while the model works.
+        let pasting = self.busy && self.direct_paste.is_some();
+        let loading = pasting
             && self
                 .direct_paste
-                .is_some_and(|paste| item.action_id() == Some(paste.action));
+                .is_some_and(|paste| item.action_id() == paste.action);
+        let enabled = self.home_action_enabled(&item);
         let debug_id = id.clone();
-        let keyboard_item = item.clone();
-        let pad = div()
+        let ink = palette.tile_ink;
+        let glyph = if loading {
+            // A faint full ring with a short arc circling it, at the glyph's optical size.
+            // Constant motion stays linear; a brisk turn makes the wait feel shorter.
+            div()
+                .debug_selector(move || format!("home-spinner-{slot}"))
+                .relative()
+                .size(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    theme::icon("spinner-track", 22.)
+                        .absolute()
+                        .text_color(rgba((ink << 8) | 0x29)),
+                )
+                .child(
+                    theme::icon("spinner-arc", 22.)
+                        .absolute()
+                        .text_color(rgb(ink))
+                        .with_animation(
+                            "home-spinner",
+                            Animation::new(Duration::from_millis(700)).repeat(),
+                            |icon, delta| {
+                                icon.with_transformation(Transformation::rotate(percentage(delta)))
+                            },
+                        ),
+                )
+                .into_any_element()
+        } else {
+            // The glyph rests a shade quieter and lights up with its tile.
+            theme::icon(icon, 26.)
+                .text_color(rgb(if selected { ink } else { palette.tile_ink_rest }))
+                .into_any_element()
+        };
+        // Every tile is printed with its position; 1–9 double as keyboard shortcuts.
+        let number = (slot < 9).then(|| (slot + 1).to_string());
+        let square = theme::tile(div().id(("home-tile", slot)), selected)
+            .size(px(HUD_TILE))
+            .child(
+                theme::tile_well()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.))
+                    .pt(px(3.))
+                    .child(glyph)
+                    .child(
+                        div()
+                            .h(px(12.))
+                            .font_family(theme::MONO)
+                            .text_size(px(10.))
+                            .line_height(px(12.))
+                            .text_color(rgb(palette.tile_number))
+                            .children(number),
+                    ),
+            );
+        div()
             .id(gpui::SharedString::from(id.clone()))
             .debug_selector(move || debug_id.clone())
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .role(Role::Button)
-            .track_focus(&self.action_control_focus(&id, cx))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                    && !event.keystroke.modifiers.platform
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                {
-                    if !event.is_held {
-                        this.run_home_action(keyboard_item.clone(), window, cx);
-                    }
-                    cx.stop_propagation();
-                }
-            }))
             .accessibility_id(format!("wiesel.action.{id}"))
             .aria_label(title.clone())
+            .aria_selected(selected)
             .when(loading, |d| {
                 d.aria_description("Working; the result will be pasted back")
             })
+            .when(!enabled, |d| {
+                d.aria_description("Select text in another app to use this action")
+            })
+            .w(px(HUD_SLOT_WIDTH))
+            .h(px(HUD_SLOT_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            // Hover and keyboard selection light the icon tile and label, not the slot.
+            // Hover never selects a disabled tile; the keyboard may, and sees it muted.
+            .when(enabled, |d| d.cursor_pointer().active(|s| s.opacity(0.8)))
+            .when((pasting && !loading) || !enabled, |d| d.opacity(0.4))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && enabled && this.hud_selected != slot {
+                    this.hud_selected = slot;
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
+                if !enabled {
+                    return;
+                }
+                this.hud_selected = slot;
                 this.run_home_action(item.clone(), window, cx);
-            }));
-        let add_hover = palette.empty_pad_hi;
-        column
+            }))
+            .child(square)
             .child(
-                theme::pad(pad, !add)
-                    .size(size)
+                div()
+                    .max_w(px(HUD_SLOT_WIDTH - 8.))
+                    .text_size(px(12.))
+                    .line_height(px(16.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if selected {
+                        palette.tile_label_selected
+                    } else {
+                        palette.tile_label
+                    }))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .child(title),
+            )
+            .into_any_element()
+    }
+    /// Status message on the left; key hints and the Settings gear on the right.
+    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
+        let palette = theme::p();
+        let wide = self.home_actions().len() >= 5;
+        let hint = |text: &'static str| {
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(palette.status_detail))
+                .child(text)
+        };
+        let count = self.home_actions().len().min(9);
+        div()
+            .debug_selector(|| "status-bar".into())
+            .h(px(HUD_STATUS_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .pl(px(18.))
+            .pr(px(8.))
+            .border_t_1()
+            .border_color(rgba(palette.status_edge))
+            .bg(rgba(palette.status_fill))
+            .child(
+                div()
+                    .id("status")
+                    .debug_selector(|| "status".into())
+                    .role(Role::Status)
+                    .accessibility_id("wiesel.status")
+                    .aria_label(
+                        self.notifications
+                            .description()
+                            .unwrap_or_else(|| "Ready".into()),
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.notifications.render()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    // The unlit "+" slot still invites a press.
-                    .when(add, |d| {
-                        d.cursor_pointer()
-                            .hover(move |s| s.bg(rgb(add_hover)).border_color(rgb(theme::PAD_GLOW)))
+                    .gap(px(12.))
+                    .when(wide && count > 0, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .child(theme::kbd(if count == 1 {
+                                    "1".to_owned()
+                                } else {
+                                    format!("1–{count}")
+                                }))
+                                .child(hint("run").pr(px(6.)))
+                                .child(theme::kbd("esc"))
+                                .child(hint("close")),
+                        )
                     })
-                    .child(if add {
-                        theme::icon(icon, 30.)
-                            .text_color(rgb(palette.add_icon))
-                            .into_any_element()
-                    } else if loading {
-                        theme::icon("loader", 26.)
-                            .debug_selector(move || format!("home-spinner-{slot}"))
-                            .text_color(rgb(theme::PAD_INK))
-                            .with_animation(
-                                "home-spinner",
-                                Animation::new(Duration::from_millis(900)).repeat(),
-                                |icon, delta| {
-                                    icon.with_transformation(Transformation::rotate(percentage(
-                                        delta,
-                                    )))
-                                },
+                    .child(
+                        div()
+                            .id("open-settings")
+                            .debug_selector(|| "open-settings".into())
+                            .role(Role::Button)
+                            .aria_label("Open Settings")
+                            .accessibility_id("wiesel.settings")
+                            .tooltip(|_, cx| cx.new(|_| HeaderTooltip("Settings (⌘,)")).into())
+                            .size(px(22.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(theme::p().tile_selected)))
+                            .child(
+                                theme::icon("settings", 15.).text_color(rgb(palette.status_label)),
                             )
-                            .into_any_element()
-                    } else {
-                        theme::icon(icon, 26.)
-                            .text_color(rgb(theme::PAD_INK))
-                            .into_any_element()
-                    }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_menu(MenuCommand::Settings, window, cx)
+                            })),
+                    ),
             )
-            .child(label(Some(title)))
-            .into_any_element()
+    }
+    /// The launcher window's size for the configured number of tiles.
+    fn hud_size(&self) -> Size<Pixels> {
+        hud_size(self.home_actions().len())
+    }
+    fn sync_hud_size(&self, window: &mut Window) {
+        let wanted = self.hud_size();
+        let current = window.bounds().size;
+        if (current.width - wanted.width).abs() > px(0.5)
+            || (current.height - wanted.height).abs() > px(0.5)
+        {
+            window.resize(wanted);
+            // AppKit resizes from the bottom-left corner; keep the launcher centered.
+            native::center(window);
+        }
     }
     fn chat(&self, cx: &mut Context<Self>) -> Div {
         div()
@@ -2826,7 +3281,7 @@ impl Wiesel {
                                                 d.w(relative(0.83))
                                                     .px(px(16.))
                                                     .py(px(12.))
-                                                    .rounded(px(6.))
+                                                    .rounded(px(14.))
                                                     .map(user_bubble)
                                             })
                                             .when(!user, |d| d.w_full())
@@ -2925,11 +3380,13 @@ impl Wiesel {
                                 }),
                             theme::Key::Blue,
                         )
-                        .w(px(76.))
-                        .h(px(38.))
-                        .text_size(px(10.))
+                        .h(px(32.))
+                        .px(px(14.))
                         .when(self.busy, |d| d.opacity(0.6))
-                        .child(if self.busy { "…" } else { "SEND" })
+                        .child(
+                            theme::icon("arrow-up", 14.).text_color(rgb(theme::Key::Blue.label())),
+                        )
+                        .child(if self.busy { "Sending…" } else { "Send" })
                         .on_click(cx.listener(|this, _, _, cx| this.send_chat(cx))),
                     ),
             )
@@ -2957,7 +3414,7 @@ impl Wiesel {
                                 .w(relative(0.83))
                                 .px(px(16.))
                                 .py(px(12.))
-                                .rounded(px(6.))
+                                .rounded(px(14.))
                                 .map(user_bubble)
                                 .flex()
                                 .flex_col()
@@ -2967,7 +3424,7 @@ impl Wiesel {
                                         .text_size(px(10.))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(theme::p().bubble_meta))
-                                        .child("YOU · SELECTED TEXT"),
+                                        .child("Selected text"),
                                 )
                                 .child(
                                     div()
@@ -2982,10 +3439,7 @@ impl Wiesel {
                             .flex()
                             .flex_col()
                             .gap(px(8.))
-                            .child(
-                                theme::silkscreen("Wiesel", theme::LOGO_RED)
-                                    .font_weight(FontWeight::BOLD),
-                            )
+                            .child(theme::silkscreen("Wiesel", theme::p().muted))
                             .child(div().text_size(px(14.)).line_height(px(21.)).child(
                                 if self.busy {
                                     String::new()
@@ -3025,15 +3479,25 @@ impl Wiesel {
             )
     }
 }
-pub(crate) const HEADER_HEIGHT: f32 = 56.;
-const TOOLBAR_HEIGHT: f32 = 44.;
-const HOME_PADDING_X: f32 = 26.;
-const HOME_PADDING_TOP: f32 = 27.;
-const HOME_PADDING_BOTTOM: f32 = 22.;
-const HOME_COLUMN_GAP: f32 = 16.;
-const HOME_ROW_GAP: f32 = 7.;
-const HOME_LABEL_GAP: f32 = 5.;
-const HOME_LABEL_HEIGHT: f32 = 12.;
+/// Height of a secondary window's title strip (traffic lights, title, status).
+pub(crate) const TITLEBAR_HEIGHT: f32 = 48.;
+const HUD_PADDING: f32 = 14.;
+const HUD_TILE: f32 = 76.;
+const HUD_TILE_GAP: f32 = 6.;
+const HUD_SLOT_WIDTH: f32 = 104.;
+const HUD_SLOT_HEIGHT: f32 = 120.;
+const HUD_STATUS_HEIGHT: f32 = 32.;
+const HUD_MIN_WIDTH: f32 = 360.;
+
+/// The launcher fits its tiles exactly: padding, slots and the status strip.
+fn hud_size(tiles: usize) -> Size<Pixels> {
+    let tiles = tiles as f32;
+    let width = 2. * HUD_PADDING + tiles * HUD_SLOT_WIDTH + (tiles - 1.).max(0.) * HUD_TILE_GAP;
+    size(
+        px(width.max(HUD_MIN_WIDTH)),
+        px(2. * HUD_PADDING - 2. + HUD_SLOT_HEIGHT + HUD_STATUS_HEIGHT),
+    )
+}
 
 /// Maps the printed pad numbers 1–9 to Home slots.
 fn home_slot_shortcut(key: &str) -> Option<usize> {
@@ -3044,11 +3508,16 @@ fn home_slot_shortcut(key: &str) -> Option<usize> {
 }
 
 impl Wiesel {
+    fn surface_title(&self, surface: Surface) -> String {
+        match surface {
+            Surface::Chat => "Chat".into(),
+            Surface::Writing if self.writing_title.is_empty() => "Result".into(),
+            Surface::Writing => self.writing_title.clone(),
+            Surface::Settings => self.screen_title(),
+        }
+    }
     fn screen_title(&self) -> String {
         match self.current_screen() {
-            Screen::Launcher => "Home".into(),
-            Screen::Chat => "Chat".into(),
-            Screen::Writing => self.writing_title.clone(),
             Screen::Settings => "Settings".into(),
             Screen::ActionManager => "Quick actions".into(),
             Screen::ActionEditor => if self
@@ -3076,91 +3545,53 @@ impl Wiesel {
             cx.notify();
         }
     }
-    /// Wordmark and status LED; the whole strip doubles as the window's drag handle.
-    fn header(&self) -> Div {
+    /// A secondary window's title strip: room for the traffic lights, Back on nested
+    /// Settings screens, the title, one screen command and the status line. The empty
+    /// title area doubles as the window's drag handle.
+    fn titlebar(&self, surface: Surface, cx: &mut Context<Self>) -> Div {
         let palette = theme::p();
-        div()
-            .debug_selector(|| "header".into())
-            .h(px(HEADER_HEIGHT))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.))
-            .pl(px(18.))
-            .pr(px(20.))
-            .bg(theme::vertical(palette.header, palette.header_hi, 1.))
-            .border_b_1()
-            .border_color(rgb(palette.header_edge))
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-            .child(
+        let nested = surface == Surface::Settings && !self.navigation.is_root();
+        let back = nested.then(|| {
+            theme::key(
                 div()
-                    .id("wordmark")
-                    .role(Role::Heading)
-                    .aria_label("Wiesel")
-                    .child(theme::wordmark(25.)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "status".into())
-                    .id("status")
-                    .role(Role::Status)
-                    .accessibility_id("wiesel.status")
-                    .min_w_0()
-                    .max_w(px(280.))
-                    .child(self.notifications.render(self.busy)),
-            )
-    }
-    /// Child screens get a Back key, their title and one screen-specific command.
-    fn toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let palette = theme::p();
-        let back = theme::key(
-            div()
-                .id("back")
-                .debug_selector(|| "back".into())
-                .role(Role::Button)
-                .aria_label("Back")
-                .accessibility_id("wiesel.navigation.back")
-                // Preserve the covered screen's focus before the click pops a route.
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .when(
-                    matches!(
-                        self.current_screen(),
-                        Screen::ActionEditor | Screen::ActionManager
-                    ),
-                    |d| d.track_focus(&self.action_control_focus("back", cx)),
-                )
-                .on_click(
-                    cx.listener(|this, event, window, cx| this.back_clicked(event, window, cx)),
-                )
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        && !event.keystroke.modifiers.platform
-                        && !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.alt
-                    {
-                        if !event.is_held {
-                            this.pop_screen(window, cx);
+                    .id("back")
+                    .debug_selector(|| "back".into())
+                    .role(Role::Button)
+                    .aria_label("Back")
+                    .accessibility_id("wiesel.navigation.back")
+                    // Preserve the covered screen's focus before the click pops a route.
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .track_focus(&self.action_control_focus("back", cx))
+                    .on_click(
+                        cx.listener(|this, event, window, cx| this.back_clicked(event, window, cx)),
+                    )
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            && !event.keystroke.modifiers.platform
+                            && !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.alt
+                        {
+                            if !event.is_held {
+                                this.pop_screen(window, cx);
+                            }
+                            cx.stop_propagation();
                         }
-                        cx.stop_propagation();
-                    }
-                })),
-            theme::Key::Grey,
-        )
-        .tooltip(|_, cx| cx.new(|_| HeaderTooltip("Back (Esc)")).into())
-        .h(px(24.))
-        .px(px(8.))
-        .child(theme::icon("arrow-left", 12.).text_color(rgb(theme::Key::Grey.label())))
-        .child("BACK");
-        let command = match self.current_screen() {
-            Screen::Chat => Some(
+                    })),
+                theme::Key::Grey,
+            )
+            .tooltip(|_, cx| cx.new(|_| HeaderTooltip("Back (Esc)")).into())
+            .size(px(26.))
+            .child(theme::icon("arrow-left", 14.).text_color(rgb(theme::Key::Grey.label())))
+        });
+        let command = match (surface, self.current_screen()) {
+            (Surface::Chat, _) => Some(
                 Self::button("new-chat", "New chat")
-                    .h(px(24.))
+                    .h(px(26.))
                     .px(px(10.))
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                     .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx))),
             ),
-            Screen::ActionManager => Some(
+            (Surface::Settings, Screen::ActionManager) => Some(
                 theme::key(
                     self.builder_button_base(
                         "new-action",
@@ -3170,33 +3601,80 @@ impl Wiesel {
                     ),
                     theme::Key::Grey,
                 )
-                .h(px(24.))
+                .h(px(26.))
                 .px(px(10.))
-                .child(theme::icon("plus", 11.).text_color(rgb(theme::Key::Grey.label())))
-                .child("NEW ACTION"),
+                .child(theme::icon("plus", 13.).text_color(rgb(theme::Key::Grey.label())))
+                .child("New action"),
             ),
             _ => None,
         };
         div()
             .debug_selector(|| "toolbar".into())
-            .h(px(TOOLBAR_HEIGHT))
+            .h(px(TITLEBAR_HEIGHT))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(12.))
-            .child(back)
+            .gap(px(10.))
+            .pl(px(84.))
+            .pr(px(12.))
+            .border_b_1()
+            .border_color(rgba(palette.border))
+            .children(back)
             .child(
-                div().flex_1().min_w_0().overflow_hidden().child(
-                    theme::silkscreen(self.screen_title(), palette.pad_title).text_ellipsis(),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .whitespace_nowrap()
+                            .child(self.surface_title(surface)),
+                    )
+                    .child(
+                        div()
+                            .id("status")
+                            .debug_selector(|| "status".into())
+                            .role(Role::Status)
+                            .accessibility_id("wiesel.status")
+                            .aria_label(
+                                self.notifications
+                                    .description()
+                                    .unwrap_or_else(|| "Ready".into()),
+                            )
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .justify_end()
+                            .child(self.notifications.render()),
+                    ),
             )
             .children(command)
     }
     fn dispatch_menu(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
+        // Settings-window commands run inside that window when it is open, so dirty-editor
+        // confirmations and focus restoration stay there.
+        if matches!(
+            command,
+            MenuCommand::Settings | MenuCommand::QuickActions | MenuCommand::NewAction
+        ) && self.route_to_settings(window, cx, move |this, window, cx| {
+            this.dispatch_menu(command, window, cx)
+        }) {
+            return;
+        }
         self.notifications.suppress_motion = true;
         // Menu commands have no outside mouse-down, so dismiss editor popups explicitly
         // before another screen covers them.
-        if self.current_screen() == Screen::ActionEditor && self.actions.dialog.is_none() {
+        if self.current_screen() == Screen::ActionEditor
+            && self.actions.dialog.is_none()
+            && self.window_is(Surface::Settings, window)
+        {
             while self.close_editor_popup(window, cx) {}
         }
         match command {
@@ -3206,11 +3684,12 @@ impl Wiesel {
                 self.builder_command(action_builder::Command::New, window, cx)
             }
             MenuCommand::NewChat => {
-                if self.current_screen() != Screen::Chat {
+                if !self.is_open(Surface::Chat) {
                     self.run_quick_action(QuickAction::Chat, window, cx);
                 }
-                if self.current_screen() == Screen::Chat {
+                if self.is_open(Surface::Chat) {
                     self.new_chat(cx);
+                    self.open_chat(window, cx);
                 }
             }
         }
@@ -3219,59 +3698,9 @@ impl Wiesel {
         self.notifications.suppress_motion = false;
         cx.notify();
     }
-}
-#[derive(Clone, Copy)]
-enum MenuCommand {
-    Settings,
-    QuickActions,
-    NewAction,
-    NewChat,
-}
-impl Render for Wiesel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        theme::set_appearance(self.settings.appearance, window.appearance());
-        let palette = theme::p();
-        self.notifications
-            .update(Instant::now(), self.idle_notification());
-        let launcher = self.current_screen() == Screen::Launcher;
-        let content = match self.current_screen() {
-            Screen::Settings => self.setup(cx).into_any_element(),
-            Screen::Launcher => self.launcher(window, cx).into_any_element(),
-            Screen::Chat => self.chat(cx).into_any_element(),
-            Screen::Writing => self.writing_view(cx).into_any_element(),
-            Screen::ActionManager => self.action_manager(cx).into_any_element(),
-            Screen::ActionEditor => self.action_editor(cx).into_any_element(),
-        };
-        div()
-            .id("wiesel-root")
-            .role(Role::Group)
-            .accessibility_id(match self.current_screen() {
-                Screen::Settings => "wiesel.page.setup",
-                Screen::Launcher => "wiesel.page.launcher",
-                Screen::Chat => "wiesel.page.chat",
-                Screen::Writing => "wiesel.page.writing",
-                Screen::ActionManager => "wiesel.page.actions",
-                Screen::ActionEditor => "wiesel.page.action-editor",
-            })
-            .aria_label("Wiesel")
-            .aria_description(match (self.authenticated, self.busy) {
-                (true, false) => "Signed in; request idle",
-                (true, true) => "Signed in; request pending",
-                (false, false) => "Signed out; request idle",
-                (false, true) => "Signed out; request pending",
-            })
-            .relative()
-            .size_full()
-            .rounded(px(14.))
-            .overflow_hidden()
-            .bg(theme::vertical(palette.chassis_hi, palette.chassis, 1.))
-            .text_color(rgb(palette.foreground))
-            .font_family(theme::SANS)
-            .text_size(px(13.))
-            .flex()
-            .flex_col()
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::key_down))
+    /// Menu and window commands every window's root handles.
+    fn window_actions<E: InteractiveElement>(&self, element: E, cx: &mut Context<Self>) -> E {
+        element
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.dispatch_menu(MenuCommand::Settings, window, cx)
             }))
@@ -3284,33 +3713,118 @@ impl Render for Wiesel {
             .on_action(cx.listener(|this, _: &NewChat, window, cx| {
                 this.dispatch_menu(MenuCommand::NewChat, window, cx)
             }))
-            .child(self.header())
+    }
+    fn render_surface(
+        &mut self,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        theme::set_appearance(self.settings.appearance, window.appearance());
+        let palette = theme::p();
+        self.notifications
+            .update(Instant::now(), self.idle_notification());
+        let content = match surface {
+            Surface::Settings => match self.current_screen() {
+                Screen::Settings => self.setup(cx).into_any_element(),
+                Screen::ActionManager => self.action_manager(cx).into_any_element(),
+                Screen::ActionEditor => self.action_editor(cx).into_any_element(),
+            },
+            Surface::Chat => self.chat(cx).into_any_element(),
+            Surface::Writing => self.writing_view(cx).into_any_element(),
+        };
+        let page = match (surface, self.current_screen()) {
+            (Surface::Settings, Screen::Settings) => "wiesel.page.setup",
+            (Surface::Settings, Screen::ActionManager) => "wiesel.page.actions",
+            (Surface::Settings, Screen::ActionEditor) => "wiesel.page.action-editor",
+            (Surface::Chat, _) => "wiesel.page.chat",
+            (Surface::Writing, _) => "wiesel.page.writing",
+        };
+        let root = div()
+            .id(("wiesel-surface", surface.index()))
+            .role(Role::Group)
+            .accessibility_id(page)
+            .aria_label(self.surface_title(surface))
+            .aria_description(self.request_description())
+            .relative()
+            .size_full()
+            .bg(rgb(palette.background))
+            .text_color(rgb(palette.foreground))
+            .font_family(theme::SANS)
+            .text_size(px(13.))
+            .flex()
+            .flex_col()
+            .track_focus(&self.surface_focus(surface))
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.surface_key_down(surface, event, window, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &CloseWindow, window, cx| {
+                this.request_close(surface, window, cx)
+            }))
+            .child(self.titlebar(surface, cx))
             .child(
-                // Pads sit straight on the chassis; everything else on a sheet of paper.
                 div()
                     .debug_selector(|| "deck".into())
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .map(|d| {
-                        if launcher {
-                            return d.child(content);
-                        }
-                        d.child(self.toolbar(cx)).px(px(16.)).pb(px(16.)).child(
-                            theme::paper()
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_hidden()
-                                .flex()
-                                .flex_col()
-                                .child(content),
-                        )
-                    }),
+                    .child(content),
             )
-            .when(self.actions.dialog.is_some(), |d| {
-                d.child(self.action_dialog(cx))
-            })
+            .when(
+                surface == Surface::Settings && self.actions.dialog.is_some(),
+                |d| d.child(self.action_dialog(cx)),
+            );
+        self.window_actions(root, cx).into_any_element()
+    }
+}
+impl Wiesel {
+    /// Every window's root announces sign-in and request state (read by the UI smoke test).
+    fn request_description(&self) -> &'static str {
+        match (self.authenticated, self.busy) {
+            (true, false) => "Signed in; request idle",
+            (true, true) => "Signed in; request pending",
+            (false, false) => "Signed out; request idle",
+            (false, true) => "Signed out; request pending",
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum MenuCommand {
+    Settings,
+    QuickActions,
+    NewAction,
+    NewChat,
+}
+/// The launcher HUD: glass over the window's native blur, tiles above a status strip.
+impl Render for Wiesel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        theme::set_appearance(self.settings.appearance, window.appearance());
+        let palette = theme::p();
+        self.notifications
+            .update(Instant::now(), self.idle_notification());
+        let root = div()
+            .id("wiesel-root")
+            .role(Role::Group)
+            .accessibility_id("wiesel.page.launcher")
+            .aria_label("Wiesel")
+            .aria_description(self.request_description())
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(rgba(palette.hud_tint))
+            .text_color(rgb(palette.foreground))
+            .font_family(theme::SANS)
+            .text_size(px(13.))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key_down))
+            .on_action(cx.listener(|this, _: &CloseWindow, _, cx| this.escape_hud(cx)))
+            .child(self.launcher(cx))
+            .child(self.status_bar(cx));
+        self.window_actions(root, cx)
     }
 }
 #[cfg(test)]
@@ -3368,9 +3882,6 @@ mod diagnostic_integration_tests {
     }
 }
 
-const WINDOW_WIDTH: f32 = 486.;
-const WINDOW_HEIGHT: f32 = 573.;
-
 /// The macOS menu bar: Settings and quick-action management live here, not on screen.
 fn app_menus() -> Vec<gpui::Menu> {
     use gpui::{Menu, MenuItem};
@@ -3387,6 +3898,8 @@ fn app_menus() -> Vec<gpui::Menu> {
         Menu::new("File").items([
             MenuItem::action("New Chat", NewChat),
             MenuItem::action("New Quick Action…", NewQuickAction),
+            MenuItem::separator(),
+            MenuItem::action("Close Window", CloseWindow),
         ]),
         Menu::new("Edit").items([
             MenuItem::action("Cut", input::Cut),
@@ -3423,6 +3936,14 @@ fn main() {
             let _ = url_tx.try_send(raw);
         }
     });
+    // Clicking the Dock icon with no window on screen brings the launcher back.
+    let reopen_hud = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::WindowHandle<Wiesel>>));
+    let reopen = reopen_hud.clone();
+    application.on_reopen(move |cx| {
+        if let Some(handle) = reopen.get() {
+            let _ = handle.update(cx, |app, window, cx| app.show_hud(window, cx));
+        }
+    });
     application.run(move |cx: &mut App| {
         cx.set_reduce_motion(
             objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
@@ -3448,10 +3969,12 @@ fn main() {
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-n", NewChat, None),
             KeyBinding::new("cmd-h", HideWiesel, None),
+            KeyBinding::new("cmd-w", CloseWindow, None),
         ]);
         cx.on_action(|_: &HideWiesel, cx| cx.hide());
         cx.set_menus(app_menus());
-        let window_size = size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT));
+        // The launcher is a borderless HUD over the desktop's native blur, like cmd+tab.
+        let window_size = hud_size(quick_actions::QUICK_ACTIONS.len());
         let bounds = Bounds::centered(None, window_size, cx);
         let handle = match cx.open_window(
             WindowOptions {
@@ -3460,7 +3983,7 @@ fn main() {
                 app_owns_titlebar_drag: true,
                 is_resizable: false,
                 is_minimizable: false,
-                window_min_size: Some(window_size),
+                window_background: WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
             |window, cx| {
@@ -3479,6 +4002,7 @@ fn main() {
                 return;
             }
         };
+        reopen_hud.set(Some(handle));
         cx.bind_keys([KeyBinding::new("cmd-shift-l", Login, None)]);
         cx.on_action(move |_: &Login, cx| {
             let _ = handle.update(cx, |app, window, cx| {

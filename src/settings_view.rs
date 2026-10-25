@@ -85,11 +85,11 @@ fn section(title: &'static str, rows: Vec<Stateful<Div>>) -> Div {
                 .aria_label(title)
                 .flex()
                 .flex_col()
-                .rounded(px(6.))
+                .rounded(px(10.))
                 .bg(rgb(palette.card))
                 .border_1()
                 .border_color(rgba(palette.border))
-                .shadow(vec![theme::shadow(0., 1., 0., 0., palette.edge_highlight)])
+                .shadow(vec![theme::shadow(0., 1., 2., 0., 0x0000000a)])
                 .children(rows.into_iter().enumerate().map(move |(index, row)| {
                     // Inset hairlines between rows, none after the last.
                     row.when(index + 1 < count, |row| {
@@ -157,18 +157,18 @@ fn segment(id: &'static str, title: &'static str, active: bool) -> Stateful<Div>
         .items_center()
         .justify_center()
         .gap(px(8.))
-        .rounded(px(3.))
+        .rounded(px(5.))
         .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .map(|d| {
             if active {
-                d.bg(rgb(palette.card))
-                    .border_1()
-                    .border_color(rgba(palette.border))
-                    .shadow(vec![
-                        theme::shadow(0., 1., 2., 0., 0x0000001f),
-                        theme::shadow(0., 1., 0., 0., palette.edge_highlight),
-                    ])
+                d.bg(rgb(if palette.dark {
+                    palette.accent
+                } else {
+                    palette.background
+                }))
+                .shadow(vec![theme::shadow(0., 1., 2., 0., 0x0000001f)])
             } else {
                 d.text_color(rgb(palette.muted))
                     .hover(|s| s.text_color(rgb(theme::p().foreground)))
@@ -184,12 +184,16 @@ fn segmented(id: &'static str, role: Role, label: &'static str) -> Stateful<Div>
         .role(role)
         .aria_label(label)
         .flex()
-        .p(px(2.))
+        .p(px(3.))
         .gap(px(2.))
-        .rounded(px(5.))
-        .bg(rgb(palette.field))
+        .rounded(px(8.))
+        .bg(rgb(if palette.dark {
+            palette.card
+        } else {
+            palette.accent
+        }))
         .border_1()
-        .border_color(rgba(palette.input_border))
+        .border_color(rgba(palette.border))
 }
 
 /// Read-only value on the right of a row.
@@ -232,11 +236,12 @@ impl Wiesel {
                         ))
                     })
                     .child(section("Providers", self.provider_rows(cx)))
-                    .child(section("Models", self.model_rows(cx)))
                     .child(section(
                         "General",
                         vec![self.shortcut_row(cx), self.appearance_row(cx)],
                     ))
+                    .child(section("Quick actions", self.quick_action_rows(cx)))
+                    .child(section("Models", self.model_rows(cx)))
                     .child(section("Permissions", vec![self.accessibility_row()]))
                     .child(section("Diagnostics", vec![self.diagnostics_row(cx)])),
             )
@@ -246,7 +251,89 @@ impl Wiesel {
         self.recording = true;
         self.notifications
             .info("Press your new shortcut. Esc cancels.");
-        window.focus(&self.focus, cx);
+        let focus = self.surface_focus(Surface::Settings);
+        self.focus_in(Surface::Settings, focus, window, cx);
+        cx.notify();
+    }
+
+    /// How many tiles the launcher shows, and the entry into managing them.
+    fn quick_action_rows(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let total = self.settings.actions().len();
+        let options = settings::QUICK_ACTION_COUNTS.into_iter().map(|count| {
+            let id: &'static str = match count {
+                3 => "quick-action-count-3",
+                5 => "quick-action-count-5",
+                _ => "quick-action-count-8",
+            };
+            let title: &'static str = match count {
+                3 => "3",
+                5 => "5",
+                _ => "8",
+            };
+            segment(id, title, self.settings.quick_action_count == count)
+                .role(Role::RadioButton)
+                .w(px(44.))
+                .flex_none()
+                .child(title)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.apply_quick_action_count(count, cx)),
+                )
+        });
+        let shown = total.min(self.settings.quick_action_count);
+        vec![
+            row(
+                "Launcher size",
+                Some(
+                    if total > shown {
+                        format!("Shows the first {shown} of your {total} actions.")
+                    } else {
+                        "How many actions the launcher shows.".to_owned()
+                    }
+                    .into(),
+                ),
+                segmented("quick-action-count", Role::RadioGroup, "Launcher size")
+                    .children(options),
+            ),
+            row(
+                "Actions",
+                Some(format!("{total} configured · add more from File → New Quick Action…").into()),
+                Self::button("manage-actions", "Manage…")
+                    .aria_label("Manage quick actions")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_action_manager(window, cx)),
+                    ),
+            ),
+        ]
+    }
+
+    fn apply_quick_action_count(&mut self, count: usize, cx: &mut Context<Self>) {
+        if self.settings.quick_action_count == count {
+            return;
+        }
+        if self.actions.read_only {
+            self.notifications
+                .warning("Saving is disabled. Repair the settings file and relaunch.");
+            cx.notify();
+            return;
+        }
+        let mut next = self.settings.clone();
+        next.quick_action_count = count;
+        match self.persist_settings(&next) {
+            Ok(()) => {
+                self.record_diagnostic(Event::new(Category::Settings, EventKind::Succeeded));
+                self.notifications.clear(Source::Settings);
+                self.settings = next;
+                self.hud_selected = 0;
+            }
+            Err(e) => {
+                self.record_diagnostic(Event::failure(Category::Settings, FailureCode::Storage));
+                self.notifications.report(
+                    Source::Settings,
+                    "Could not save the launcher size. Try again.",
+                    &e,
+                );
+            }
+        }
         cx.notify();
     }
 
@@ -387,7 +474,7 @@ impl Wiesel {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(4.))
+            .rounded(px(6.))
             .bg(rgb(palette.field))
             .border_1()
             .map(|d| {

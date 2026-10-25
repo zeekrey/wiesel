@@ -1,16 +1,54 @@
-# Rooted navigation
+# Windows and navigation
+
+Wiesel has one state owner, the `Wiesel` entity in `src/main.rs`, and several
+windows that render from it:
+
+- **Launcher HUD**: `Wiesel`'s own window. A borderless, blurred panel modeled on the
+  macOS cmd+tab switcher: one row of quick-action tiles above a slim status strip
+  with the Settings gear. It shows the first `Settings::quick_action_count` actions
+  (3, 5 or 8, chosen in Settings). There is no "add" tile; new actions come from
+  **File → New Quick Action…** or Settings.
+- **Surfaces** (`enum Surface`): Settings, Chat and Writing (a quick action's result).
+  Each is a singleton window whose root view (`SurfaceView`) only forwards rendering
+  to `Wiesel::render_surface`. Closing one drops the window, never its state: chat
+  history, drafts, failed messages and the last result survive and reappear when the
+  window opens again.
+
+## Opening and closing windows
+
+- `open_surface(surface, focus, cx)` opens or activates a surface and focuses
+  `focus` (or the window's root focus) inside it. GPUI renders a window as soon as it
+  opens, which would re-enter `Wiesel` mid-update, so the window is created in a
+  deferred effect. Until then `Surfaces::opening` marks it as open, so `is_open`
+  is true at once. Closing a surface that is still opening cancels the open.
+- `focus_in(surface, focus, window, cx)` focuses directly when `window` already is
+  that surface's window, otherwise it opens/activates the surface with a pending
+  focus.
+- `route_to_settings(window, cx, operation)` re-runs a Settings operation inside the
+  Settings window when it was triggered from another window (menu, ⌘⇧L, a login
+  callback). Focus capture, focus restoration and confirmation dialogs then act on the
+  Settings window.
+- `close_surface` / `forget_surface` drop a window. Closing Settings unmounts its
+  stack (see below), stops shortcut recording and cancels a pending browser login.
+  `surface_should_close` backs the close button, ⌘W and Escape at a root. Settings
+  first asks to discard a dirty action draft (`Removal::Close`).
+- Opening any surface dismisses the HUD (`dismiss_hud` orders the HUD window out
+  without hiding the app). The global shortcut calls `show_hud`, which re-centers the
+  HUD, highlights the first tile and focuses it. Other windows keep their state.
+  Clicking the Dock icon with nothing on screen also shows the HUD.
+
+## The Settings stack
 
 `src/navigation.rs` provides `Navigation<T, L>`, a UI-independent stack of owned
-components and owner-defined pop lifecycle data. `Wiesel::navigation` is the only
-route authority; `Screen` is a component discriminator, not a second page state.
-Home/Launcher is always the permanent root, including before login/onboarding.
-Settings (also the setup screen), Chat and Writing are children.
+components and owner-defined pop lifecycle data. `Wiesel::navigation` is the
+**Settings window's** stack: `Screen::Settings` is its permanent root, with
+`Screen::ActionManager` (Quick actions) and `Screen::ActionEditor` as children.
+`current_screen()` is the stack's top (Settings while the window is closed).
 
-## Stack API
+### Stack API
 
 - `Navigation::new(root)` mounts the permanent root with no pop lifecycle.
 - `push(component, on_pop) -> EntryId` mounts a child with a fresh identity.
-  `T` can be a screen enum, an owned screen-state value, or a GPUI entity.
 - `current()` / `root()` return immutable `Entry<T, L>` references. Entries expose
   `id`, `component` and `on_pop: Option<L>`; the root's lifecycle is `None`.
 - `entries()` iterates mounted entries from root to current. `depth()` includes
@@ -24,136 +62,112 @@ Settings (also the setup screen), Chat and Writing are children.
   return removed entries in top-to-bottom order.
 
 `L` is the Rust equivalent of `onPop`: the owner consumes the returned lifecycle
-once, with its application/window context, after each explicit removal. This
-avoids a closure holding/reentering a GPUI entity while it is being updated. The
-stack itself does not run callbacks on drop. A caller must process **every**
-returned entry, including entries from multi-pop. Root cannot be removed,
-mutated through this API, or replaced. Entry identities are never reused within
-one navigation instance.
+once, with its application/window context, after each explicit removal. A caller
+must process **every** returned entry, including entries from multi-pop. Entry
+identities are never reused within one navigation instance.
 
-## Wiesel integration API
+### Wiesel integration
 
-All route-changing UI handlers use these owner helpers in `src/main.rs`:
-
-- `current_screen()` derives the visible screen from `navigation.current()`.
-- `push_screen(screen, startup, window, cx)` preserves retained domain state,
-  snapshots the covered screen's focus, then focuses the new screen. Pushing
-  Launcher instead unwinds to the permanent root; pushing current is a no-op.
-- `push_settings(startup, window, cx)` is the Settings singleton entry point.
-  Current Settings activation is a no-op. If Settings exists below current,
-  intervening screens are popped via `pop_to_screen` to reveal it, not duplicated.
+- `push_screen(screen, window, cx)` opens the Settings window if needed, snapshots
+  the covered screen's focus (only when called from the Settings window) and focuses
+  the new screen. Pushing the current screen is a no-op.
+- `push_settings(startup, window, cx)` is the Settings entry point. It reveals the
+  root by popping intervening screens via `pop_to_screen` instead of stacking a
+  duplicate. `startup` marks Settings opened for setup at launch
+  (`settings_startup`).
+- `open_action_manager` reveals or pushes Quick actions; it is a singleton.
 - `pop_screen(window, cx) -> bool` processes one lifecycle, restores the covered
-  focus, and returns false at root. `pop_to_screen` and `pop_to_root` process the
-  same lifecycle for each removed child.
-- `ScreenLifecycle` records `restore_focus` and whether Settings was pushed for
-  startup. `finish_pop` cancels an active browser login only when leaving Settings
-  and exits shortcut recording. It does **not** cancel inference.
+  focus and returns false at the Settings root.
+- `finish_pop` clears the action editor when its entry is removed; leaving Settings
+  stops recording and cancels a pending browser login. It does **not** cancel
+  inference.
 
-Toolbar navigation controls prevent mouse-down's default focus transfer, so the
-push snapshots the input that was actually focused, not the root handle. Every
-child screen shows Back in its toolbar, and it works while inference is busy.
-Save Settings pops Settings to its underlying screen rather than resetting the
-stack to Home. Settings and quick-action management are macOS menu commands
-(`OpenSettings`, `AdjustQuickActions`) handled on the root view; both are
-singletons that reveal an existing entry instead of stacking a duplicate
-(`push_settings`, `open_action_manager`), remain usable while inference is busy,
-and first close any action-editor popup, since a menu click has no outside
-mouse-down to dismiss it.
+Back in the Settings title bar prevents mouse-down's default focus transfer, so the
+push snapshots the input that was actually focused. Settings, Quick actions and New
+Quick Action are menu commands handled on every window's root and routed into the
+Settings window; they remain usable while inference is busy and first close any
+action-editor popup.
 
-### New screens and dirty editors
+### Dirty editors
 
-New screens should add one `Screen` component variant, rendering/focus behavior,
-and use the helpers above; do not add authoritative route booleans or another
-page field. Screen-local entities/state may be carried in the component payload;
-app-owned retained domains may outlive mounting when explicitly intended.
-Non-inference screens/local editing must not be gated by the inference busy flag.
+**Preflight the whole removal before calling pop/pop-to-existing/closing if any
+removed screen can discard unsaved state.** `guard_action_removal` asks before a
+dirty action draft is removed by Back/Escape (`Removal::One`), by revealing a lower
+screen (`Removal::To`) or by closing the window (`Removal::Close`). If denied, the
+stack and window stay unchanged.
 
-**Preflight the whole removal before calling pop/pop-to-existing/pop-to-root if
-any removed screen can discard unsaved state.** Built-in Chat/Writing/Settings
-state is retained outside the mounted entries, so today's transitions are safe.
-A new destructive editor must obtain its dirty-editor confirmation before
-invoking these helpers (including Settings activation and hotkey root activation).
-If denied or unsafe, leave the stack unchanged. Do not pop some entries, then ask
-about later ones. The generic stack cannot make product-specific dirty decisions.
-Settings must use `push_settings`, not an unconditional direct Settings push.
+## Keys
 
-## Escape and activation
+Launcher HUD:
 
-Key handling is deliberately layered:
+1. `1`–`9` run the tile printed with that number.
+2. ←/→ and Tab/⇧Tab move the highlight (wrapping); Enter or Space runs it. Hovering a
+   tile highlights it too.
+   Tiles whose instructions use `{selection}` (and paste-back tiles) are muted and do
+   nothing until text has been captured.
+3. Escape dismisses the HUD. With no other window open it hides Wiesel instead, so
+   focus returns to the previous app.
 
-1. Shortcut recording consumes Escape to stop recording, without navigation.
-2. A focused child popover/modal consumes Escape before the parent's bubbling
-   handler. The existing ModelPicker closes itself this way. New overlays must
-   likewise stop propagation when dismissing.
-3. Otherwise Escape pops **one** child and restores focus, including Settings.
-4. At root Escape requests application hiding; it never underflows the stack.
+Settings window, in order of precedence:
 
-Hide (Wiesel menu, ⌘H) hides without changing navigation or clearing drafts. Completed global
-hotkey selection capture activates Home by unwinding idle non-Settings screens.
-It retains Settings (onboarding/editing) and retains the current route while an
-inference is busy. This preserves the prior intentional hotkey behavior, now via
-stack removal/lifecycles rather than page replacement. Selection snapshots used
-by an existing Writing request are not replaced by a later activation.
+1. Shortcut recording consumes Escape to stop recording.
+2. A focused popover or confirmation consumes Escape before the window does.
+3. Otherwise Escape pops **one** screen and restores focus; at the Settings root it
+   closes the window.
 
-Startup pushes setup Settings over Home. Verification of a saved/successfully
-persisted login may pop **only current startup Settings**, and only when login,
-onboarding and registered-hotkey requirements are met. Explicitly opened Settings
-never auto-pops, and startup Settings below another screen is never implicitly
-removed. Authentication changes do not replace/reset the navigation stack.
-Leaving setup does not bypass inference gates: requests still require verified
-login, a valid credential and completed onboarding.
+Chat and Writing: Escape closes the window. ⌘W closes any secondary window (with the
+same dirty-draft confirmation for Settings) and dismisses the HUD.
+
+## Startup
+
+Startup opens setup Settings over the HUD. Verification of a saved or freshly
+persisted login closes Settings again **only** when it is still the startup window,
+on its root, and login, onboarding and the registered shortcut are in place. An
+explicitly opened Settings window never closes itself. Leaving setup does not bypass
+inference gates: requests still require verified login (or a local model), a valid
+credential and completed onboarding.
 
 ## Retained state and asynchronous ownership
 
-Navigation-only cover/pop/hide preserves Chat composer text/selection, messages,
-failed drafts, scroll handle/reader position, Launcher draft, Settings fields,
-and Writing source/title/result. Chat and Writing are retained app-owned domains,
-not recreated on every entry push. A deliberate New Chat or nonempty Home
-submission can replace chat history, but only when no physical inference is pending.
+Closing or covering windows preserves Chat composer text/selection, messages,
+failed drafts, scroll position, Settings fields and Writing source/title/result.
+A deliberate New Chat can replace chat history, but only when no physical inference
+is pending.
 
 Every inference scope carries login generation/device plus a `CompletionScope`
-(originating `EntryId` and monotonic request generation). `active_request` owns
-one physical inference slot, even after its screen is popped. Navigation/Settings
-remains available, but another inference and New Chat replacement remain blocked
-until its terminal result. Reopening a retained domain can intentionally expose
-its completed state; completion never pushes a route or resurrects a removed entry.
-Same-session covered/popped successes update only that retained domain; failures
-recover the failed draft without overwriting a newer draft. Replayed events from
-an older request cannot modify/release a newer request's slot.
+(an `EntryId` and monotonic request generation). `active_request` owns one physical
+inference slot, even after its window closes. Navigation and Settings remain
+available, but another inference and New Chat replacement remain blocked until its
+terminal result. Completion never opens a window by itself, except that a failed
+paste-back opens Writing so the result is not lost. Replayed events from an older
+request cannot modify or release a newer request's slot.
 
 ### Account-privacy exception
 
 Actual session end/signout/revocation is not navigation-only. `end_session_state`
-clears private Chat/Home drafts, history/failed drafts/previews, Writing source,
-result/title and captured selection/snapshots immediately, while leaving routes
+clears private Chat drafts, history/failed drafts/previews, Writing source,
+result/title and captured selection/snapshots immediately, while leaving windows
 and Settings/instructions intact. It does not touch the OS clipboard, persisted
 settings/actions or diagnostic files. Native credential cleanup remains in the
 existing production `clear_session` path, separate from this in-memory boundary.
 
 Session end invalidates capture identity but keeps draining the physical Copy
 capture until clipboard restoration completes. A late capture cannot restore
-ended-session selection or activate/change routes. It also retains the physical
-inference slot: stale deltas and reply/error payloads are discarded, while the
-**exact originating terminal event** can release that slot despite its stale login
-scope. It cannot release a different/newer slot, recover old private drafts or
-revive credentials/history/routes. A replacement login alone does not permit a
-second physical request. These rules add no retry or provider cancellation, and
-make no billing-outcome guarantee.
+ended-session selection or show the HUD. It also retains the physical inference
+slot: stale deltas and reply/error payloads are discarded, while the **exact
+originating terminal event** can release that slot despite its stale login scope.
 
 ## Verification boundary
 
-`src/navigation.rs` has ordinary Rust tests for root, identities, retained owned
-state, lifecycle order and atomic unknown-target handling. `src/chat_tests.rs`
-uses real GPUI fixture clicks/typing/Enter/Escape plus `ControlledBackend` releases
-for nested navigation, focus/draft/selection/history/scroll restoration, overlay
-precedence, singleton Settings, startup gating and covered/popped/stale requests.
-Ephemeral session/capture tests avoid Keychain/native capture/model refresh and
-exercise the production in-memory/event paths.
+`src/navigation.rs` has ordinary Rust tests for the stack. `src/surface_tests.rs`
+covers the HUD row, launcher size, keys, and opening/closing the secondary windows.
+`src/chat_tests.rs` and `src/action_builder_tests.rs` drive Chat, Settings and the
+action editor through real GPUI clicks and keystrokes. `src/test_support.rs` routes
+input to the window that renders a control (or to the key window for typing).
 
-GPUI's TestPlatform has no native rendering and its `hide()` is unimplemented.
-Ephemeral fixtures opt into a test-only hide recorder; real root Escape reaches
-the production navigation handler and records hide **intent**, not native hiding.
-Production/uninjected paths still call `cx.hide()`. No native launch, live inference,
-user settings/credential read, clipboard operation or hotkey registration is
-performed by these fixtures. See [testing.md](testing.md) for the separate native
-smoke authorization and evidence boundary.
+GPUI's TestPlatform has no native rendering, and its windows have no AppKit handle,
+so ordering the HUD out and centering it are no-ops in tests (the `hud_visible` flag
+records intent). Root Escape records hide **intent** through a test-only recorder.
+No native launch, live inference, user settings/credential read, clipboard
+operation or hotkey registration is performed by these fixtures. See
+[testing.md](testing.md) for the separate native smoke authorization boundary.

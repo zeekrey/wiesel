@@ -49,13 +49,6 @@ impl<T, L> Navigation<T, L> {
         std::iter::once(&self.root).chain(self.children.iter())
     }
 
-    /// Update owner lifecycle data without exposing mutable routes or entry identities.
-    pub fn lifecycles_mut(&mut self) -> impl Iterator<Item = &mut L> {
-        self.children
-            .iter_mut()
-            .filter_map(|entry| entry.on_pop.as_mut())
-    }
-
     pub fn is_root(&self) -> bool {
         self.children.is_empty()
     }
@@ -185,31 +178,5 @@ mod tests {
         assert!(navigation.pop_to(EntryId(999)).is_none());
         assert_eq!(navigation.depth(), 2);
         assert_eq!(navigation.current().id, settings);
-    }
-    #[test]
-    fn lifecycle_updates_preserve_root_routes_and_entry_identities() {
-        let mut navigation = Navigation::new("Home");
-        navigation.push("Manager", "deleted control");
-        navigation.push("Settings", "surviving control");
-        let before = navigation
-            .entries()
-            .map(|entry| (entry.id, entry.component))
-            .collect::<Vec<_>>();
-        for lifecycle in navigation.lifecycles_mut() {
-            if *lifecycle == "deleted control" {
-                *lifecycle = "Home input";
-            }
-        }
-        assert_eq!(
-            navigation
-                .entries()
-                .map(|entry| (entry.id, entry.component))
-                .collect::<Vec<_>>(),
-            before
-        );
-        assert!(navigation.root().on_pop.is_none());
-        assert_eq!(navigation.pop().unwrap().on_pop, Some("surviving control"));
-        assert_eq!(navigation.pop().unwrap().on_pop, Some("Home input"));
-        assert!(navigation.is_root());
     }
 }
