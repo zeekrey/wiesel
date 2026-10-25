@@ -2992,17 +2992,17 @@ impl Wiesel {
             div()
                 .debug_selector(move || format!("home-spinner-{slot}"))
                 .relative()
-                .size(px(30.))
+                .size(px(26.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .child(
-                    theme::icon("spinner-track", 24.)
+                    theme::icon("spinner-track", 22.)
                         .absolute()
                         .text_color(rgba((ink << 8) | 0x29)),
                 )
                 .child(
-                    theme::icon("spinner-arc", 24.)
+                    theme::icon("spinner-arc", 22.)
                         .absolute()
                         .text_color(rgb(ink))
                         .with_animation(
@@ -3015,29 +3015,33 @@ impl Wiesel {
                 )
                 .into_any_element()
         } else {
-            theme::icon(icon, 30.)
-                .text_color(rgb(ink))
+            // The glyph rests a shade quieter and lights up with its tile.
+            theme::icon(icon, 26.)
+                .text_color(rgb(if selected { ink } else { palette.tile_ink_rest }))
                 .into_any_element()
         };
         // Every tile is printed with its position; 1–9 double as keyboard shortcuts.
         let number = (slot < 9).then(|| (slot + 1).to_string());
         let square = theme::tile(div().id(("home-tile", slot)), selected)
             .size(px(HUD_TILE))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(5.))
-            .pt(px(4.))
-            .child(glyph)
             .child(
-                div()
-                    .h(px(12.))
-                    .font_family(theme::MONO)
-                    .text_size(px(10.))
-                    .line_height(px(12.))
-                    .text_color(rgb(palette.tile_number))
-                    .children(number),
+                theme::tile_well()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.))
+                    .pt(px(3.))
+                    .child(glyph)
+                    .child(
+                        div()
+                            .h(px(12.))
+                            .font_family(theme::MONO)
+                            .text_size(px(10.))
+                            .line_height(px(12.))
+                            .text_color(rgb(palette.tile_number))
+                            .children(number),
+                    ),
             );
         div()
             .id(gpui::SharedString::from(id.clone()))

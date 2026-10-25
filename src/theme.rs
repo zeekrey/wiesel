@@ -43,14 +43,18 @@ pub struct Palette {
     // The launcher HUD. Tints sit on top of the window's native blur.
     /// 0xRRGGBBAA glass tint.
     pub hud_tint: u32,
-    /// Icon tile faces (top, bottom), 0xRRGGBBAA rim and printed glyph.
-    pub tile_face: (u32, u32),
-    pub tile_rim: u32,
+    /// Icon tiles are double-bezeled: an outer shell (top, bottom) around a recessed well.
+    /// Rims are 0xRRGGBBAA hairlines; selection only brightens the shell a shade.
+    pub tile_shell: (u32, u32),
+    pub tile_shell_selected: (u32, u32),
+    pub tile_shell_rim: u32,
+    pub tile_well: (u32, u32),
+    pub tile_well_rim: u32,
+    /// Printed glyph, and its quieter resting tone.
     pub tile_ink: u32,
+    pub tile_ink_rest: u32,
     /// 0xRRGGBBAA soft hover fill for small launcher controls.
     pub tile_selected: u32,
-    /// 0xRRGGBBAA halo around the selected icon tile.
-    pub tile_halo: u32,
     pub tile_label: u32,
     pub tile_label_selected: u32,
     pub tile_number: u32,
@@ -87,11 +91,14 @@ pub const LIGHT: Palette = Palette {
     bubble_text: 0x0a0a0a,
     bubble_meta: 0x737373,
     hud_tint: 0xf6f6f8e6,
-    tile_face: (0xffffff, 0xf2f2f2),
-    tile_rim: 0x00000017,
+    tile_shell: (0xffffff, 0xf3f3f5),
+    tile_shell_selected: (0xffffff, 0xf7f7f9),
+    tile_shell_rim: 0x00000014,
+    tile_well: (0xeeeef0, 0xf5f5f7),
+    tile_well_rim: 0x0000000f,
     tile_ink: 0x171717,
+    tile_ink_rest: 0x3d3d3d,
     tile_selected: 0x00000012,
-    tile_halo: 0x00000024,
     tile_label: 0x424242,
     tile_label_selected: 0x0a0a0a,
     tile_number: 0x8a8a8a,
@@ -126,11 +133,14 @@ pub const DARK: Palette = Palette {
     bubble_text: 0xfafafa,
     bubble_meta: 0xa1a1a1,
     hud_tint: 0x1e1e20eb,
-    tile_face: (0x383838, 0x1f1f1f),
-    tile_rim: 0xffffff10,
+    tile_shell: (0x2c2c2e, 0x232325),
+    tile_shell_selected: (0x313134, 0x28282a),
+    tile_shell_rim: 0xffffff0f,
+    tile_well: (0x121213, 0x18181a),
+    tile_well_rim: 0xffffff0a,
     tile_ink: 0xfafafa,
+    tile_ink_rest: 0xcfcfcf,
     tile_selected: 0xffffff21,
-    tile_halo: 0xffffff38,
     tile_label: 0xb8b8b8,
     tile_label_selected: 0xfafafa,
     tile_number: 0x7a7a7a,
@@ -268,45 +278,83 @@ pub fn key<E: Styled + StatefulInteractiveElement>(element: E, kind: Key) -> E {
         .focus_visible(move |s| s.shadow(ring))
 }
 
-/// The launcher's icon square: a softly lit rounded tile, like an app icon in cmd+tab.
-/// Selection is a halo hugging the tile; its spread follows the tile's corners.
+/// Outer bezel of a launcher tile: a softly lit rounded shell framing a recessed well
+/// (see `tile_well`), like a piece of hardware set into the glass. Selection brightens the
+/// shell by a shade, the way a hovered card on libraries.dev does; nothing else moves.
 pub fn tile<E: Styled + StatefulInteractiveElement>(element: E, selected: bool) -> E {
     let palette = p();
-    let mut rest = vec![
+    let (top, bottom) = if selected {
+        palette.tile_shell_selected
+    } else {
+        palette.tile_shell
+    };
+    let rest = vec![
+        // Top-edge catch light, then the hairline rim.
         inset(
             0.,
             1.,
             0.,
             0.,
-            if palette.dark { 0xffffff24 } else { 0xffffffff },
+            if palette.dark { 0xffffff14 } else { 0xffffffff },
         ),
-        inset(0., 0., 0., 1., palette.tile_rim),
+        inset(0., 0., 0., 1., palette.tile_shell_rim),
         shadow(
             0.,
             1.,
             2.,
             0.,
-            if palette.dark { 0x00000080 } else { 0x0000001a },
+            if palette.dark { 0x00000073 } else { 0x00000014 },
         ),
         shadow(
             0.,
-            6.,
-            14.,
-            0.,
-            if palette.dark { 0x00000040 } else { 0x0000000f },
+            8.,
+            18.,
+            -4.,
+            if palette.dark { 0x00000059 } else { 0x00000014 },
         ),
     ];
-    if selected {
-        rest.insert(0, shadow(0., 0., 0., 3., palette.tile_halo));
-    }
     let ring = focus_ring(rest.clone());
     element
         .relative()
-        .rounded(px(18.))
-        .bg(vertical(palette.tile_face.0, palette.tile_face.1, 1.))
+        .rounded(px(TILE_RADIUS))
+        .p(px(TILE_BEZEL))
+        .bg(vertical(top, bottom, 1.))
         .shadow(rest)
         // Hover and press feedback belong to the whole launcher slot, not the square.
         .focus_visible(move |s| s.shadow(ring))
+}
+
+/// Corner radius of the tile shell; the well's radius stays concentric with it.
+pub const TILE_RADIUS: f32 = 20.;
+/// Width of the shell's bezel around the well.
+pub const TILE_BEZEL: f32 = 6.;
+
+/// Inner well of a launcher tile: sunk into the shell with a shadow under its top edge
+/// and a faint lip of light along the bottom.
+pub fn tile_well() -> Div {
+    let palette = p();
+    let (top, bottom) = palette.tile_well;
+    div()
+        .size_full()
+        .rounded(px(TILE_RADIUS - TILE_BEZEL))
+        .bg(vertical(top, bottom, 1.))
+        .shadow(vec![
+            inset(
+                0.,
+                1.,
+                3.,
+                0.,
+                if palette.dark { 0x000000a6 } else { 0x0000001a },
+            ),
+            inset(0., 0., 0., 1., palette.tile_well_rim),
+            inset(
+                0.,
+                -1.,
+                0.,
+                0.,
+                if palette.dark { 0xffffff0a } else { 0xffffffb3 },
+            ),
+        ])
 }
 
 /// Small keycap, e.g. `esc` in the status strip.
